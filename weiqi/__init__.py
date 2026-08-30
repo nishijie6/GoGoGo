@@ -16,6 +16,17 @@ from .katago import (
     KataGoProfile,
     KataGoSettings,
 )
+from .rl_config import (
+    DEFAULT_RL_CONFIG_PATH,
+    DEFAULT_RL_PRESET,
+    RL_CONFIG_VERSION,
+    RL_PRESET_NAMES,
+    RLConfigError,
+    RLTrainingConfig,
+    load_rl_training_config,
+    resolve_rl_training_config,
+    save_rl_training_config,
+)
 from .training import (
     TRAINING_CATEGORIES,
     TRAINING_LESSONS,
@@ -39,6 +50,12 @@ __all__ = [
     "KataGoProfile",
     "KataGoSettings",
     "MoveAnalysis",
+    "DEFAULT_RL_CONFIG_PATH",
+    "DEFAULT_RL_PRESET",
+    "RL_CONFIG_VERSION",
+    "RL_PRESET_NAMES",
+    "RLConfigError",
+    "RLTrainingConfig",
     "ScoreResult",
     "TRAINING_CATEGORIES",
     "TRAINING_LESSONS",
@@ -48,4 +65,7 @@ __all__ = [
     "WinRateEstimate",
     "WinRateEstimator",
     "is_katago_difficulty",
+    "load_rl_training_config",
+    "resolve_rl_training_config",
+    "save_rl_training_config",
 ]

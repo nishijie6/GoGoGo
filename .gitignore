@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 dist/
 build/
+training_runs/
 
 # KataGo binaries/models are large and platform-specific. Keep only the setup
 # guide in this directory; users select local files in the application.
