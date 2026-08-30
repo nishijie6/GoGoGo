@@ -1,0 +1,1219 @@
+"""Tkinter user interface for the local Go game."""
+
+from __future__ import annotations
+
+import tkinter as tk
+from concurrent.futures import Future, ThreadPoolExecutor
+from tkinter import messagebox, ttk
+from typing import Optional
+
+from .ai import AI_DIFFICULTIES, AIMove, GoAI
+from .engine import BLACK, EMPTY, WHITE, GoGame, MoveRecord, Point, color_name
+from .rules import RULE_SECTIONS, RULES_INTRO
+from .training_gui import ReasoningTrainer
+from .winrate import WinRateEstimate, WinRateEstimator
+
+
+MODE_AI = "人机对战"
+MODE_LOCAL = "双人对战"
+COLUMN_NAMES = "ABCDEFGHJKLMNOPQRST"
+
+
+class GoApp:
+    """A responsive desktop Go board supporting AI and local play."""
+
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.root.title("弈境 · 围棋")
+        self.root.geometry("1080x760")
+        self.root.minsize(900, 690)
+        self.root.configure(bg="#172019")
+
+        self._configure_styles()
+
+        self.game = GoGame(size=9)
+        self.ai = GoAI()
+        self.winrate_estimator = WinRateEstimator()
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="go-ai")
+        self.ai_future: Optional[Future[AIMove]] = None
+        self.ai_busy = False
+        self.generation = 0
+        self.active_mode = MODE_AI
+        self.active_difficulty = "中等"
+        self.human_color = BLACK
+        self.ai_color = WHITE
+        self.hover_point: Optional[Point] = None
+        self._board_geometry: Optional[tuple[float, float, float]] = None
+        self._end_dialog_shown = False
+        self.rules_window: Optional[tk.Toplevel] = None
+        self.training_window: Optional[ReasoningTrainer] = None
+        self._winrate_cache_key: Optional[tuple[object, ...]] = None
+        self._last_winrate: Optional[WinRateEstimate] = None
+
+        self.mode_var = tk.StringVar(value=MODE_AI)
+        self.size_var = tk.StringVar(value="9×9")
+        self.human_color_var = tk.StringVar(value="黑方（先手）")
+        self.difficulty_var = tk.StringVar(value="中等")
+        self.turn_var = tk.StringVar()
+        self.notice_var = tk.StringVar()
+        self.capture_var = tk.StringVar()
+        self.move_var = tk.StringVar()
+        self.last_var = tk.StringVar()
+        self.winrate_var = tk.StringVar()
+        self.winlead_var = tk.StringVar()
+
+        self._build_layout()
+        self._bind_shortcuts()
+        self.new_game()
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+
+    def _configure_styles(self) -> None:
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        style.configure("App.TFrame", background="#172019")
+        style.configure("Panel.TFrame", background="#f2eee5")
+        style.configure(
+            "Title.TLabel",
+            background="#172019",
+            foreground="#f6f0df",
+            font=("Microsoft YaHei UI", 20, "bold"),
+        )
+        style.configure(
+            "Subtitle.TLabel",
+            background="#172019",
+            foreground="#aebbad",
+            font=("Microsoft YaHei UI", 9),
+        )
+        style.configure(
+            "PanelTitle.TLabel",
+            background="#f2eee5",
+            foreground="#26332b",
+            font=("Microsoft YaHei UI", 11, "bold"),
+        )
+        style.configure(
+            "Panel.TLabel",
+            background="#f2eee5",
+            foreground="#445148",
+            font=("Microsoft YaHei UI", 9),
+        )
+        style.configure(
+            "WinRate.TLabel",
+            background="#f2eee5",
+            foreground="#26332b",
+            font=("Microsoft YaHei UI", 9, "bold"),
+        )
+        style.configure(
+            "Estimate.TLabel",
+            background="#f2eee5",
+            foreground="#68746c",
+            font=("Microsoft YaHei UI", 8),
+        )
+        style.configure(
+            "Turn.TLabel",
+            background="#f2eee5",
+            foreground="#172019",
+            font=("Microsoft YaHei UI", 13, "bold"),
+        )
+        style.configure(
+            "Notice.TLabel",
+            background="#e7e0d2",
+            foreground="#5b4b35",
+            font=("Microsoft YaHei UI", 9),
+            padding=9,
+        )
+        style.configure(
+            "Primary.TButton",
+            background="#376348",
+            foreground="#ffffff",
+            font=("Microsoft YaHei UI", 10, "bold"),
+            padding=(12, 9),
+        )
+        style.configure(
+            "Header.TButton",
+            background="#2b4133",
+            foreground="#f2eddf",
+            font=("Microsoft YaHei UI", 9),
+            padding=(11, 7),
+        )
+        style.map(
+            "Header.TButton",
+            background=[("active", "#3b5a47")],
+        )
+        style.configure(
+            "RuleTitle.TLabel",
+            background="#f2eee5",
+            foreground="#1d3024",
+            font=("Microsoft YaHei UI", 18, "bold"),
+        )
+        style.configure(
+            "RuleIntro.TLabel",
+            background="#e7e0d2",
+            foreground="#4f5a52",
+            font=("Microsoft YaHei UI", 9),
+            padding=10,
+        )
+        style.map(
+            "Primary.TButton",
+            background=[("active", "#437756"), ("disabled", "#aab3ac")],
+        )
+        style.configure(
+            "Action.TButton",
+            font=("Microsoft YaHei UI", 9),
+            padding=(9, 7),
+        )
+        style.configure(
+            "TCombobox",
+            font=("Microsoft YaHei UI", 9),
+            padding=5,
+        )
+
+    def _build_layout(self) -> None:
+        shell = ttk.Frame(self.root, style="App.TFrame", padding=(18, 14, 18, 18))
+        shell.grid(row=0, column=0, sticky="nsew")
+        self.root.rowconfigure(0, weight=1)
+        self.root.columnconfigure(0, weight=1)
+        shell.rowconfigure(1, weight=1)
+        shell.columnconfigure(0, weight=1)
+
+        header = ttk.Frame(shell, style="App.TFrame")
+        header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        header.columnconfigure(1, weight=1)
+        ttk.Label(header, text="弈境", style="Title.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Label(
+            header,
+            text="本地围棋 · 中国数子法 · 支持 9×9 / 13×13 / 19×19",
+            style="Subtitle.TLabel",
+        ).grid(row=0, column=1, sticky="sw", padx=(14, 0), pady=(0, 3))
+        ttk.Button(
+            header,
+            text="推理训练  F2",
+            style="Header.TButton",
+            command=self.show_training,
+        ).grid(row=0, column=2, sticky="e", padx=(12, 0))
+        ttk.Button(
+            header,
+            text="围棋规则  F1",
+            style="Header.TButton",
+            command=self.show_rules,
+        ).grid(row=0, column=3, sticky="e", padx=(8, 0))
+
+        board_shell = tk.Frame(
+            shell,
+            bg="#0f1712",
+            highlightbackground="#2d3a31",
+            highlightthickness=1,
+            bd=0,
+        )
+        board_shell.grid(row=1, column=0, sticky="nsew", padx=(0, 14))
+        board_shell.rowconfigure(0, weight=1)
+        board_shell.columnconfigure(0, weight=1)
+        self.canvas = tk.Canvas(
+            board_shell,
+            bg="#d8a75d",
+            bd=0,
+            highlightthickness=0,
+            cursor="hand2",
+        )
+        self.canvas.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        self.canvas.bind("<Configure>", lambda _event: self.draw_board())
+        self.canvas.bind("<Button-1>", self._on_board_click)
+        self.canvas.bind("<Motion>", self._on_board_motion)
+        self.canvas.bind("<Leave>", self._on_board_leave)
+
+        panel_shell = ttk.Frame(shell, style="Panel.TFrame", width=286)
+        panel_shell.grid(row=1, column=1, sticky="ns")
+        panel_shell.grid_propagate(False)
+        panel_shell.rowconfigure(0, weight=1)
+        panel_shell.columnconfigure(0, weight=1)
+        self.panel_canvas = tk.Canvas(
+            panel_shell,
+            width=268,
+            bg="#f2eee5",
+            bd=0,
+            highlightthickness=0,
+            yscrollincrement=24,
+        )
+        panel_scrollbar = ttk.Scrollbar(
+            panel_shell,
+            orient="vertical",
+            command=self.panel_canvas.yview,
+        )
+        self.panel_canvas.configure(yscrollcommand=panel_scrollbar.set)
+        self.panel_canvas.grid(row=0, column=0, sticky="nsew")
+        panel_scrollbar.grid(row=0, column=1, sticky="ns")
+
+        panel = ttk.Frame(self.panel_canvas, style="Panel.TFrame", padding=16)
+        panel_window = self.panel_canvas.create_window(
+            (0, 0),
+            window=panel,
+            anchor="nw",
+        )
+        panel.bind(
+            "<Configure>",
+            lambda _event: self.panel_canvas.configure(
+                scrollregion=self.panel_canvas.bbox("all")
+            ),
+        )
+        self.panel_canvas.bind(
+            "<Configure>",
+            lambda event: self.panel_canvas.itemconfigure(
+                panel_window,
+                width=event.width,
+            ),
+        )
+        self.panel_canvas.bind("<MouseWheel>", self._on_panel_mousewheel)
+        panel.columnconfigure(0, weight=1)
+
+        ttk.Label(panel, text="新局设置", style="PanelTitle.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Label(panel, text="对战模式", style="Panel.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(8, 2)
+        )
+        self.mode_combo = ttk.Combobox(
+            panel,
+            textvariable=self.mode_var,
+            values=(MODE_AI, MODE_LOCAL),
+            state="readonly",
+        )
+        self.mode_combo.grid(row=2, column=0, sticky="ew")
+        self.mode_combo.bind("<<ComboboxSelected>>", self._on_mode_selected)
+
+        options = ttk.Frame(panel, style="Panel.TFrame")
+        options.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        options.columnconfigure((0, 1), weight=1)
+        ttk.Label(options, text="棋盘", style="Panel.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Label(options, text="执子", style="Panel.TLabel").grid(
+            row=0, column=1, sticky="w", padx=(7, 0)
+        )
+        self.size_combo = ttk.Combobox(
+            options,
+            textvariable=self.size_var,
+            values=("9×9", "13×13", "19×19"),
+            state="readonly",
+            width=8,
+        )
+        self.size_combo.grid(row=1, column=0, sticky="ew", pady=(3, 0))
+        self.human_combo = ttk.Combobox(
+            options,
+            textvariable=self.human_color_var,
+            values=("黑方（先手）", "白方（后手）"),
+            state="readonly",
+            width=12,
+        )
+        self.human_combo.grid(row=1, column=1, sticky="ew", padx=(7, 0), pady=(3, 0))
+        ttk.Label(
+            options,
+            text="电脑难度（相对强度）",
+            style="Panel.TLabel",
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(5, 0))
+        self.difficulty_combo = ttk.Combobox(
+            options,
+            textvariable=self.difficulty_var,
+            values=AI_DIFFICULTIES,
+            state="readonly",
+        )
+        self.difficulty_combo.grid(
+            row=3,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(3, 0),
+        )
+
+        ttk.Button(
+            panel,
+            text="开始新局",
+            style="Primary.TButton",
+            command=self.new_game,
+        ).grid(row=4, column=0, sticky="ew", pady=(9, 10))
+
+        ttk.Separator(panel).grid(row=5, column=0, sticky="ew", pady=(0, 9))
+        ttk.Label(panel, textvariable=self.turn_var, style="Turn.TLabel").grid(
+            row=6, column=0, sticky="w"
+        )
+        ttk.Label(
+            panel,
+            textvariable=self.notice_var,
+            style="Notice.TLabel",
+            wraplength=218,
+            justify="left",
+        ).grid(row=7, column=0, sticky="ew", pady=(6, 7))
+        ttk.Label(panel, textvariable=self.capture_var, style="Panel.TLabel").grid(
+            row=8, column=0, sticky="w", pady=2
+        )
+        ttk.Label(panel, textvariable=self.move_var, style="Panel.TLabel").grid(
+            row=9, column=0, sticky="w", pady=2
+        )
+        ttk.Label(panel, textvariable=self.last_var, style="Panel.TLabel").grid(
+            row=10, column=0, sticky="w", pady=2
+        )
+
+        winrate_frame = ttk.Frame(panel, style="Panel.TFrame")
+        winrate_frame.grid(row=11, column=0, sticky="ew", pady=(7, 3))
+        winrate_frame.columnconfigure(1, weight=1)
+        ttk.Label(
+            winrate_frame,
+            text="实时胜率",
+            style="PanelTitle.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            winrate_frame,
+            textvariable=self.winrate_var,
+            style="WinRate.TLabel",
+        ).grid(row=0, column=1, sticky="e")
+        self.winrate_bar = tk.Canvas(
+            winrate_frame,
+            width=218,
+            height=14,
+            bg="#ded8ca",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground="#aaa293",
+        )
+        self.winrate_bar.grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(4, 3),
+        )
+        self.winrate_bar.bind(
+            "<Configure>", lambda _event: self._draw_winrate_bar()
+        )
+        ttk.Label(
+            winrate_frame,
+            textvariable=self.winlead_var,
+            style="Estimate.TLabel",
+        ).grid(row=2, column=0, columnspan=2, sticky="w")
+
+        actions = ttk.Frame(panel, style="Panel.TFrame")
+        actions.grid(row=12, column=0, sticky="ew", pady=(7, 9))
+        actions.columnconfigure((0, 1), weight=1)
+        self.undo_button = ttk.Button(
+            actions, text="悔棋", style="Action.TButton", command=self.undo
+        )
+        self.undo_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.pass_button = ttk.Button(
+            actions, text="虚手", style="Action.TButton", command=self.pass_turn
+        )
+        self.pass_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self.resign_button = ttk.Button(
+            actions, text="认输", style="Action.TButton", command=self.resign
+        )
+        self.resign_button.grid(
+            row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0)
+        )
+
+        ttk.Label(panel, text="棋谱", style="PanelTitle.TLabel").grid(
+            row=13, column=0, sticky="w", pady=(1, 5)
+        )
+        log_frame = ttk.Frame(panel, style="Panel.TFrame")
+        log_frame.grid(row=14, column=0, sticky="nsew")
+        log_frame.rowconfigure(0, weight=1)
+        log_frame.columnconfigure(0, weight=1)
+        panel.rowconfigure(14, weight=1)
+        self.move_log = tk.Listbox(
+            log_frame,
+            height=5,
+            bg="#fbf8f1",
+            fg="#39463d",
+            selectbackground="#78917e",
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground="#d5cdbf",
+            font=("Microsoft YaHei UI", 9),
+            activestyle="none",
+        )
+        scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.move_log.yview)
+        self.move_log.configure(yscrollcommand=scrollbar.set)
+        self.move_log.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        ttk.Label(
+            panel,
+            text="快捷键：Ctrl+N 新局 · Ctrl+Z 悔棋 · P 虚手\nF1 规则 · F2 推理训练；连续两次虚手结束。",
+            style="Panel.TLabel",
+            wraplength=225,
+            justify="left",
+        ).grid(row=15, column=0, sticky="w", pady=(7, 0))
+        self._bind_panel_mousewheel(panel)
+
+    def show_training(self) -> None:
+        """Open the guided joseki and life-and-death reasoning trainer."""
+
+        if self.training_window is not None and self.training_window.is_alive:
+            self.training_window.lift()
+            return
+        self.training_window = ReasoningTrainer(
+            self.root,
+            on_close=self._training_closed,
+        )
+
+    def _training_closed(self) -> None:
+        self.training_window = None
+
+    def show_rules(self) -> None:
+        """Open the in-program Go rules reference."""
+
+        if self.rules_window is not None:
+            try:
+                if self.rules_window.winfo_exists():
+                    self.rules_window.deiconify()
+                    self.rules_window.lift()
+                    self.rules_window.focus_set()
+                    return
+            except tk.TclError:
+                pass
+
+        window = tk.Toplevel(self.root)
+        self.rules_window = window
+        window.title("围棋规则 · 弈境")
+        window.configure(bg="#f2eee5")
+        window.minsize(560, 460)
+        window.transient(self.root)
+        window.protocol("WM_DELETE_WINDOW", self._close_rules)
+        window.bind("<Escape>", lambda _event: self._close_rules())
+        window.bind("<Control-w>", lambda _event: self._close_rules())
+        window.rowconfigure(0, weight=1)
+        window.columnconfigure(0, weight=1)
+
+        shell = ttk.Frame(window, style="Panel.TFrame", padding=18)
+        shell.grid(row=0, column=0, sticky="nsew")
+        shell.rowconfigure(2, weight=1)
+        shell.columnconfigure(0, weight=1)
+
+        ttk.Label(shell, text="围棋规则", style="RuleTitle.TLabel").grid(
+            row=0,
+            column=0,
+            sticky="w",
+        )
+        ttk.Label(
+            shell,
+            text=RULES_INTRO,
+            style="RuleIntro.TLabel",
+            wraplength=680,
+            justify="left",
+        ).grid(row=1, column=0, sticky="ew", pady=(9, 12))
+
+        text_frame = ttk.Frame(shell, style="Panel.TFrame")
+        text_frame.grid(row=2, column=0, sticky="nsew")
+        text_frame.rowconfigure(0, weight=1)
+        text_frame.columnconfigure(0, weight=1)
+        rules_text = tk.Text(
+            text_frame,
+            wrap="word",
+            bg="#fbf8f1",
+            fg="#39463d",
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground="#d0c8b9",
+            padx=18,
+            pady=14,
+            font=("Microsoft YaHei UI", 10),
+            cursor="arrow",
+        )
+        rules_scrollbar = ttk.Scrollbar(
+            text_frame,
+            orient="vertical",
+            command=rules_text.yview,
+        )
+        rules_text.configure(yscrollcommand=rules_scrollbar.set)
+        rules_text.grid(row=0, column=0, sticky="nsew")
+        rules_scrollbar.grid(row=0, column=1, sticky="ns")
+
+        rules_text.tag_configure(
+            "heading",
+            font=("Microsoft YaHei UI", 12, "bold"),
+            foreground="#315e43",
+            spacing1=12,
+            spacing3=6,
+        )
+        rules_text.tag_configure(
+            "body",
+            font=("Microsoft YaHei UI", 10),
+            foreground="#39463d",
+            spacing1=2,
+            spacing3=8,
+        )
+        rules_text.tag_configure(
+            "bullet",
+            font=("Microsoft YaHei UI", 10),
+            foreground="#39463d",
+            lmargin1=16,
+            lmargin2=30,
+            spacing1=2,
+            spacing3=6,
+        )
+        for section in RULE_SECTIONS:
+            rules_text.insert(tk.END, section.title + "\n", "heading")
+            for paragraph in section.paragraphs:
+                tag = "bullet" if paragraph.startswith("•") else "body"
+                rules_text.insert(tk.END, paragraph + "\n", tag)
+            rules_text.insert(tk.END, "\n", "body")
+        rules_text.configure(state="disabled")
+
+        footer = ttk.Frame(shell, style="Panel.TFrame")
+        footer.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        footer.columnconfigure(0, weight=1)
+        ttk.Label(
+            footer,
+            text="本说明与当前程序采用的规则一致 · Esc 关闭",
+            style="Estimate.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Button(
+            footer,
+            text="关闭",
+            style="Action.TButton",
+            command=self._close_rules,
+        ).grid(row=0, column=1, sticky="e")
+
+        screen_width = window.winfo_screenwidth()
+        screen_height = window.winfo_screenheight()
+        width = min(760, max(560, screen_width - 80))
+        height = min(680, max(460, screen_height - 100))
+        self.root.update_idletasks()
+        x = max(0, self.root.winfo_rootx() + (self.root.winfo_width() - width) // 2)
+        y = max(0, self.root.winfo_rooty() + (self.root.winfo_height() - height) // 2)
+        window.geometry(f"{width}x{height}+{x}+{y}")
+        window.focus_set()
+
+    def _close_rules(self) -> None:
+        if self.rules_window is not None:
+            try:
+                self.rules_window.destroy()
+            except tk.TclError:
+                pass
+        self.rules_window = None
+
+    def _bind_shortcuts(self) -> None:
+        self.root.bind("<Control-n>", lambda _event: self.new_game())
+        self.root.bind("<Control-z>", lambda _event: self.undo())
+        self.root.bind("<Key-p>", lambda _event: self.pass_turn())
+        self.root.bind("<Key-P>", lambda _event: self.pass_turn())
+        self.root.bind("<F1>", lambda _event: self.show_rules())
+        self.root.bind("<F2>", lambda _event: self.show_training())
+
+    def _bind_panel_mousewheel(self, widget: tk.Misc) -> None:
+        if not isinstance(widget, (tk.Listbox, ttk.Scrollbar)):
+            widget.bind("<MouseWheel>", self._on_panel_mousewheel, add="+")
+        for child in widget.winfo_children():
+            self._bind_panel_mousewheel(child)
+
+    def _on_panel_mousewheel(self, event: tk.Event) -> str:
+        if event.delta:
+            direction = -1 if event.delta > 0 else 1
+            self.panel_canvas.yview_scroll(direction * 2, "units")
+        return "break"
+
+    def _on_mode_selected(self, _event: object = None) -> None:
+        state = "readonly" if self.mode_var.get() == MODE_AI else "disabled"
+        self.human_combo.configure(state=state)
+        self.difficulty_combo.configure(state=state)
+
+    def new_game(self) -> None:
+        """Apply the selected options and replace the current game."""
+
+        self._invalidate_ai()
+        size = int(self.size_var.get().split("×", maxsplit=1)[0])
+        self.active_mode = self.mode_var.get()
+        self.active_difficulty = self.difficulty_var.get()
+        self.ai = GoAI(difficulty=self.active_difficulty)
+        self.human_color = (
+            BLACK if self.human_color_var.get().startswith("黑") else WHITE
+        )
+        self.ai_color = WHITE if self.human_color == BLACK else BLACK
+        self.game = GoGame(size=size, komi=6.5)
+        self.hover_point = None
+        self._end_dialog_shown = False
+        if self.active_mode == MODE_AI:
+            self.notice_var.set(
+                f"新对局已开始，电脑难度：{self.active_difficulty}。"
+            )
+        else:
+            self.notice_var.set("新对局已开始，请在棋盘交叉点落子。")
+        self._on_mode_selected()
+        self._refresh()
+        if self._is_ai_turn():
+            self.root.after(300, self._start_ai_turn)
+
+    def _on_board_click(self, event: tk.Event) -> None:
+        if not self._human_can_act():
+            if self.ai_busy:
+                self.notice_var.set("电脑正在思考，请稍候…")
+            elif self.game.game_over:
+                if self.game.result_text:
+                    self.notice_var.set(self.game.result_text)
+                else:
+                    self.notice_var.set("本局已经结束，可悔棋或开始新局。")
+            elif self.active_mode == MODE_AI:
+                self.notice_var.set("现在轮到电脑落子。")
+            return
+
+        point = self._event_to_point(event.x, event.y)
+        if point is None:
+            return
+        row, col = point
+        color = self.game.current_player
+        analysis = self.game.play(row, col)
+        if not analysis.legal:
+            self.notice_var.set(f"不能落子：{analysis.reason}")
+            self.root.bell()
+            self._draw_hover()
+            return
+
+        coordinate = self._coordinate(row, col)
+        if analysis.captured:
+            notice = f"{color_name(color)}于 {coordinate} 落子，提掉 {analysis.captured} 子。"
+        else:
+            notice = f"{color_name(color)}于 {coordinate} 落子。"
+        self.hover_point = None
+        self._refresh(notice)
+        if self._is_ai_turn():
+            self._start_ai_turn()
+
+    def _on_board_motion(self, event: tk.Event) -> None:
+        point = self._event_to_point(event.x, event.y)
+        if point == self.hover_point:
+            return
+        self.hover_point = point
+        self._draw_hover()
+
+    def _on_board_leave(self, _event: object = None) -> None:
+        self.hover_point = None
+        self.canvas.delete("hover")
+
+    def _event_to_point(self, x: float, y: float) -> Optional[Point]:
+        if self._board_geometry is None:
+            return None
+        origin_x, origin_y, gap = self._board_geometry
+        col = round((x - origin_x) / gap)
+        row = round((y - origin_y) / gap)
+        if not (0 <= row < self.game.size and 0 <= col < self.game.size):
+            return None
+        point_x = origin_x + col * gap
+        point_y = origin_y + row * gap
+        if ((x - point_x) ** 2 + (y - point_y) ** 2) ** 0.5 > gap * 0.45:
+            return None
+        return row, col
+
+    def draw_board(self) -> None:
+        """Redraw the complete board according to the current canvas size."""
+
+        width = max(self.canvas.winfo_width(), 200)
+        height = max(self.canvas.winfo_height(), 200)
+        self.canvas.delete("all")
+
+        short_side = min(width, height)
+        margin = max(40.0, min(62.0, short_side * 0.10))
+        board_span = max(100.0, short_side - margin * 2)
+        gap = board_span / (self.game.size - 1)
+        origin_x = (width - board_span) / 2
+        origin_y = (height - board_span) / 2
+        stone_radius = min(gap * 0.46, 33.0)
+        coordinate_offset = min(
+            margin - 9.0,
+            max(stone_radius + 14.0, margin * 0.65),
+        )
+        self._board_geometry = (origin_x, origin_y, gap)
+
+        # Layered board background gives the flat Canvas a little warmth/depth.
+        self.canvas.create_rectangle(
+            0, 0, width, height, fill="#d9aa63", outline="", tags="board"
+        )
+        for stripe in range(0, int(height), 24):
+            self.canvas.create_line(
+                0,
+                stripe,
+                width,
+                stripe + 7,
+                fill="#d3a159",
+                width=1,
+                stipple="gray75",
+                tags="board",
+            )
+
+        end_x = origin_x + board_span
+        end_y = origin_y + board_span
+        for index in range(self.game.size):
+            position_x = origin_x + index * gap
+            position_y = origin_y + index * gap
+            line_width = 2 if index in (0, self.game.size - 1) else 1
+            self.canvas.create_line(
+                origin_x,
+                position_y,
+                end_x,
+                position_y,
+                fill="#3d2a17",
+                width=line_width,
+                tags="grid",
+            )
+            self.canvas.create_line(
+                position_x,
+                origin_y,
+                position_x,
+                end_y,
+                fill="#3d2a17",
+                width=line_width,
+                tags="grid",
+            )
+
+            coordinate_font = ("Segoe UI", max(8, min(10, int(gap * 0.24))))
+            self.canvas.create_text(
+                position_x,
+                end_y + coordinate_offset,
+                text=COLUMN_NAMES[index],
+                fill="#4e361e",
+                font=coordinate_font,
+                tags="coordinates",
+            )
+            self.canvas.create_text(
+                origin_x - coordinate_offset,
+                position_y,
+                text=str(self.game.size - index),
+                fill="#4e361e",
+                font=coordinate_font,
+                tags="coordinates",
+            )
+
+        star_radius = max(2.5, min(4.2, gap * 0.11))
+        for star_row, star_col in self._star_points():
+            star_x = origin_x + star_col * gap
+            star_y = origin_y + star_row * gap
+            self.canvas.create_oval(
+                star_x - star_radius,
+                star_y - star_radius,
+                star_x + star_radius,
+                star_y + star_radius,
+                fill="#342313",
+                outline="",
+                tags="stars",
+            )
+
+        for row in range(self.game.size):
+            for col in range(self.game.size):
+                color = self.game.board[row][col]
+                if color != EMPTY:
+                    self._draw_stone(row, col, color, stone_radius)
+
+        if self.game.last_move is not None:
+            row, col = self.game.last_move
+            center_x = origin_x + col * gap
+            center_y = origin_y + row * gap
+            marker_radius = max(2.2, stone_radius * 0.12)
+            marker_color = "#f1c65c" if self.game.board[row][col] == BLACK else "#b84334"
+            self.canvas.create_oval(
+                center_x - marker_radius,
+                center_y - marker_radius,
+                center_x + marker_radius,
+                center_y + marker_radius,
+                fill=marker_color,
+                outline="",
+                tags="last-move",
+            )
+
+        self._draw_hover()
+
+    def _draw_stone(self, row: int, col: int, color: int, radius: float) -> None:
+        if self._board_geometry is None:
+            return
+        origin_x, origin_y, gap = self._board_geometry
+        center_x = origin_x + col * gap
+        center_y = origin_y + row * gap
+        shadow_offset = max(1.5, radius * 0.09)
+        self.canvas.create_oval(
+            center_x - radius + shadow_offset,
+            center_y - radius + shadow_offset,
+            center_x + radius + shadow_offset,
+            center_y + radius + shadow_offset,
+            fill="#6e5034",
+            outline="",
+            stipple="gray50",
+            tags="stones",
+        )
+        if color == BLACK:
+            fill, outline, highlight = "#171b19", "#080a09", "#58605b"
+        else:
+            fill, outline, highlight = "#f5f2e9", "#a89f8e", "#ffffff"
+        self.canvas.create_oval(
+            center_x - radius,
+            center_y - radius,
+            center_x + radius,
+            center_y + radius,
+            fill=fill,
+            outline=outline,
+            width=max(1, int(radius * 0.06)),
+            tags="stones",
+        )
+        shine_radius = radius * 0.23
+        self.canvas.create_oval(
+            center_x - radius * 0.48,
+            center_y - radius * 0.5,
+            center_x - radius * 0.48 + shine_radius,
+            center_y - radius * 0.5 + shine_radius,
+            fill=highlight,
+            outline="",
+            stipple="gray50",
+            tags="stones",
+        )
+
+    def _draw_hover(self) -> None:
+        self.canvas.delete("hover")
+        if not self._human_can_act() or self.hover_point is None:
+            return
+        row, col = self.hover_point
+        if self.game.board[row][col] != EMPTY:
+            return
+        analysis = self.game.analyze_move(row, col)
+        if not analysis.legal or self._board_geometry is None:
+            return
+        origin_x, origin_y, gap = self._board_geometry
+        center_x = origin_x + col * gap
+        center_y = origin_y + row * gap
+        radius = min(gap * 0.43, 31.0)
+        fill = "#1d211f" if self.game.current_player == BLACK else "#f7f4ec"
+        outline = "#111513" if self.game.current_player == BLACK else "#8f8778"
+        self.canvas.create_oval(
+            center_x - radius,
+            center_y - radius,
+            center_x + radius,
+            center_y + radius,
+            fill=fill,
+            outline=outline,
+            width=2,
+            stipple="gray50",
+            tags="hover",
+        )
+
+    def _star_points(self) -> tuple[Point, ...]:
+        if self.game.size == 9:
+            return ((2, 2), (2, 6), (4, 4), (6, 2), (6, 6))
+        if self.game.size == 13:
+            axes = (3, 6, 9)
+        else:
+            axes = (3, 9, 15)
+        return tuple((row, col) for row in axes for col in axes)
+
+    def pass_turn(self) -> None:
+        if not self._human_can_act():
+            if self.ai_busy:
+                self.notice_var.set("电脑正在思考，现在不能虚手。")
+            return
+        color = self.game.current_player
+        if not self.game.pass_turn():
+            return
+        self.hover_point = None
+        self._refresh(f"{color_name(color)}选择虚手。")
+        if self.game.game_over:
+            self._show_game_over()
+        elif self._is_ai_turn():
+            self._start_ai_turn()
+
+    def resign(self) -> None:
+        if not self._human_can_act():
+            return
+        color = self.game.current_player
+        if not messagebox.askyesno(
+            "确认认输", f"确定由{color_name(color)}认输并结束本局吗？", parent=self.root
+        ):
+            return
+        if self.game.resign():
+            self.hover_point = None
+            self._refresh(self.game.result_text)
+            self._show_game_over()
+
+    def undo(self) -> None:
+        if not self.game.can_undo:
+            self.notice_var.set("当前没有可以撤回的着手。")
+            return
+
+        was_ai_busy = self.ai_busy
+        self._invalidate_ai()
+        undone = self.game.undo(1)
+        if self.active_mode == MODE_AI and not was_ai_busy:
+            # Normally take back the AI response and the preceding human action,
+            # leaving the human at the decision they wanted to reconsider.
+            while self.game.can_undo and self.game.current_player != self.human_color:
+                undone += self.game.undo(1)
+
+        self.hover_point = None
+        self._end_dialog_shown = False
+        self._refresh(f"已撤回 {undone} 手。")
+        if self._is_ai_turn():
+            self.root.after(220, self._start_ai_turn)
+
+    def _start_ai_turn(self) -> None:
+        if not self._is_ai_turn() or self.ai_busy:
+            return
+        self.ai_busy = True
+        request_generation = self.generation
+        snapshot = self.game.clone()
+        self.ai_future = self.executor.submit(self.ai.choose_move, snapshot)
+        self._refresh(
+            f"{color_name(self.ai_color)}电脑正在思考…"
+            f"（{self.active_difficulty}）"
+        )
+        self.root.after(60, lambda: self._poll_ai(request_generation))
+
+    def _poll_ai(self, request_generation: int) -> None:
+        if request_generation != self.generation:
+            return
+        future = self.ai_future
+        if future is None:
+            return
+        if not future.done():
+            self.root.after(60, lambda: self._poll_ai(request_generation))
+            return
+
+        self.ai_busy = False
+        self.ai_future = None
+        try:
+            decision = future.result()
+        except Exception as error:  # Keep the GUI usable if an AI bug occurs.
+            # A safe automatic pass hands control back instead of leaving the
+            # application permanently stuck on the computer's turn.
+            if self._is_ai_turn():
+                self.game.pass_turn()
+            self._refresh(f"电脑计算失败并已自动虚手：{error}")
+            if self.game.game_over:
+                self._show_game_over()
+            return
+
+        if request_generation != self.generation or not self._is_ai_turn():
+            self._refresh()
+            return
+
+        color = self.game.current_player
+        if decision.point is None:
+            self.game.pass_turn()
+            notice = f"{color_name(color)}电脑选择虚手（{decision.explanation}）。"
+        else:
+            row, col = decision.point
+            analysis = self.game.play(row, col)
+            if not analysis.legal:
+                # The snapshot and live game should match.  Passing is a safe
+                # fallback if they ever do not.
+                self.game.pass_turn()
+                notice = f"{color_name(color)}电脑选择虚手。"
+            else:
+                coordinate = self._coordinate(row, col)
+                capture_text = (
+                    f"，提掉 {analysis.captured} 子" if analysis.captured else ""
+                )
+                notice = (
+                    f"{color_name(color)}电脑于 {coordinate} 落子{capture_text}"
+                    f"（{decision.explanation}）。"
+                )
+        self._refresh(notice)
+        if self.game.game_over:
+            self._show_game_over()
+
+    def _invalidate_ai(self) -> None:
+        self.generation += 1
+        if self.ai_future is not None:
+            self.ai_future.cancel()
+        self.ai_future = None
+        self.ai_busy = False
+
+    def _is_ai_turn(self) -> bool:
+        return (
+            self.active_mode == MODE_AI
+            and not self.game.game_over
+            and self.game.current_player == self.ai_color
+        )
+
+    def _human_can_act(self) -> bool:
+        if self.game.game_over or self.ai_busy:
+            return False
+        return self.active_mode == MODE_LOCAL or self.game.current_player == self.human_color
+
+    def _refresh(self, notice: Optional[str] = None) -> None:
+        if self.game.game_over and self.game.result_text:
+            self.notice_var.set(self.game.result_text)
+        elif notice is not None:
+            self.notice_var.set(notice)
+
+        if self.game.game_over:
+            self.turn_var.set("对局结束")
+        elif self.ai_busy:
+            self.turn_var.set(
+                f"● {color_name(self.game.current_player)} · 电脑 · "
+                f"{self.active_difficulty}"
+            )
+        elif self.active_mode == MODE_AI:
+            role = (
+                "玩家"
+                if self.game.current_player == self.human_color
+                else f"电脑 · {self.active_difficulty}"
+            )
+            self.turn_var.set(f"● {color_name(self.game.current_player)} · {role}")
+        else:
+            self.turn_var.set(f"● {color_name(self.game.current_player)}落子")
+
+        self.capture_var.set(
+            f"提子：黑 {self.game.captures[BLACK]}  ·  白 {self.game.captures[WHITE]}"
+        )
+        self.move_var.set(
+            f"手数：{self.game.move_number}  ·  连续虚手：{self.game.consecutive_passes}"
+        )
+        if self.game.moves:
+            last = self.game.moves[-1]
+            if last.kind == "play" and last.row is not None and last.col is not None:
+                last_text = self._coordinate(last.row, last.col)
+            elif last.kind == "pass":
+                last_text = "虚手"
+            else:
+                last_text = "认输"
+            self.last_var.set(f"上一手：{color_name(last.color)} {last_text}")
+        else:
+            self.last_var.set("上一手：—")
+
+        self.undo_button.configure(state="normal" if self.game.can_undo else "disabled")
+        action_state = "normal" if self._human_can_act() else "disabled"
+        self.pass_button.configure(state=action_state)
+        self.resign_button.configure(state=action_state)
+        self._update_winrate()
+        self._refresh_move_log()
+        self.draw_board()
+
+    def _update_winrate(self) -> None:
+        cache_key: tuple[object, ...] = (
+            self.game.size,
+            self.game.komi,
+            self.game.board_hash(),
+            self.game.current_player,
+            self.game.move_number,
+            self.game.consecutive_passes,
+            self.game.game_over,
+            self.game.winner,
+        )
+        if cache_key != self._winrate_cache_key:
+            self._last_winrate = self.winrate_estimator.estimate(self.game)
+            self._winrate_cache_key = cache_key
+
+        estimate = self._last_winrate
+        if estimate is None:
+            return
+        self.winrate_var.set(
+            f"黑 {estimate.black_percent:.1f}%  ·  白 {estimate.white_percent:.1f}%"
+        )
+        if estimate.final:
+            if self.game.winner is None:
+                detail = "和棋"
+            else:
+                detail = f"{color_name(self.game.winner)}胜"
+            self.winlead_var.set(f"终局 · {detail}")
+        elif abs(estimate.black_lead) < 0.35:
+            self.winlead_var.set(f"{estimate.phase} · 局势接近均衡（启发式估算）")
+        else:
+            leader = "黑" if estimate.black_lead > 0 else "白"
+            self.winlead_var.set(
+                f"{estimate.phase} · {leader}约领先 {abs(estimate.black_lead):.1f} 目"
+                "（启发式估算）"
+            )
+        self._draw_winrate_bar()
+
+    def _draw_winrate_bar(self) -> None:
+        if not hasattr(self, "winrate_bar"):
+            return
+        self.winrate_bar.delete("all")
+        estimate = self._last_winrate
+        if estimate is None:
+            return
+        width = max(
+            10,
+            self.winrate_bar.winfo_width(),
+            self.winrate_bar.winfo_reqwidth(),
+        )
+        height = max(10, self.winrate_bar.winfo_height())
+        black_width = width * estimate.black_win_probability
+        self.winrate_bar.create_rectangle(
+            0,
+            0,
+            black_width,
+            height,
+            fill="#1b201d",
+            outline="",
+        )
+        self.winrate_bar.create_rectangle(
+            black_width,
+            0,
+            width,
+            height,
+            fill="#ece7dc",
+            outline="",
+        )
+        self.winrate_bar.create_line(
+            width / 2,
+            0,
+            width / 2,
+            height,
+            fill="#8e887d",
+            width=1,
+        )
+
+    def _refresh_move_log(self) -> None:
+        self.move_log.delete(0, tk.END)
+        for index, move in enumerate(self.game.moves, start=1):
+            self.move_log.insert(tk.END, self._format_move(index, move))
+        if self.game.moves:
+            self.move_log.see(tk.END)
+
+    def _format_move(self, number: int, move: MoveRecord) -> str:
+        stone = "●" if move.color == BLACK else "○"
+        if move.kind == "play" and move.row is not None and move.col is not None:
+            text = self._coordinate(move.row, move.col)
+            if move.captured:
+                text += f"  提 {move.captured}"
+        elif move.kind == "pass":
+            text = "虚手"
+        else:
+            text = "认输"
+        return f"{number:>3}. {stone}  {text}"
+
+    def _coordinate(self, row: int, col: int) -> str:
+        return f"{COLUMN_NAMES[col]}{self.game.size - row}"
+
+    def _show_game_over(self) -> None:
+        if self._end_dialog_shown:
+            return
+        self._end_dialog_shown = True
+        if self.game.score_result is not None:
+            score = self.game.score_result
+            message = (
+                "双方连续虚手，对局结束。按当前盘面采用中国数子法计分：\n\n"
+                f"黑方：棋子 {score.black_stones} + 围空 {score.black_territory}"
+                f" = {score.black_total:g}\n"
+                f"白方：棋子 {score.white_stones} + 围空 {score.white_territory}"
+                f" + 贴目 {score.komi:g} = {score.white_total:g}\n\n"
+                f"{self.game.result_text}\n\n"
+                "提示：程序不自动判定死子，终局前应先提净死子。"
+            )
+        else:
+            message = self.game.result_text
+        messagebox.showinfo("对局结果", message, parent=self.root)
+
+    def close(self) -> None:
+        self._invalidate_ai()
+        self.executor.shutdown(wait=False, cancel_futures=True)
+        if self.training_window is not None:
+            self.training_window.close()
+            self.training_window = None
+        self._close_rules()
+        self.root.destroy()
+
+
+def run() -> None:
+    root = tk.Tk()
+    GoApp(root)
+    root.mainloop()
