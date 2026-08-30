@@ -82,8 +82,8 @@ class KataGoSettingsDialog:
             shell,
             text=(
                 "职业 1–9 段需要官方 KataGo 引擎和主神经网络。可选的人类风格"
-                "模型会分别使用 rank_1d 至 rank_9d 棋谱策略；不安装该模型时，"
-                "程序仍可按递增搜索量运行 KataGo，但不具备对应段位的人类行棋风格。"
+                "模型会使用 proyear_2023 职业棋谱策略，再以递增搜索量、逐级降低"
+                "的随机温度和更严格的主网络评价区分难度；不安装时仍可运行主网络。"
             ),
             style="RuleIntro.TLabel",
             wraplength=730,
@@ -252,7 +252,8 @@ class KataGoSettingsDialog:
             self.status_label.configure(fg="#9d3d31")
         elif settings.human_style_enabled:
             self.status_var.set(
-                "配置完整：将使用 KataGo 主网络分析，并用人类风格模型模拟职业 1–9 段行棋。"
+                "配置完整：将使用 KataGo 主网络分析，并结合 2023 职业棋谱风格"
+                "模拟职业 1–9 段行棋。"
             )
             self.status_label.configure(fg="#315e43")
         else:

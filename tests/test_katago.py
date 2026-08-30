@@ -34,7 +34,21 @@ class KataGoProtocolTests(unittest.TestCase):
         self.assertEqual(len(visits), len(set(visits)))
         self.assertEqual(
             [profile.human_sl_profile for profile in KATAGO_PROFILES],
-            [f"rank_{dan}d" for dan in range(1, 10)],
+            ["proyear_2023"] * 9,
+        )
+        self.assertEqual(
+            [profile.move_temperature for profile in KATAGO_PROFILES],
+            sorted(
+                (profile.move_temperature for profile in KATAGO_PROFILES),
+                reverse=True,
+            ),
+        )
+        self.assertEqual(
+            [profile.utility_scale for profile in KATAGO_PROFILES],
+            sorted(
+                (profile.utility_scale for profile in KATAGO_PROFILES),
+                reverse=True,
+            ),
         )
 
     def test_gtp_coordinates_round_trip_for_all_board_sizes(self) -> None:
@@ -67,9 +81,13 @@ class KataGoProtocolTests(unittest.TestCase):
         self.assertTrue(query["includePolicy"])
         self.assertEqual(
             query["overrideSettings"]["humanSLProfile"],
-            "rank_5d",
+            "proyear_2023",
         )
         self.assertFalse(query["overrideSettings"]["ignorePreRootHistory"])
+        self.assertEqual(
+            query["overrideSettings"]["humanSLRootExploreProbWeightless"],
+            0.5,
+        )
 
     def test_empty_game_query_sets_initial_player(self) -> None:
         game = GoGame(13)
@@ -150,6 +168,16 @@ class KataGoSettingsAndDecisionTests(unittest.TestCase):
                         "order": 0,
                         "winrate": 0.52,
                         "scoreLead": 0.4,
+                        "humanPrior": 0.0,
+                        "utility": 0.3,
+                    },
+                    {
+                        "move": point_to_vertex(target, 9),
+                        "order": 1,
+                        "winrate": 0.51,
+                        "scoreLead": 0.2,
+                        "humanPrior": 1.0,
+                        "utility": 0.2,
                     }
                 ],
                 "humanPolicy": policy,
@@ -162,8 +190,37 @@ class KataGoSettingsAndDecisionTests(unittest.TestCase):
                 human_style_requested=True,
             )
             self.assertEqual(decision.point, target)
-            self.assertIn("5 段棋谱分布", decision.explanation)
+            self.assertIn("2023 职业棋谱风格", decision.explanation)
+            self.assertIn("职业 5 段参数", decision.explanation)
             self.assertTrue(game.analyze_move(*target).legal)
+            engine.close()
+
+    def test_professional_blend_uses_side_to_move_utility(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = self._settings(Path(temporary), with_human=True)
+            engine = KataGoEngine(settings, seed=7)
+            game = GoGame(9)
+            self.assertTrue(game.play(4, 4).legal)  # White is now to move.
+            white_favored = (2, 2)
+            black_favored = (6, 6)
+            move_infos = [
+                {
+                    "move": point_to_vertex(black_favored, 9),
+                    "humanPrior": 0.5,
+                    "utility": 0.8,
+                },
+                {
+                    "move": point_to_vertex(white_favored, 9),
+                    "humanPrior": 0.5,
+                    "utility": -0.8,
+                },
+            ]
+            selected = engine._sample_professional_moves(
+                game,
+                move_infos,
+                KATAGO_PROFILES[-1],
+            )
+            self.assertEqual(selected, white_favored)
             engine.close()
 
 

@@ -9,6 +9,7 @@ local rules engine and KataGo's protocol.
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import random
@@ -47,25 +48,31 @@ class KataGoEngineError(KataGoError):
 class KataGoProfile:
     """One simulated professional tier.
 
-    The human-style profile provides the rank imitation when the optional
-    human SL model is installed.  ``max_visits`` also rises monotonically so
-    that the normal network fallback becomes stronger from tier to tier.
+    The optional human SL model supplies a modern professional-game style.
+    Search visits increase while temperature and utility scale decrease, so
+    higher tiers choose more accurately and consistently.
     """
 
     label: str
     dan: int
     max_visits: int
     human_sl_profile: str
+    move_temperature: float
+    utility_scale: float
 
 
 _VISITS_BY_DAN = (24, 36, 54, 80, 120, 180, 270, 400, 600)
+_TEMPERATURE_BY_DAN = (1.00, 0.90, 0.80, 0.71, 0.63, 0.55, 0.48, 0.41, 0.35)
+_UTILITY_SCALE_BY_DAN = (0.75, 0.66, 0.58, 0.50, 0.43, 0.36, 0.30, 0.25, 0.20)
 
 KATAGO_PROFILES = tuple(
     KataGoProfile(
         label=label,
         dan=index + 1,
         max_visits=_VISITS_BY_DAN[index],
-        human_sl_profile=f"rank_{index + 1}d",
+        human_sl_profile="proyear_2023",
+        move_temperature=_TEMPERATURE_BY_DAN[index],
+        utility_scale=_UTILITY_SCALE_BY_DAN[index],
     )
     for index, label in enumerate(KATAGO_DIFFICULTIES)
 )
@@ -317,6 +324,8 @@ def build_analysis_query(
         query["overrideSettings"] = {
             "humanSLProfile": profile.human_sl_profile,
             "ignorePreRootHistory": False,
+            "humanSLRootExploreProbWeightless": 0.5,
+            "humanSLCpuctPermanent": 2.0,
         }
     return query
 
@@ -524,16 +533,26 @@ class KataGoEngine:
 
         top_vertex = str(move_infos[0].get("move", "pass")) if move_infos else "pass"
         human_policy = response.get("humanPolicy")
+        has_human_policy = (
+            isinstance(human_policy, list)
+            and len(human_policy) == game.size * game.size + 1
+        )
+        has_human_priors = any(
+            (self._optional_float(info.get("humanPrior")) or 0.0) > 0.0
+            for info in move_infos
+        )
         used_human_style = (
             human_style_requested
-            and isinstance(human_policy, list)
-            and len(human_policy) == game.size * game.size + 1
+            and (has_human_priors or has_human_policy)
         )
 
         if top_vertex.strip().upper() == "PASS":
             point: Optional[Point] = None
         elif used_human_style:
-            point = self._sample_human_policy(game, human_policy)
+            point = self._sample_professional_moves(game, move_infos, profile)
+            if point is None and has_human_policy:
+                assert isinstance(human_policy, list)
+                point = self._sample_human_policy(game, human_policy, profile)
             if point is None:
                 point = self._first_legal_candidate(game, move_infos)
         else:
@@ -567,8 +586,8 @@ class KataGoEngine:
             reason = f"KataGo 判断当前应当虚手，完成约 {visits} 次搜索"
         elif used_human_style:
             reason = (
-                f"KataGo 人类风格模型按 {profile.dan} 段棋谱分布选点，"
-                f"主网络完成约 {visits} 次局面核验"
+                "KataGo 人类风格模型按 2023 职业棋谱风格选点，"
+                f"以模拟职业 {profile.dan} 段参数完成约 {visits} 次局面核验"
             )
         else:
             reason = (
@@ -583,10 +602,46 @@ class KataGoEngine:
             analysis_visits=visits,
         )
 
+    def _sample_professional_moves(
+        self,
+        game: GoGame,
+        move_infos: list[dict[str, Any]],
+        profile: KataGoProfile,
+    ) -> Optional[Point]:
+        """Blend professional-game priors with KataGo's searched evaluation."""
+
+        candidates: list[tuple[Point, float, float]] = []
+        for info in move_infos:
+            human_prior = self._optional_float(info.get("humanPrior"))
+            utility = self._optional_float(info.get("utility"))
+            if human_prior is None or human_prior <= 0.0 or utility is None:
+                continue
+            try:
+                point = vertex_to_point(str(info.get("move", "")), game.size)
+            except ValueError:
+                continue
+            if point is None or not game.analyze_move(*point).legal:
+                continue
+            perspective_utility = utility if game.current_player == BLACK else -utility
+            candidates.append((point, human_prior, perspective_utility))
+        if not candidates:
+            return None
+
+        best_utility = max(utility for _, _, utility in candidates)
+        weighted_points: list[tuple[Point, float]] = []
+        for point, human_prior, utility in candidates:
+            log_weight = (
+                math.log(human_prior) / profile.move_temperature
+                + (utility - best_utility) / profile.utility_scale
+            )
+            weighted_points.append((point, math.exp(max(-60.0, log_weight))))
+        return self._weighted_choice(weighted_points)
+
     def _sample_human_policy(
         self,
         game: GoGame,
         policy: list[Any],
+        profile: KataGoProfile,
     ) -> Optional[Point]:
         weighted_points: list[tuple[Point, float]] = []
         for index, raw_weight in enumerate(policy[:-1]):
@@ -598,7 +653,15 @@ class KataGoEngine:
                 continue
             point = (index // game.size, index % game.size)
             if game.analyze_move(*point).legal:
-                weighted_points.append((point, weight))
+                weighted_points.append(
+                    (point, weight ** (1.0 / profile.move_temperature))
+                )
+        return self._weighted_choice(weighted_points)
+
+    def _weighted_choice(
+        self,
+        weighted_points: list[tuple[Point, float]],
+    ) -> Optional[Point]:
         total = sum(weight for _, weight in weighted_points)
         if total <= 0:
             return None
