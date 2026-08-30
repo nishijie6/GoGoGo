@@ -29,6 +29,8 @@ class RulesContentTests(unittest.TestCase):
             "6.5 目",
             "公气",
             "实时胜率",
+            "KataGo",
+            "业余段位档位已移除",
             "F1",
             "推理训练",
             "F2",

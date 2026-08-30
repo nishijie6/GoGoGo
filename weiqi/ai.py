@@ -1,4 +1,4 @@
-"""A fast, local heuristic opponent for the Go GUI."""
+"""Built-in heuristic opponents and shared AI result types."""
 
 from __future__ import annotations
 
@@ -11,13 +11,23 @@ from .engine import BLACK, EMPTY, GoGame, MoveAnalysis, Point, ScoreResult, oppo
 from .winrate import WinRateEstimator
 
 
-AI_DIFFICULTIES = (
+BUILTIN_DIFFICULTIES = (
     "简单",
     "中等",
     "难",
-    *(f"业余棋手{dan}段" for dan in range(1, 6)),
-    *(f"职业棋手{dan}段" for dan in range(1, 10)),
 )
+
+KATAGO_DIFFICULTIES = tuple(
+    f"KataGo 模拟职业{dan}段" for dan in range(1, 10)
+)
+
+AI_DIFFICULTIES = BUILTIN_DIFFICULTIES + KATAGO_DIFFICULTIES
+
+
+def is_katago_difficulty(label: str) -> bool:
+    """Return whether ``label`` is one of the KataGo professional tiers."""
+
+    return label in KATAGO_DIFFICULTIES
 
 
 @dataclass(frozen=True)
@@ -26,6 +36,9 @@ class AIMove:
 
     point: Optional[Point]
     explanation: str
+    black_win_probability: Optional[float] = None
+    black_lead: Optional[float] = None
+    analysis_visits: int = 0
 
 
 @dataclass(frozen=True)
@@ -64,7 +77,9 @@ class GoAI:
         seed: Optional[int] = None,
         difficulty: str = "中等",
     ) -> None:
-        if difficulty not in AI_DIFFICULTIES:
+        if difficulty not in BUILTIN_DIFFICULTIES:
+            if difficulty in KATAGO_DIFFICULTIES:
+                raise ValueError(f"{difficulty} 需要使用 KataGo 对手")
             raise ValueError(f"未知电脑难度：{difficulty}")
         self._random = random.Random(seed)
         self.difficulty = difficulty
@@ -226,37 +241,14 @@ class GoAI:
 
     @staticmethod
     def _difficulty_profile(label: str) -> DifficultyProfile:
-        rank = AI_DIFFICULTIES.index(label)
+        rank = BUILTIN_DIFFICULTIES.index(label)
         if label == "简单":
             return DifficultyProfile(label, rank, 6.0, 0, 20.0, 0, 0.0, 0)
         if label == "中等":
             return DifficultyProfile(label, rank, 1.2, 8, 3.5, 0, 0.0, 0)
         if label == "难":
             return DifficultyProfile(label, rank, 0.6, 3, 1.4, 0, 0.0, 0)
-        if label.startswith("业余"):
-            dan = rank - 2
-            return DifficultyProfile(
-                label=label,
-                rank=rank,
-                noise=0.45 - 0.07 * (dan - 1),
-                choice_pool=3 if dan <= 2 else (2 if dan <= 4 else 1),
-                temperature=max(0.35, 1.2 - 0.18 * (dan - 1)),
-                strategic_candidates=6 + 2 * dan,
-                strategic_weight=0.75 + 0.16 * dan,
-                reply_width=0,
-            )
-
-        dan = rank - 7
-        return DifficultyProfile(
-            label=label,
-            rank=rank,
-            noise=0.12 * (10 - dan) / 9,
-            choice_pool=1,
-            temperature=0.1,
-            strategic_candidates=16 + 2 * dan,
-            strategic_weight=1.7 + 0.18 * dan,
-            reply_width=1 + (dan - 1) // 3,
-        )
+        raise ValueError(f"未知内置电脑难度：{label}")
 
     def _select_candidate(self, candidates: list[_Candidate]) -> _Candidate:
         if self.profile.rank == 0:

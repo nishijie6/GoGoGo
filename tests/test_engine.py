@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import unittest
 
-from weiqi.ai import AI_DIFFICULTIES, GoAI
+from weiqi.ai import (
+    AI_DIFFICULTIES,
+    BUILTIN_DIFFICULTIES,
+    KATAGO_DIFFICULTIES,
+    GoAI,
+)
 from weiqi.engine import BLACK, EMPTY, WHITE, GoGame
 
 
@@ -143,12 +148,16 @@ class GoAITests(unittest.TestCase):
             "简单",
             "中等",
             "难",
-            *(f"业余棋手{dan}段" for dan in range(1, 6)),
-            *(f"职业棋手{dan}段" for dan in range(1, 10)),
+            *(f"KataGo 模拟职业{dan}段" for dan in range(1, 10)),
         )
         self.assertEqual(AI_DIFFICULTIES, expected)
-        profiles = [GoAI(seed=1, difficulty=label).profile for label in expected]
-        self.assertEqual([profile.rank for profile in profiles], list(range(17)))
+        self.assertFalse(any("业余" in label for label in AI_DIFFICULTIES))
+        self.assertEqual(KATAGO_DIFFICULTIES, expected[3:])
+        profiles = [
+            GoAI(seed=1, difficulty=label).profile
+            for label in BUILTIN_DIFFICULTIES
+        ]
+        self.assertEqual([profile.rank for profile in profiles], list(range(3)))
         self.assertEqual(
             [profile.strategic_candidates for profile in profiles],
             sorted(profile.strategic_candidates for profile in profiles),
@@ -165,7 +174,7 @@ class GoAITests(unittest.TestCase):
     def test_every_difficulty_returns_a_legal_move_without_mutation(self) -> None:
         game = GoGame(9)
         before = (game.board_hash(), game.current_player, game.move_number)
-        for label in AI_DIFFICULTIES:
+        for label in BUILTIN_DIFFICULTIES:
             decision = GoAI(seed=11, difficulty=label).choose_move(game)
             self.assertIsNotNone(decision.point, label)
             assert decision.point is not None
@@ -178,6 +187,8 @@ class GoAITests(unittest.TestCase):
     def test_unknown_difficulty_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             GoAI(difficulty="神秘难度")
+        with self.assertRaisesRegex(ValueError, "KataGo"):
+            GoAI(difficulty=KATAGO_DIFFICULTIES[0])
 
     def test_ai_returns_legal_move_without_mutating_game(self) -> None:
         for size in (9, 13, 19):

@@ -7,8 +7,16 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from tkinter import messagebox, ttk
 from typing import Optional
 
-from .ai import AI_DIFFICULTIES, AIMove, GoAI
+from .ai import AI_DIFFICULTIES, AIMove, GoAI, is_katago_difficulty
 from .engine import BLACK, EMPTY, WHITE, GoGame, MoveRecord, Point, color_name
+from .katago import (
+    KataGoAI,
+    KataGoConfigurationError,
+    KataGoEngine,
+    KataGoError,
+    KataGoSettings,
+)
+from .katago_gui import KataGoSettingsDialog
 from .rules import RULE_SECTIONS, RULES_INTRO
 from .training_gui import ReasoningTrainer
 from .winrate import WinRateEstimate, WinRateEstimator
@@ -33,6 +41,7 @@ class GoApp:
 
         self.game = GoGame(size=9)
         self.ai = GoAI()
+        self.katago_engine: Optional[KataGoEngine] = None
         self.winrate_estimator = WinRateEstimator()
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="go-ai")
         self.ai_future: Optional[Future[AIMove]] = None
@@ -47,8 +56,11 @@ class GoApp:
         self._end_dialog_shown = False
         self.rules_window: Optional[tk.Toplevel] = None
         self.training_window: Optional[ReasoningTrainer] = None
+        self.katago_settings_window: Optional[KataGoSettingsDialog] = None
+        self._pending_katago_new_game = False
         self._winrate_cache_key: Optional[tuple[object, ...]] = None
         self._last_winrate: Optional[WinRateEstimate] = None
+        self._winrate_source = "启发式估算"
 
         self.mode_var = tk.StringVar(value=MODE_AI)
         self.size_var = tk.StringVar(value="9×9")
@@ -192,16 +204,22 @@ class GoApp:
         ).grid(row=0, column=1, sticky="sw", padx=(14, 0), pady=(0, 3))
         ttk.Button(
             header,
+            text="KataGo 设置",
+            style="Header.TButton",
+            command=self.show_katago_settings,
+        ).grid(row=0, column=2, sticky="e", padx=(12, 0))
+        ttk.Button(
+            header,
             text="推理训练  F2",
             style="Header.TButton",
             command=self.show_training,
-        ).grid(row=0, column=2, sticky="e", padx=(12, 0))
+        ).grid(row=0, column=3, sticky="e", padx=(8, 0))
         ttk.Button(
             header,
             text="围棋规则  F1",
             style="Header.TButton",
             command=self.show_rules,
-        ).grid(row=0, column=3, sticky="e", padx=(8, 0))
+        ).grid(row=0, column=4, sticky="e", padx=(8, 0))
 
         board_shell = tk.Frame(
             shell,
@@ -312,7 +330,7 @@ class GoApp:
         self.human_combo.grid(row=1, column=1, sticky="ew", padx=(7, 0), pady=(3, 0))
         ttk.Label(
             options,
-            text="电脑难度（相对强度）",
+            text="电脑难度 / 引擎",
             style="Panel.TLabel",
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(5, 0))
         self.difficulty_combo = ttk.Combobox(
@@ -461,6 +479,58 @@ class GoApp:
 
     def _training_closed(self) -> None:
         self.training_window = None
+
+    def show_katago_settings(self, pending_new_game: bool = False) -> None:
+        """Open the KataGo path configuration dialog."""
+
+        self._pending_katago_new_game = (
+            self._pending_katago_new_game or pending_new_game
+        )
+        if (
+            self.katago_settings_window is not None
+            and self.katago_settings_window.is_alive
+        ):
+            self.katago_settings_window.lift()
+            return
+        self.katago_settings_window = KataGoSettingsDialog(
+            self.root,
+            on_saved=self._katago_settings_saved,
+            on_close=self._katago_settings_closed,
+        )
+
+    def _katago_settings_saved(self, settings: KataGoSettings) -> None:
+        """Apply new paths and resume the operation that requested setup."""
+
+        should_start_new_game = self._pending_katago_new_game
+        self._pending_katago_new_game = False
+        self._invalidate_ai()
+        if self.katago_engine is not None:
+            self.katago_engine.close()
+            self.katago_engine = None
+
+        if should_start_new_game:
+            self.root.after(80, self.new_game)
+            return
+
+        if self.active_mode == MODE_AI and is_katago_difficulty(
+            self.active_difficulty
+        ):
+            try:
+                self.katago_engine = KataGoEngine(settings)
+                self.ai = KataGoAI(
+                    self.katago_engine,
+                    self.active_difficulty,
+                )
+            except KataGoError as error:
+                self.notice_var.set(f"KataGo 配置仍不可用：{error}")
+                return
+            self.notice_var.set("KataGo 配置已更新，准备继续当前对局。")
+            if self._is_ai_turn():
+                self.root.after(120, self._start_ai_turn)
+
+    def _katago_settings_closed(self) -> None:
+        self.katago_settings_window = None
+        self._pending_katago_new_game = False
 
     def show_rules(self) -> None:
         """Open the in-program Go rules reference."""
@@ -624,11 +694,48 @@ class GoApp:
     def new_game(self) -> None:
         """Apply the selected options and replace the current game."""
 
-        self._invalidate_ai()
         size = int(self.size_var.get().split("×", maxsplit=1)[0])
-        self.active_mode = self.mode_var.get()
-        self.active_difficulty = self.difficulty_var.get()
-        self.ai = GoAI(difficulty=self.active_difficulty)
+        selected_mode = self.mode_var.get()
+        selected_difficulty = self.difficulty_var.get()
+
+        candidate_engine: Optional[KataGoEngine] = None
+        if selected_mode == MODE_AI and is_katago_difficulty(selected_difficulty):
+            settings = KataGoSettings.load()
+            try:
+                settings.require_valid()
+            except KataGoConfigurationError as error:
+                self.notice_var.set(f"职业段位需要先配置 KataGo：{error}。")
+                self.show_katago_settings(pending_new_game=True)
+                return
+
+            if (
+                self.katago_engine is not None
+                and not self.katago_engine.closed
+                and self.katago_engine.settings.fingerprint == settings.fingerprint
+            ):
+                candidate_engine = self.katago_engine
+            else:
+                try:
+                    candidate_engine = KataGoEngine(settings)
+                except KataGoError as error:
+                    self.notice_var.set(f"KataGo 配置不可用：{error}。")
+                    self.show_katago_settings(pending_new_game=True)
+                    return
+            candidate_ai = KataGoAI(candidate_engine, selected_difficulty)
+        else:
+            builtin_difficulty = (
+                "中等" if is_katago_difficulty(selected_difficulty) else selected_difficulty
+            )
+            candidate_ai = GoAI(difficulty=builtin_difficulty)
+
+        old_engine = self.katago_engine
+        self._invalidate_ai()
+        if old_engine is not None and old_engine is not candidate_engine:
+            old_engine.close()
+        self.katago_engine = candidate_engine
+        self.ai = candidate_ai
+        self.active_mode = selected_mode
+        self.active_difficulty = selected_difficulty
         self.human_color = (
             BLACK if self.human_color_var.get().startswith("黑") else WHITE
         )
@@ -636,9 +743,17 @@ class GoApp:
         self.game = GoGame(size=size, komi=6.5)
         self.hover_point = None
         self._end_dialog_shown = False
+        self._winrate_cache_key = None
+        self._last_winrate = None
+        self._winrate_source = "启发式估算"
         if self.active_mode == MODE_AI:
+            engine_note = (
+                "；首次启动引擎可能需要调优显卡"
+                if is_katago_difficulty(self.active_difficulty)
+                else ""
+            )
             self.notice_var.set(
-                f"新对局已开始，电脑难度：{self.active_difficulty}。"
+                f"新对局已开始，电脑难度：{self.active_difficulty}{engine_note}。"
             )
         else:
             self.notice_var.set("新对局已开始，请在棋盘交叉点落子。")
@@ -980,6 +1095,19 @@ class GoApp:
         try:
             decision = future.result()
         except Exception as error:  # Keep the GUI usable if an AI bug occurs.
+            if isinstance(error, KataGoError) or isinstance(self.ai, KataGoAI):
+                self._refresh(
+                    f"KataGo 计算失败，棋盘已保留：{error}。"
+                    "请检查设置后重试。"
+                )
+                messagebox.showerror(
+                    "KataGo 计算失败",
+                    f"{error}\n\n棋盘没有改变。请检查引擎、模型或显卡后端设置，"
+                    "保存后程序会尝试继续当前对局。",
+                    parent=self.root,
+                )
+                self.show_katago_settings()
+                return
             # A safe automatic pass hands control back instead of leaving the
             # application permanently stuck on the computer's turn.
             if self._is_ai_turn():
@@ -1014,14 +1142,18 @@ class GoApp:
                     f"{color_name(color)}电脑于 {coordinate} 落子{capture_text}"
                     f"（{decision.explanation}）。"
                 )
+        self._store_katago_winrate(decision)
         self._refresh(notice)
         if self.game.game_over:
             self._show_game_over()
 
     def _invalidate_ai(self) -> None:
         self.generation += 1
+        future_running = self.ai_future is not None and not self.ai_future.done()
         if self.ai_future is not None:
             self.ai_future.cancel()
+        if future_running and self.katago_engine is not None:
+            self.katago_engine.stop()
         self.ai_future = None
         self.ai_busy = False
 
@@ -1087,19 +1219,11 @@ class GoApp:
         self.draw_board()
 
     def _update_winrate(self) -> None:
-        cache_key: tuple[object, ...] = (
-            self.game.size,
-            self.game.komi,
-            self.game.board_hash(),
-            self.game.current_player,
-            self.game.move_number,
-            self.game.consecutive_passes,
-            self.game.game_over,
-            self.game.winner,
-        )
+        cache_key = self._position_cache_key()
         if cache_key != self._winrate_cache_key:
             self._last_winrate = self.winrate_estimator.estimate(self.game)
             self._winrate_cache_key = cache_key
+            self._winrate_source = "启发式估算"
 
         estimate = self._last_winrate
         if estimate is None:
@@ -1114,14 +1238,51 @@ class GoApp:
                 detail = f"{color_name(self.game.winner)}胜"
             self.winlead_var.set(f"终局 · {detail}")
         elif abs(estimate.black_lead) < 0.35:
-            self.winlead_var.set(f"{estimate.phase} · 局势接近均衡（启发式估算）")
+            self.winlead_var.set(
+                f"{estimate.phase} · 局势接近均衡（{self._winrate_source}）"
+            )
         else:
             leader = "黑" if estimate.black_lead > 0 else "白"
             self.winlead_var.set(
                 f"{estimate.phase} · {leader}约领先 {abs(estimate.black_lead):.1f} 目"
-                "（启发式估算）"
+                f"（{self._winrate_source}）"
             )
         self._draw_winrate_bar()
+
+    def _position_cache_key(self) -> tuple[object, ...]:
+        return (
+            self.game.size,
+            self.game.komi,
+            self.game.board_hash(),
+            self.game.current_player,
+            self.game.move_number,
+            self.game.consecutive_passes,
+            self.game.game_over,
+            self.game.winner,
+        )
+
+    def _store_katago_winrate(self, decision: AIMove) -> None:
+        """Cache KataGo's post-move evaluation for the position now on screen."""
+
+        probability = decision.black_win_probability
+        if probability is None or self.game.game_over:
+            return
+        heuristic = self.winrate_estimator.estimate(self.game)
+        black_lead = (
+            decision.black_lead
+            if decision.black_lead is not None
+            else heuristic.black_lead
+        )
+        correction = black_lead - heuristic.black_lead
+        self._last_winrate = WinRateEstimate(
+            black_win_probability=max(0.0, min(1.0, probability)),
+            black_expected_score=heuristic.black_expected_score + correction / 2.0,
+            white_expected_score=heuristic.white_expected_score - correction / 2.0,
+            black_lead=black_lead,
+            phase=heuristic.phase,
+        )
+        self._winrate_cache_key = self._position_cache_key()
+        self._winrate_source = f"KataGo · {decision.analysis_visits} visits"
 
     def _draw_winrate_bar(self) -> None:
         if not hasattr(self, "winrate_bar"):
@@ -1205,10 +1366,16 @@ class GoApp:
 
     def close(self) -> None:
         self._invalidate_ai()
+        if self.katago_engine is not None:
+            self.katago_engine.close()
+            self.katago_engine = None
         self.executor.shutdown(wait=False, cancel_futures=True)
         if self.training_window is not None:
             self.training_window.close()
             self.training_window = None
+        if self.katago_settings_window is not None:
+            self.katago_settings_window.close()
+            self.katago_settings_window = None
         self._close_rules()
         self.root.destroy()
 

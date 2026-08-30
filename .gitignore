@@ -3,3 +3,10 @@ __pycache__/
 .venv/
 dist/
 build/
+
+# KataGo binaries/models are large and platform-specific. Keep only the setup
+# guide in this directory; users select local files in the application.
+katago/*
+!katago/README.md
+*.bin.gz
+katago.exe
