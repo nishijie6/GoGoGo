@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,6 +21,7 @@ from weiqi.katago import (
     KataGoEngineError,
     KataGoSettings,
     build_analysis_query,
+    katago_subprocess_environment,
     point_to_vertex,
     profile_for_difficulty,
     vertex_to_point,
@@ -27,6 +29,29 @@ from weiqi.katago import (
 
 
 class KataGoProtocolTests(unittest.TestCase):
+    def test_windows_environment_exposes_pytorch_cuda_libraries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            purelib = Path(temporary)
+            torch_libraries = purelib / "torch" / "lib"
+            torch_libraries.mkdir(parents=True)
+
+            environment = katago_subprocess_environment(
+                purelib=purelib,
+                platform_name="nt",
+            )
+
+        self.assertEqual(
+            environment["PATH"].split(os.pathsep)[0],
+            str(torch_libraries),
+        )
+
+    def test_non_windows_environment_is_not_modified(self) -> None:
+        environment = katago_subprocess_environment(
+            purelib=Path("unused"),
+            platform_name="posix",
+        )
+        self.assertEqual(environment.get("PATH"), os.environ.get("PATH"))
+
     def test_professional_profiles_are_strictly_increasing(self) -> None:
         self.assertEqual(
             tuple(profile.label for profile in KATAGO_PROFILES),

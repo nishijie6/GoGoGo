@@ -15,6 +15,7 @@ import queue
 import random
 import shutil
 import subprocess
+import sysconfig
 import threading
 import uuid
 from collections import deque
@@ -31,6 +32,34 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 KATAGO_FOLDER = PROJECT_ROOT / "katago"
 LEGACY_KATAGO_FOLDER = PROJECT_ROOT / "vendor" / "katago"
 DEFAULT_ANALYSIS_CONFIG = PROJECT_ROOT / "config" / "katago_analysis.cfg"
+
+
+def katago_subprocess_environment(
+    purelib: Optional[Path] = None,
+    platform_name: Optional[str] = None,
+) -> dict[str, str]:
+    """Return an environment that exposes PyTorch's bundled CUDA DLLs.
+
+    The official Windows CUDA builds of KataGo dynamically load the CUDA and
+    cuDNN runtimes.  A CUDA-enabled PyTorch wheel already ships compatible
+    copies, so reusing them avoids requiring a second system-wide CUDA Toolkit
+    installation.  Non-Windows platforms and environments without PyTorch are
+    left unchanged.
+    """
+
+    environment = os.environ.copy()
+    if (platform_name or os.name) != "nt":
+        return environment
+    package_folder = purelib or Path(sysconfig.get_path("purelib"))
+    torch_libraries = package_folder / "torch" / "lib"
+    if torch_libraries.is_dir():
+        current_path = environment.get("PATH", "")
+        environment["PATH"] = (
+            str(torch_libraries)
+            if not current_path
+            else str(torch_libraries) + os.pathsep + current_path
+        )
+    return environment
 
 
 class KataGoError(RuntimeError):
@@ -434,6 +463,7 @@ class KataGoEngine:
                 process = subprocess.Popen(
                     command,
                     cwd=str(runtime_folder),
+                    env=katago_subprocess_environment(),
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,

@@ -20,8 +20,8 @@ KataGo 引擎提供。
 - 程序内置完整中文围棋规则，可点击顶部“围棋规则”或按 `F1` 查看
 - 推理训练：内置常见定式与基础死活题，支持点击试解、提示、逐手演示、回退和重置
 - 每个训练落子都有“为什么这样下”的中文棋理解说；定式明确标注为局部参考次序
-- 已建立强化学习训练配置层：默认采用适合普通电脑的 9×9 平衡参数，并保留
-  19×19 高性能显卡预设与严格的自定义覆盖能力
+- 已接入 KataGo 官方强化学习流水线，当前从 9×9 开始，支持数据洗牌、
+  CUDA/BF16 训练、模型导出、断点续训及后续独立的 19×19 阶段
 - 棋谱列表、坐标、星位、上一手标记和落子预览
 
 ## 启动
@@ -112,54 +112,163 @@ SHA-256，并放入已被 Git 忽略的 `katago/` 目录；之后程序会自动
 不展示模型的隐藏思维过程。定式不是全盘唯一答案；实际选择仍需结合
 周围子力、征子与行棋方向。
 
-## 强化学习训练配置
+## KataGo 强化学习（RTX 5070 Ti）
 
-项目目前先完成了强化学习的**配置基础**，尚未加入 PyTorch 神经网络、MCTS
-和自我对弈训练循环。因此选择配置不会让当前版本在后台自动训练，也不会增加
-正常下棋时的显卡占用。后续训练器会统一读取 `config/rl_training.json`，避免
-界面、训练进程和评测程序各自维护一套不一致的参数。
+本工作区已接入 KataGo 官方的单机训练流程：自我对弈生成数据、洗牌回放窗口、
+PyTorch 更新网络、导出 KataGo 二进制模型，再由新模型继续自我对弈。训练入口
+是 `train_rl.py`，本机专用配置为 `config/rl_training.rtx5070ti.json`。
 
-默认文件使用 `balanced` 预设，主要参数如下：
+课程训练会先接管并续跑现有 9×9 检查点，然后依次进入 13×13 和 19×19；
+不会重置已有的 9×9 数据。三个阶段共用 `b10c128` 网络和迁移后的 SWA 权重，
+但自我对弈、洗牌与检查点始终保存在各自棋盘目录中，禁止跨棋盘混洗。
+9×9 的本机配置按 RTX 5070 Ti 16 GB 的实测结果设置：
 
-| 项目 | 默认值 |
+| 项目 | 本机配置 |
 |---|---:|
-| 棋盘 | 9×9 |
-| 网络 | 64 通道、4 个残差块 |
-| 每手 MCTS | 64 次模拟 |
-| 自我对弈进程 | 2 |
-| 每轮自我对弈 | 16 局 |
-| 训练批次 | 128 |
-| 最大显存比例 | 60% |
+| 棋盘与规则 | 9×9、中国面积计分、位置全局同形、贴 6.5 目 |
+| 数据张量 | `dataBoardLen=9`，不与 19×19 数据混用 |
+| 网络 | 官方 `b10c128`，10 个残差块、128 通道，约 296 万参数 |
+| 训练精度 | CUDA BF16 + TF32 |
+| 训练批次 | 每 GPU 1024 |
+| 每手搜索 | 200 visits |
+| 自我对弈 | 128 个并行棋局线程、推理批次 128、每轮 128 局 |
+| 推理后端 | CUDA FP16 + NHWC、2 个神经网络服务线程 |
+| 每轮训练上限 | 4 步（首轮洗牌集也能形成完整 epoch） |
+| 训练目录 | `training_runs/9x9/` |
 
-默认关闭自我对弈认输，防止早期弱模型因为错误胜率污染训练结果；默认还要求
-在用户开始正常对局时暂停训练。`device` 和数值精度均为 `auto`，将来训练器
-可在有 CUDA 显卡时使用 GPU，无可用加速器时清楚提示并回退到 CPU。
+本机训练吞吐实测如下，最终选择 1024 批次：
 
-仓库同时提供 `config/rl_training.high_performance.example.json`。该示例选择
-`high_performance` 预设，面向显存较大的高性能 NVIDIA 显卡，启用 19×19、
-更深网络、更多并行自我对弈和 400 次 MCTS 模拟。它只是起点，并不对网络
-通道数、残差块、批次或工作进程设置低性能上限；可以通过 `overrides` 继续
-提高或降低任意已知参数。例如：
+| BF16 批次 | 吞吐 | 峰值训练显存 |
+|---:|---:|---:|
+| 256 | 11,993 样本/秒 | 0.54 GiB |
+| 512 | 16,485 样本/秒 | 0.98 GiB |
+| 1024 | 17,609 样本/秒 | 1.84 GiB |
 
-```json
-{
-  "schema_version": 1,
-  "preset": "balanced",
-  "overrides": {
-    "game": {"board_size": 13},
-    "hardware": {
-      "device": "cuda:0",
-      "gpu_memory_fraction": 0.75
-    },
-    "network": {"channels": 96},
-    "self_play": {"workers": 4}
-  }
-}
+Windows 上当前 PyTorch 构建没有可供 `torch.compile` 使用的 Triton，因此本机
+配置采用已实测稳定的 BF16 eager 路径；这不会关闭 CUDA、Tensor Core 或
+TF32。KataGo 推理仍使用 FP16/NHWC。运行前可检查全部依赖：
+
+```powershell
+.\.venv\Scripts\python.exe train_rl.py doctor
+.\.venv\Scripts\python.exe train_rl.py status
 ```
 
-加载器会拒绝拼错的字段、无效棋盘尺寸、超过 100% 的显存比例、不合理的认输
-阈值以及与当前规则引擎不一致的计分或劫争规则。配置保存采用临时文件替换，
-后续在界面中调整参数时不会留下只写了一半的 JSON 文件。
+执行一次短闭环或仅持续当前棋盘训练：
+
+```powershell
+# 少量对局、低 visits，验证所有阶段
+.\.venv\Scripts\python.exe train_rl.py cycle --smoke
+
+# 按 RTX 配置持续训练；Ctrl+C 可安全停止
+.\.venv\Scripts\python.exe train_rl.py continuous
+```
+
+推荐使用自动课程编排器长期训练：
+
+```powershell
+.\.venv\Scripts\python.exe train_rl.py curriculum `
+  --curriculum-config config\rl_curriculum.rtx5070ti.json
+
+# 只读取状态，不启动第二份训练
+.\.venv\Scripts\python.exe train_rl.py curriculum-status
+```
+
+编排器在 9×9 达到最低 1000 万阶段样本且连续通过质量评测后，自动迁移到
+13×13；13×13 新增至少 2500 万阶段样本并达标后迁移到 19×19。19×19
+没有结束样本数，会持续训练并以滚动冠军评测记录胜率与近似 Elo，直到手动停止。
+阶段迁移继承上一阶段的 SWA 权重，但会重置优化器、阶段计数和数据记录。
+每新增 50 万样本执行固定 200 局评测；未达标或评测失败只会留在当前棋盘续训，
+不会强制切换或破坏现有检查点。评测使用持久化的 100 个确定性开局，每个开局
+交换候选与基准的黑白方各下一局，避免把同一空棋盘轨迹重复 200 次当成独立样本。
+自我对弈关闭弱模型的原始策略开局初始化，探索仍由 MCTS 温度和 25% 根噪声提供。
+
+正式接管前可用当前 SWA 检查点分别验证 13×13、19×19 的模型加载、4 局低
+visits 自我对弈及单批训练；验证产物与正式阶段数据完全隔离：
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\validate_curriculum_gpu.py `
+  --source-checkpoint .\training_runs\9x9\torchmodels_toexport\<模型名>\model.ckpt
+```
+
+持续训练每接纳一个新模型都会原子更新本地监控面板和结构化历史。首次启用或需要
+从已有检查点补录时运行：
+
+```powershell
+.\.venv\Scripts\python.exe train_rl.py dashboard
+Start-Process .\training_runs\9x9\dashboard.html
+```
+
+面板每 15 秒自动刷新，展示累计训练样本、自我对弈数据量、每轮新增数据、官方
+总损失 EMA，以及策略/价值/目数损失分量。原始记录同时保存在
+`training_runs/9x9/metrics/history.csv`、`history.jsonl` 和 `latest.json`，可直接
+用于 Excel、Python 或后续实验分析。损失趋势反映对当前训练目标的拟合情况，
+不等同于 Elo 或实际棋力；课程面板中的固定条件模型对战用于判断实际进步。
+
+课程和各棋盘面板可以同时查看；13×13、19×19 面板会在对应阶段首次启动后生成：
+
+```powershell
+Start-Process .\training_runs\curriculum\dashboard.html
+Start-Process .\training_runs\9x9\dashboard.html
+Start-Process .\training_runs\13x13\dashboard.html
+Start-Process .\training_runs\19x19\dashboard.html
+```
+
+全局面板显示当前棋盘、切换门槛、预计剩余样本、评测胜率/Elo、黑白胜负、
+双停率、极端棋局率和磁盘状态；棋盘面板保留该阶段的损失曲线和对局统计。
+原子课程状态保存在 `training_runs/curriculum/state.json`，启动日志位于
+`training_runs/curriculum/logs/`，各阶段原始指标位于
+`training_runs/<棋盘>/metrics/`。可随时用 `curriculum-status` 查看状态；全局锁会
+拒绝重复实例。
+
+训练有互斥锁，不能误启两个进程写同一检查点。中断后再次执行 `continuous`
+会从 `train/gogogo/checkpoint.ckpt` 续训；自我对弈、洗牌数据、日志、待导出
+检查点和已接纳模型分别保存在训练目录的对应子目录。首次没有模型时由 KataGo
+随机启动器生成种子数据。这个单显卡初始训练采用无 gatekeeper 模式，新导出
+模型会直接接纳，以便更快完成早期迭代。
+
+若希望登录 Windows 后自动续训，可为当前用户注册计划任务。任务隐藏启动、忽略
+重复实例、异常退出 5 分钟后重试，且没有运行时限。任务还包含每 5 分钟一次的
+轻量守护触发；正常运行时会因 `IgnoreNew` 自动跳过，外部中断未被 Windows 识别
+为失败时则会在 5 分钟内恢复：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File `
+  .\scripts\register_curriculum_task.ps1 -StartNow
+```
+
+交互运行时按 `Ctrl+C` 会在安全边界保留可恢复产物，再次执行 `curriculum` 即可
+恢复。若要暂停后台计划任务并防止自动重启，可执行：
+
+```powershell
+Stop-ScheduledTask -TaskName GoGoGo-KataGo-Curriculum
+Disable-ScheduledTask -TaskName GoGoGo-KataGo-Curriculum
+
+# 恢复后台训练
+Enable-ScheduledTask -TaskName GoGoGo-KataGo-Curriculum
+Start-ScheduledTask -TaskName GoGoGo-KataGo-Curriculum
+```
+
+电脑休眠期间训练自然暂停，唤醒后继续；注册脚本不会修改 Windows 电源计划。
+剩余磁盘低于 50 GiB 时编排器会主动清理可回收的旧模型、检查点和 NPZ 回放窗；
+低于 30 GiB 时会安全暂停并在全局面板报警。SGF、CSV、JSONL 记录会保留。
+每个棋盘目录中的 `replay_rows.json` 原子记录已清理 NPZ 的累计行数，并传给
+KataGo 官方 `shuffle.py -add-to-data-rows`，因此 50 万行物理回放窗口滚动后，
+检查点和模型名中的逻辑数据水位仍会单调增长。不要手工修改或删除这个账本；
+账本损坏时编排器会停止而不是用错误水位继续训练。
+
+旧的 19×19 `b15c192` 试验数据和检查点仍保存在
+`training_runs/high_performance/`，配置为
+`config/rl_training.rtx5070ti.19x19.json`。它是独立的历史试验，不会进入新的
+`b10c128` 课程训练；课程版 19×19 使用
+`config/rl_training.rtx5070ti.curriculum.19x19.json`。
+
+自行从零训练出的模型一开始很弱，达到成熟围棋网络的棋力需要大量 GPU 时间和
+自我对弈数据。桌面程序默认使用 `katago/` 中下载的成熟主网络；本地强化学习
+模型则在独立训练目录中持续成长，不会意外替换正常对局模型。
+
+通用配置 `config/rl_training.json` 和高性能示例仍可用于覆盖参数。加载器会
+拒绝拼错字段、无效棋盘尺寸、超过 100% 的显存比例，以及与当前规则引擎不一致
+的计分或劫争规则。
 
 ## 规则说明
 
@@ -185,18 +294,26 @@ python -m unittest discover -s tests -v
 
 测试覆盖三种尺寸、提子、自杀禁手、劫争、虚手终局、计分、悔棋、推理分支
 隔离与恢复、AI 合法性、实时胜率估算、KataGo 坐标/棋谱/规则协议、职业段位与
-HumanSL profile、配置读写、内置规则内容，以及定式/死活课程的逐手合法回放。
+HumanSL profile、CUDA 运行时发现、强化学习参数映射、配置读写、内置规则内容，
+以及定式/死活课程的逐手合法回放。
 
 ## 项目结构
 
 ```text
-weiqi_gui/
-├── main.py              # 启动入口
+GoGoGo/
+├── main.py              # 桌面程序启动入口
 ├── 安装KataGo.ps1       # Windows 官方引擎与模型安装脚本
+├── train_rl.py          # KataGo 强化学习命令行入口
+├── requirements-rl.txt  # CUDA PyTorch 训练依赖
 ├── weiqi/
 │   ├── engine.py        # 围棋规则与计分
 │   ├── ai.py            # 本地启发式电脑对手
 │   ├── katago.py        # KataGo JSON 协议、职业段位和进程管理
+│   ├── katago_rl.py     # 官方自我对弈/洗牌/训练/导出编排
+│   ├── replay_accounting.py # NPZ 清理后的原子累计行账本
+│   ├── rl_curriculum.py # 课程配置、质量门槛、迁移与保留规则
+│   ├── rl_curriculum_runtime.py # 可恢复课程运行时和全局面板
+│   ├── rl_metrics.py    # 检查点指标、CSV/JSONL 历史和本地 HTML 图表
 │   ├── katago_gui.py    # KataGo 文件配置窗口
 │   ├── winrate.py       # 实时胜率与领先目数估算
 │   ├── rl_config.py     # 强化学习默认/高性能预设、覆盖和校验
@@ -208,7 +325,16 @@ weiqi_gui/
 ├── config/
 │   ├── katago_analysis.cfg # 低内存、单局面 KataGo 分析配置
 │   ├── rl_training.json # 普通电脑默认强化学习配置
-│   └── rl_training.high_performance.example.json # 高性能显卡示例
+│   ├── rl_training.high_performance.example.json # 高性能显卡示例
+│   ├── rl_training.rtx5070ti.json # 当前 9×9 本机实测配置
+│   ├── rl_training.rtx5070ti.13x13.json # 13×13 课程阶段
+│   ├── rl_training.rtx5070ti.curriculum.19x19.json # 19×19 课程阶段
+│   ├── rl_curriculum.rtx5070ti.json # 9→13→19 课程与门槛
+│   └── rl_training.rtx5070ti.19x19.json # 保留的旧 19×19 试验配置
+├── scripts/
+│   ├── start_curriculum.ps1 # 隐藏计划任务入口与日志
+│   ├── register_curriculum_task.ps1 # 当前用户登录自启注册
+│   └── validate_curriculum_gpu.py # 13/19 GPU 冒烟验证
 ├── katago/
 │   └── README.md        # 可选引擎和模型的本地放置说明
 └── tests/
@@ -216,6 +342,11 @@ weiqi_gui/
     ├── test_winrate.py  # 实时胜率估算测试
     ├── test_katago.py   # KataGo 协议、配置和职业段位测试
     ├── test_installer.py # Windows 安装器固定版本、摘要和目录安全测试
+    ├── test_katago_rl.py # 官方强化学习流水线参数测试
+    ├── test_replay_accounting.py # 回放累计行与中断恢复测试
+    ├── test_rl_curriculum.py # 课程状态、门槛、评测与迁移测试
+    ├── test_rl_curriculum_runtime.py # 编排、磁盘清理和恢复测试
+    ├── test_rl_metrics.py # 训练指标解析、持久化与图表测试
     ├── test_rl_config.py # 强化学习配置与安全校验测试
     ├── test_reasoning.py # 推理分支、撤回边界与正式棋局恢复测试
     ├── test_rules.py    # 程序内规则内容测试

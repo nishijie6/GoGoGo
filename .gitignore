@@ -5,6 +5,7 @@ dist/
 build/
 training_runs/
 katago-analysis.log
+gtp_logs/
 vendor/katago/
 
 # KataGo binaries/models are large and platform-specific. Keep only the setup

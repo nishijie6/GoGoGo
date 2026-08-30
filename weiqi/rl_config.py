@@ -1,9 +1,9 @@
-"""Validated configuration for the future reinforcement-learning trainer.
+"""Validated configuration for the KataGo reinforcement-learning runner.
 
 This module intentionally has no PyTorch dependency.  The GUI and tests can
 therefore read, validate, and save training choices even on a computer that is
-only used to play Go.  A future trainer can consume :class:`RLTrainingConfig`
-without duplicating defaults or silently accepting misspelled options.
+only used to play Go.  The trainer consumes :class:`RLTrainingConfig` without
+duplicating defaults or silently accepting misspelled options.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ class GameTrainingConfig:
 
 @dataclass(frozen=True)
 class HardwareTrainingConfig:
-    """Hardware preferences resolved by the future PyTorch runtime."""
+    """Hardware preferences resolved by the PyTorch runtime."""
 
     device: str
     precision: str
@@ -104,7 +104,7 @@ class OptimizerTrainingConfig:
 
 @dataclass(frozen=True)
 class EvaluationTrainingConfig:
-    """Automatic promotion gate for a newly trained checkpoint."""
+    """Settings reserved for an optional model-promotion gate."""
 
     games: int
     simulations_per_move: int
@@ -226,19 +226,20 @@ _HIGH_PERFORMANCE_PRESET: Dict[str, Any] = {
         "allow_suicide": False,
     },
     "hardware": {
-        # ``auto`` keeps the file loadable everywhere; a trainer should prefer
-        # CUDA when present and otherwise report its chosen fallback clearly.
+        # ``auto`` keeps the generic preset loadable everywhere. A local
+        # hardware profile should select a concrete accelerator.
         "device": "auto",
-        "precision": "auto",
+        "precision": "amp_bfloat16",
         "gpu_memory_fraction": 0.90,
         "allow_tf32": True,
-        "compile_model": True,
+        "compile_model": False,
         "data_loader_workers": 8,
         "pin_memory": True,
     },
     "network": {
-        "channels": 160,
-        "residual_blocks": 12,
+        # Official KataGo model kind b15c192.
+        "channels": 192,
+        "residual_blocks": 15,
         "policy_channels": 4,
         "value_channels": 2,
         "value_hidden_size": 256,

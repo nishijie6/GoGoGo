@@ -4,8 +4,9 @@
   "overrides": {
     "hardware": {
       "device": "cuda:0",
-      "precision": "auto",
-      "gpu_memory_fraction": 0.9
+      "precision": "amp_bfloat16",
+      "gpu_memory_fraction": 0.9,
+      "compile_model": false
     },
     "runtime": {
       "pause_while_game_is_active": true

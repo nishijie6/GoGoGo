@@ -2,6 +2,19 @@
 
 本项目不会把 KataGo 可执行文件和大型神经网络模型提交到 Git 仓库。
 
+## 当前工作区配置
+
+本机已经安装并验证以下内容（均被 `.gitignore` 排除）：
+
+- `katago.exe`：KataGo v1.18.2，CUDA 13.2 / cuDNN 9.24 Windows x64
+- `kata1-tf2-b10c384-s2941M-d5872M.bin.gz`：桌面对局使用的成熟主网络
+- `source/`：固定在官方 v1.18.2 标签，供自我对弈、洗牌、PyTorch 训练和
+  模型导出使用
+
+官方 Windows CUDA 引擎所需的 CUDA/cuDNN DLL 由项目虚拟环境中的
+`torch/lib` 提供，桌面程序和 `train_rl.py` 都会自动补充进程的 `PATH`，
+无需再安装一份完整 CUDA Toolkit。强化学习用法见根目录 `README.md`。
+
 可以把下列文件放在本目录，程序会在启动时自动发现：
 
 - Windows：`katago.exe`

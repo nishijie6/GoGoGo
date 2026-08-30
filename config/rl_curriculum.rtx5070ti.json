@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "state_directory": "training_runs/curriculum",
+  "evaluation_interval_samples": 500000,
+  "evaluation_games": 200,
+  "promotion_win_rate": 0.6,
+  "wilson_lower_bound": 0.5,
+  "required_consecutive_passes": 2,
+  "health_window_cycles": 10,
+  "replay_window_rows": 500000,
+  "keep_models": 20,
+  "keep_shuffles": 10,
+  "disk_cleanup_gib": 50,
+  "disk_pause_gib": 30,
+  "max_gpu_memory_gib": 13,
+  "stages": [
+    {
+      "board_size": 9,
+      "training_config": "config/rl_training.rtx5070ti.json",
+      "min_stage_samples": 10000000,
+      "autotune_batches": [],
+      "indefinite": false
+    },
+    {
+      "board_size": 13,
+      "training_config": "config/rl_training.rtx5070ti.13x13.json",
+      "min_stage_samples": 25000000,
+      "autotune_batches": [512, 1024, 1536, 2048],
+      "indefinite": false
+    },
+    {
+      "board_size": 19,
+      "training_config": "config/rl_training.rtx5070ti.curriculum.19x19.json",
+      "min_stage_samples": null,
+      "autotune_batches": [256, 512, 768, 1024, 1280],
+      "indefinite": true
+    }
+  ]
+}
