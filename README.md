@@ -215,6 +215,7 @@ weiqi_gui/
     ├── test_engine.py   # 规则与电脑对手测试
     ├── test_winrate.py  # 实时胜率估算测试
     ├── test_katago.py   # KataGo 协议、配置和职业段位测试
+    ├── test_installer.py # Windows 安装器固定版本、摘要和目录安全测试
     ├── test_rl_config.py # 强化学习配置与安全校验测试
     ├── test_reasoning.py # 推理分支、撤回边界与正式棋局恢复测试
     ├── test_rules.py    # 程序内规则内容测试

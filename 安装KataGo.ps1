@@ -19,10 +19,16 @@ function Assert-AssetDigest {
         [string]$ExpectedSha256 = ""
     )
 
-    if ($Asset.digest -and $Asset.digest.StartsWith("sha256:")) {
-        $expected = $Asset.digest.Substring(7).ToUpperInvariant()
-    } elseif ($ExpectedSha256) {
+    if ($ExpectedSha256) {
         $expected = $ExpectedSha256.ToUpperInvariant()
+        if ($Asset.digest -and $Asset.digest.StartsWith("sha256:")) {
+            $apiDigest = $Asset.digest.Substring(7).ToUpperInvariant()
+            if ($apiDigest -ne $expected) {
+                throw "$($Asset.name) 的 GitHub API 摘要与仓库固定 SHA-256 不一致。"
+            }
+        }
+    } elseif ($Asset.digest -and $Asset.digest.StartsWith("sha256:")) {
+        $expected = $Asset.digest.Substring(7).ToUpperInvariant()
     } else {
         Write-Warning "GitHub 未返回 $($Asset.name) 的 SHA-256，无法自动校验。"
         return

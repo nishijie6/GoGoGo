@@ -571,6 +571,10 @@ class KataGoEngine:
             move_infos = []
         move_infos = [info for info in move_infos if isinstance(info, dict)]
         move_infos.sort(key=lambda info: int(info.get("order", 999999)))
+        if profile.selection_mode == "human_rank" and not move_infos:
+            raise KataGoEngineError(
+                "HumanSL 请求缺少用于判断虚手的普通搜索结果"
+            )
 
         top_vertex = str(move_infos[0].get("move", "pass")) if move_infos else "pass"
         human_policy = response.get("humanPolicy")

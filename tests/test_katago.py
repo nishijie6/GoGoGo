@@ -351,6 +351,27 @@ class KataGoSettingsAndDecisionTests(unittest.TestCase):
             self.assertIn("虚手", decision.explanation)
             engine.close()
 
+    def test_human_rank_rejects_policy_without_normal_search_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = self._settings(Path(temporary), with_human=True)
+            engine = KataGoEngine(settings)
+            policy = [0.0] * 82
+            policy[0] = 1.0
+            response = {
+                "moveInfos": [],
+                "humanPolicy": policy,
+                "rootInfo": {"visits": 64},
+            }
+
+            with self.assertRaisesRegex(KataGoEngineError, "普通搜索结果"):
+                engine._decision_from_response(
+                    GoGame(9),
+                    HUMANSL_PROFILES[0],
+                    response,
+                    human_style_requested=True,
+                )
+            engine.close()
+
     def test_human_rank_requires_a_configured_human_model(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             settings = self._settings(Path(temporary), with_human=False)
