@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -294,6 +295,83 @@ class KataGoSettingsAndDecisionTests(unittest.TestCase):
             self.assertIn("人类棋谱策略采样", decision.explanation)
             engine.close()
 
+    def test_human_rank_uses_selected_move_evaluation_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = self._settings(Path(temporary), with_human=True)
+            engine = KataGoEngine(settings, seed=13)
+            game = GoGame(9)
+            target = (2, 6)
+            policy = [0.0] * 82
+            policy[target[0] * game.size + target[1]] = 1.0
+            response = {
+                "moveInfos": [
+                    {
+                        "move": point_to_vertex(target, game.size),
+                        "order": 0,
+                        "winrate": 0.63,
+                        "scoreLead": 2.25,
+                    }
+                ],
+                "humanPolicy": policy,
+                "rootInfo": {"winrate": 0.5, "scoreLead": 0.0, "visits": 64},
+            }
+
+            decision = engine._decision_from_response(
+                game,
+                HUMANSL_PROFILES[0],
+                response,
+                human_style_requested=True,
+            )
+
+            self.assertEqual(decision.point, target)
+            self.assertAlmostEqual(decision.black_win_probability or 0.0, 0.63)
+            self.assertAlmostEqual(decision.black_lead or 0.0, 2.25)
+            engine.close()
+
+    def test_human_rank_rejects_request_without_enabled_human_style(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = self._settings(Path(temporary), with_human=True)
+            engine = KataGoEngine(settings)
+            policy = [0.0] * 82
+            policy[0] = 1.0
+            response = {
+                "moveInfos": [{"move": "A9", "order": 0}],
+                "humanPolicy": policy,
+                "rootInfo": {"visits": 64},
+            }
+
+            with self.assertRaisesRegex(KataGoEngineError, "缺少人类风格模型"):
+                engine._decision_from_response(
+                    GoGame(9),
+                    HUMANSL_PROFILES[0],
+                    response,
+                    human_style_requested=False,
+                )
+            engine.close()
+
+    def test_human_rank_rejects_policy_whose_weighted_points_are_illegal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = self._settings(Path(temporary), with_human=True)
+            engine = KataGoEngine(settings)
+            game = GoGame(9)
+            self.assertTrue(game.play(0, 0).legal)
+            policy = [0.0] * 82
+            policy[0] = 1.0
+            response = {
+                "moveInfos": [{"move": "D4", "order": 0}],
+                "humanPolicy": policy,
+                "rootInfo": {"visits": 64},
+            }
+
+            with self.assertRaisesRegex(KataGoEngineError, "可采样"):
+                engine._decision_from_response(
+                    game,
+                    HUMANSL_PROFILES[0],
+                    response,
+                    human_style_requested=True,
+                )
+            engine.close()
+
     def test_human_rank_rejects_missing_or_empty_policy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             settings = self._settings(Path(temporary), with_human=True)
@@ -379,6 +457,63 @@ class KataGoSettingsAndDecisionTests(unittest.TestCase):
             with self.assertRaisesRegex(KataGoConfigurationError, "人类风格模型"):
                 KataGoAI(engine, HUMANSL_DIFFICULTIES[0])
             engine.close()
+
+    def test_settings_load_precedence_covers_current_and_legacy_environment_names(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings_path = Path(temporary) / "settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "executable": "saved.exe",
+                        "model": "saved-model.bin.gz",
+                        "human_model": "saved-human.bin.gz",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            discovered = KataGoSettings(
+                executable="discovered.exe",
+                model="discovered-model.bin.gz",
+                human_model="discovered-human.bin.gz",
+            )
+            environment = {
+                "KATAGO_EXE": "current.exe",
+                "WEIQI_KATAGO_EXE": "legacy.exe",
+                "WEIQI_KATAGO_MODEL": "legacy-model.bin.gz",
+            }
+
+            with patch.dict("os.environ", environment, clear=True):
+                with patch.object(
+                    KataGoSettings,
+                    "_discover_local_files",
+                    return_value=discovered,
+                ):
+                    loaded = KataGoSettings.load(settings_path)
+
+            self.assertEqual(loaded.executable, "current.exe")
+            self.assertEqual(loaded.model, "legacy-model.bin.gz")
+            self.assertEqual(loaded.human_model, "saved-human.bin.gz")
+
+    def test_discovery_can_mix_standard_executable_with_legacy_models(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            standard = root / "katago"
+            legacy = root / "vendor" / "katago"
+            standard.mkdir()
+            (legacy / "models").mkdir(parents=True)
+            executable = standard / "katago.exe"
+            model = legacy / "models" / "legacy.bin.gz"
+            human = legacy / "models" / "legacy-human.bin.gz"
+            for path in (executable, model, human):
+                path.write_bytes(b"test")
+
+            with patch("weiqi.katago.KATAGO_FOLDER", standard):
+                with patch("weiqi.katago.LEGACY_KATAGO_FOLDER", legacy):
+                    discovered = KataGoSettings._discover_local_files()
+
+            self.assertEqual(discovered.executable, str(executable))
+            self.assertEqual(discovered.model, str(model))
+            self.assertEqual(discovered.human_model, str(human))
 
     def test_professional_blend_uses_side_to_move_utility(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

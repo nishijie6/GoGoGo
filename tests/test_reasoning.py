@@ -5,8 +5,8 @@ from __future__ import annotations
 import unittest
 from unittest.mock import Mock, patch
 
-from weiqi.ai import KATAGO_DIFFICULTIES
-from weiqi.engine import BLACK, EMPTY, GoGame
+from weiqi.ai import HUMANSL_DIFFICULTIES, KATAGO_DIFFICULTIES
+from weiqi.engine import BLACK, EMPTY, WHITE, GoGame
 from weiqi.gui import MODE_AI, MODE_LOCAL, GoApp
 from weiqi.katago import KataGoConfigurationError
 from weiqi.reasoning import ReasoningSession
@@ -163,6 +163,28 @@ class ReasoningSessionTests(unittest.TestCase):
         self.assertIs(app.game, session.variation)
         app.show_katago_settings.assert_called_once_with(pending_new_game=True)
 
+    def test_missing_human_model_keeps_reasoning_restore_point(self) -> None:
+        formal_game = GoGame(9)
+        session = ReasoningSession.start(formal_game)
+        app = GoApp.__new__(GoApp)
+        app.game = session.variation
+        app._reasoning_session = session
+        app.size_var = self.variable("9×9")
+        app.mode_var = self.variable(MODE_AI)
+        app.difficulty_var = self.variable(HUMANSL_DIFFICULTIES[0])
+        app.notice_var = Mock()
+        app.show_katago_settings = Mock()
+        settings = Mock()
+        settings.require_valid.return_value = None
+        settings.human_style_enabled = False
+
+        with patch("weiqi.gui.KataGoSettings.load", return_value=settings):
+            app.new_game()
+
+        self.assertIs(app._reasoning_session, session)
+        self.assertIs(app.game, session.variation)
+        app.show_katago_settings.assert_called_once_with(pending_new_game=True)
+
     def test_successful_new_game_discards_reasoning_session(self) -> None:
         formal_game = GoGame(9)
         session = ReasoningSession.start(formal_game)
@@ -187,6 +209,35 @@ class ReasoningSessionTests(unittest.TestCase):
         self.assertIsNot(app.game, session.variation)
         self.assertEqual(app.game.move_number, 0)
         self.assertEqual(app.active_mode, MODE_LOCAL)
+
+    def test_reasoning_pass_end_undoes_one_step_without_formal_result_dialog(self) -> None:
+        formal_game = GoGame(9)
+        session = ReasoningSession.start(formal_game)
+        app = GoApp.__new__(GoApp)
+        app.game = session.variation
+        app._reasoning_session = session
+        app.active_mode = MODE_AI
+        app.human_color = BLACK
+        app.ai_color = WHITE
+        app.ai_busy = False
+        app.hover_point = None
+        app._end_dialog_shown = False
+        app._refresh = Mock()
+        app._show_game_over = Mock()
+        app._invalidate_ai = Mock()
+
+        app.pass_turn()
+        app.pass_turn()
+
+        self.assertTrue(app.game.game_over)
+        self.assertEqual(app.game.move_number, 2)
+        app._show_game_over.assert_not_called()
+
+        app.undo()
+
+        self.assertFalse(app.game.game_over)
+        self.assertEqual(app.game.move_number, 1)
+        self.assertEqual(app._invalidate_ai.call_count, 1)
 
 
 if __name__ == "__main__":
