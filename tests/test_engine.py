@@ -7,6 +7,7 @@ import unittest
 from weiqi.ai import (
     AI_DIFFICULTIES,
     BUILTIN_DIFFICULTIES,
+    HUMANSL_DIFFICULTIES,
     KATAGO_DIFFICULTIES,
     GoAI,
 )
@@ -149,10 +150,13 @@ class GoAITests(unittest.TestCase):
             "中等",
             "难",
             *(f"KataGo 模拟职业{dan}段" for dan in range(1, 10)),
+            *(f"HumanSL {kyu}级（模拟）" for kyu in range(20, 0, -1)),
+            *(f"HumanSL {dan}段（模拟）" for dan in range(1, 10)),
         )
         self.assertEqual(AI_DIFFICULTIES, expected)
         self.assertFalse(any("业余" in label for label in AI_DIFFICULTIES))
-        self.assertEqual(KATAGO_DIFFICULTIES, expected[3:])
+        self.assertEqual(KATAGO_DIFFICULTIES, expected[3:12])
+        self.assertEqual(HUMANSL_DIFFICULTIES, expected[12:])
         profiles = [
             GoAI(seed=1, difficulty=label).profile
             for label in BUILTIN_DIFFICULTIES

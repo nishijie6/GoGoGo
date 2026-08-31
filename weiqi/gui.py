@@ -7,7 +7,13 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from tkinter import messagebox, ttk
 from typing import Optional
 
-from .ai import AI_DIFFICULTIES, AIMove, GoAI, is_katago_difficulty
+from .ai import (
+    AI_DIFFICULTIES,
+    AIMove,
+    GoAI,
+    is_human_sl_difficulty,
+    is_katago_difficulty,
+)
 from .engine import BLACK, EMPTY, WHITE, GoGame, MoveRecord, Point, color_name
 from .katago import (
     KataGoAI,
@@ -17,6 +23,7 @@ from .katago import (
     KataGoSettings,
 )
 from .katago_gui import KataGoSettingsDialog
+from .reasoning import ReasoningSession
 from .rules import RULE_SECTIONS, RULES_INTRO
 from .training_gui import ReasoningTrainer
 from .winrate import WinRateEstimate, WinRateEstimator
@@ -40,6 +47,7 @@ class GoApp:
         self._configure_styles()
 
         self.game = GoGame(size=9)
+        self._reasoning_session: Optional[ReasoningSession] = None
         self.ai = GoAI()
         self.katago_engine: Optional[KataGoEngine] = None
         self.winrate_estimator = WinRateEstimator()
@@ -156,6 +164,17 @@ class GoApp:
             background=[("active", "#3b5a47")],
         )
         style.configure(
+            "ReasoningActive.TButton",
+            background="#9a5728",
+            foreground="#ffffff",
+            font=("Microsoft YaHei UI", 9, "bold"),
+            padding=(11, 7),
+        )
+        style.map(
+            "ReasoningActive.TButton",
+            background=[("active", "#b86a31")],
+        )
+        style.configure(
             "RuleTitle.TLabel",
             background="#f2eee5",
             foreground="#1d3024",
@@ -208,18 +227,25 @@ class GoApp:
             style="Header.TButton",
             command=self.show_katago_settings,
         ).grid(row=0, column=2, sticky="e", padx=(12, 0))
+        self.reasoning_button = ttk.Button(
+            header,
+            text="开启推理  F3",
+            style="Header.TButton",
+            command=self.toggle_reasoning_mode,
+        )
+        self.reasoning_button.grid(row=0, column=3, sticky="e", padx=(8, 0))
         ttk.Button(
             header,
             text="推理训练  F2",
             style="Header.TButton",
             command=self.show_training,
-        ).grid(row=0, column=3, sticky="e", padx=(8, 0))
+        ).grid(row=0, column=4, sticky="e", padx=(8, 0))
         ttk.Button(
             header,
             text="围棋规则  F1",
             style="Header.TButton",
             command=self.show_rules,
-        ).grid(row=0, column=4, sticky="e", padx=(8, 0))
+        ).grid(row=0, column=5, sticky="e", padx=(8, 0))
 
         board_shell = tk.Frame(
             shell,
@@ -459,7 +485,7 @@ class GoApp:
 
         ttk.Label(
             panel,
-            text="快捷键：Ctrl+N 新局 · Ctrl+Z 悔棋 · P 虚手\nF1 规则 · F2 推理训练；连续两次虚手结束。",
+            text="快捷键：Ctrl+N 新局 · Ctrl+Z 悔棋 · P 虚手\nF1 规则 · F2 推理训练 · F3 推理模式。",
             style="Panel.TLabel",
             wraplength=225,
             justify="left",
@@ -522,6 +548,9 @@ class GoApp:
                     self.active_difficulty,
                 )
             except KataGoError as error:
+                if self.katago_engine is not None:
+                    self.katago_engine.close()
+                    self.katago_engine = None
                 self.notice_var.set(f"KataGo 配置仍不可用：{error}")
                 return
             self.notice_var.set("KataGo 配置已更新，准备继续当前对局。")
@@ -673,6 +702,7 @@ class GoApp:
         self.root.bind("<Key-P>", lambda _event: self.pass_turn())
         self.root.bind("<F1>", lambda _event: self.show_rules())
         self.root.bind("<F2>", lambda _event: self.show_training())
+        self.root.bind("<F3>", lambda _event: self.toggle_reasoning_mode())
 
     def _bind_panel_mousewheel(self, widget: tk.Misc) -> None:
         if not isinstance(widget, (tk.Listbox, ttk.Scrollbar)):
@@ -691,6 +721,70 @@ class GoApp:
         self.human_combo.configure(state=state)
         self.difficulty_combo.configure(state=state)
 
+    @property
+    def in_reasoning_mode(self) -> bool:
+        """Whether the board is currently showing an isolated variation."""
+
+        return self._reasoning_session is not None
+
+    def toggle_reasoning_mode(self) -> bool:
+        """Enter reasoning mode, or discard the variation and restore the game."""
+
+        if self.in_reasoning_mode:
+            return self.exit_reasoning_mode()
+        return self.enter_reasoning_mode()
+
+    def enter_reasoning_mode(self) -> bool:
+        """Save the formal game and switch the board to a temporary variation."""
+
+        if self.game.game_over:
+            self.notice_var.set("本局已经结束，不能从终局开启推理模式。")
+            self.root.bell()
+            return False
+
+        self._invalidate_ai()
+        session = ReasoningSession.start(self.game)
+        self._reasoning_session = session
+        self.game = session.variation
+        self.hover_point = None
+        self._end_dialog_shown = False
+        self._winrate_cache_key = None
+        self._last_winrate = None
+        self._winrate_source = "启发式估算"
+        self._refresh(
+            "推理模式已开启：正式棋局已保存。现在可为黑白双方连续推演，"
+            "悔棋只撤回推演着手。"
+        )
+        return True
+
+    def exit_reasoning_mode(self) -> bool:
+        """Discard the temporary variation and resume the saved formal game."""
+
+        session = self._reasoning_session
+        if session is None:
+            return False
+
+        self._invalidate_ai()
+        variation_moves = session.variation_move_count
+        self.game = session.restore_formal_game()
+        self._reasoning_session = None
+        self.hover_point = None
+        self._end_dialog_shown = False
+        self._winrate_cache_key = None
+        self._last_winrate = None
+        self._winrate_source = "启发式估算"
+        if variation_moves:
+            notice = (
+                f"已退出推理模式，丢弃当前推演分支的 {variation_moves} 手；"
+                "正式棋局已恢复，可继续对局。"
+            )
+        else:
+            notice = "已退出推理模式，正式棋局已恢复，可继续对局。"
+        self._refresh(notice)
+        if self._is_ai_turn():
+            self.root.after(220, self._start_ai_turn)
+        return True
+
     def new_game(self) -> None:
         """Apply the selected options and replace the current game."""
 
@@ -704,7 +798,16 @@ class GoApp:
             try:
                 settings.require_valid()
             except KataGoConfigurationError as error:
-                self.notice_var.set(f"职业段位需要先配置 KataGo：{error}。")
+                self.notice_var.set(f"所选电脑难度需要先配置 KataGo：{error}。")
+                self.show_katago_settings(pending_new_game=True)
+                return
+            if (
+                is_human_sl_difficulty(selected_difficulty)
+                and not settings.human_style_enabled
+            ):
+                self.notice_var.set(
+                    "HumanSL 人类段位需要先配置人类风格模型。"
+                )
                 self.show_katago_settings(pending_new_game=True)
                 return
 
@@ -730,6 +833,7 @@ class GoApp:
 
         old_engine = self.katago_engine
         self._invalidate_ai()
+        self._reasoning_session = None
         if old_engine is not None and old_engine is not candidate_engine:
             old_engine.close()
         self.katago_engine = candidate_engine
@@ -755,6 +859,12 @@ class GoApp:
             self.notice_var.set(
                 f"新对局已开始，电脑难度：{self.active_difficulty}{engine_note}。"
             )
+            if is_human_sl_difficulty(self.active_difficulty) and size != 19:
+                self.notice_var.set(
+                    self.notice_var.get()
+                    + " HumanSL 级段位主要基于 19×19 人类棋谱，"
+                    "当前尺寸仅作风格模拟。"
+                )
         else:
             self.notice_var.set("新对局已开始，请在棋盘交叉点落子。")
         self._on_mode_selected()
@@ -767,7 +877,11 @@ class GoApp:
             if self.ai_busy:
                 self.notice_var.set("电脑正在思考，请稍候…")
             elif self.game.game_over:
-                if self.game.result_text:
+                if self.in_reasoning_mode:
+                    self.notice_var.set(
+                        "当前推演分支已经结束，可悔棋继续推演，或退出推理模式恢复正式棋局。"
+                    )
+                elif self.game.result_text:
                     self.notice_var.set(self.game.result_text)
                 else:
                     self.notice_var.set("本局已经结束，可悔棋或开始新局。")
@@ -792,6 +906,8 @@ class GoApp:
             notice = f"{color_name(color)}于 {coordinate} 落子，提掉 {analysis.captured} 子。"
         else:
             notice = f"{color_name(color)}于 {coordinate} 落子。"
+        if self.in_reasoning_mode:
+            notice = f"推演：{notice}"
         self.hover_point = None
         self._refresh(notice)
         if self._is_ai_turn():
@@ -938,6 +1054,57 @@ class GoApp:
             )
 
         self._draw_hover()
+        self._draw_reasoning_overlay(stone_radius)
+
+    def _draw_reasoning_overlay(self, stone_radius: float) -> None:
+        """Mark temporary stones and keep the variation boundary unmistakable."""
+
+        session = self._reasoning_session
+        if session is None or self._board_geometry is None:
+            return
+
+        origin_x, origin_y, gap = self._board_geometry
+        marked_points: set[Point] = set()
+        for move in self.game.moves[session.start_move_number :]:
+            if move.kind != "play" or move.row is None or move.col is None:
+                continue
+            point = (move.row, move.col)
+            if point in marked_points or self.game.board[move.row][move.col] != move.color:
+                continue
+            marked_points.add(point)
+            center_x = origin_x + move.col * gap
+            center_y = origin_y + move.row * gap
+            radius = stone_radius * 0.84
+            self.canvas.create_oval(
+                center_x - radius,
+                center_y - radius,
+                center_x + radius,
+                center_y + radius,
+                outline="#e47b2d",
+                width=max(2, int(stone_radius * 0.10)),
+                tags="reasoning-overlay",
+            )
+
+        badge_text = f"推理模式 · 临时变化 +{session.variation_move_count} 手"
+        self.canvas.create_rectangle(
+            13,
+            11,
+            235,
+            42,
+            fill="#7d431e",
+            outline="#f0a154",
+            width=1,
+            tags="reasoning-overlay",
+        )
+        self.canvas.create_text(
+            24,
+            26,
+            text=badge_text,
+            anchor="w",
+            fill="#fff5e8",
+            font=("Microsoft YaHei UI", 10, "bold"),
+            tags="reasoning-overlay",
+        )
 
     def _draw_stone(self, row: int, col: int, color: int, radius: float) -> None:
         if self._board_geometry is None:
@@ -1028,9 +1195,11 @@ class GoApp:
         if not self.game.pass_turn():
             return
         self.hover_point = None
-        self._refresh(f"{color_name(color)}选择虚手。")
+        prefix = "推演：" if self.in_reasoning_mode else ""
+        self._refresh(f"{prefix}{color_name(color)}选择虚手。")
         if self.game.game_over:
-            self._show_game_over()
+            if not self.in_reasoning_mode:
+                self._show_game_over()
         elif self._is_ai_turn():
             self._start_ai_turn()
 
@@ -1038,23 +1207,49 @@ class GoApp:
         if not self._human_can_act():
             return
         color = self.game.current_player
+        reasoning = self.in_reasoning_mode
+        title = "确认推演认输" if reasoning else "确认认输"
+        prompt = (
+            f"确定让{color_name(color)}在当前推演分支认输吗？"
+            "这不会影响正式棋局。"
+            if reasoning
+            else f"确定由{color_name(color)}认输并结束本局吗？"
+        )
         if not messagebox.askyesno(
-            "确认认输", f"确定由{color_name(color)}认输并结束本局吗？", parent=self.root
+            title,
+            prompt,
+            parent=self.root,
         ):
             return
         if self.game.resign():
             self.hover_point = None
-            self._refresh(self.game.result_text)
-            self._show_game_over()
+            if reasoning:
+                self._refresh(
+                    f"推演分支：{self.game.result_text}。可悔棋继续推演，"
+                    "或退出推理模式恢复正式棋局。"
+                )
+            else:
+                self._refresh(self.game.result_text)
+                self._show_game_over()
 
     def undo(self) -> None:
         if not self.game.can_undo:
-            self.notice_var.set("当前没有可以撤回的着手。")
+            if self.in_reasoning_mode:
+                self.notice_var.set(
+                    "推演已经回到保存点，不能撤回正式棋局中的着手。"
+                )
+            else:
+                self.notice_var.set("当前没有可以撤回的着手。")
             return
 
         was_ai_busy = self.ai_busy
         self._invalidate_ai()
         undone = self.game.undo(1)
+        if self.in_reasoning_mode:
+            self.hover_point = None
+            self._end_dialog_shown = False
+            self._refresh(f"推演已撤回 {undone} 手，正式棋局保持不变。")
+            return
         if self.active_mode == MODE_AI and not was_ai_busy:
             # Normally take back the AI response and the preceding human action,
             # leaving the human at the decision they wanted to reconsider.
@@ -1159,7 +1354,8 @@ class GoApp:
 
     def _is_ai_turn(self) -> bool:
         return (
-            self.active_mode == MODE_AI
+            not self.in_reasoning_mode
+            and self.active_mode == MODE_AI
             and not self.game.game_over
             and self.game.current_player == self.ai_color
         )
@@ -1167,15 +1363,30 @@ class GoApp:
     def _human_can_act(self) -> bool:
         if self.game.game_over or self.ai_busy:
             return False
+        if self.in_reasoning_mode:
+            return True
         return self.active_mode == MODE_LOCAL or self.game.current_player == self.human_color
 
     def _refresh(self, notice: Optional[str] = None) -> None:
-        if self.game.game_over and self.game.result_text:
+        if self.in_reasoning_mode and self.game.game_over:
+            result = self.game.result_text or "当前变化已经结束"
+            self.notice_var.set(
+                f"推演分支已结束：{result}。可悔棋继续推演，"
+                "或退出推理模式恢复正式棋局。"
+            )
+        elif self.game.game_over and self.game.result_text:
             self.notice_var.set(self.game.result_text)
         elif notice is not None:
             self.notice_var.set(notice)
 
-        if self.game.game_over:
+        if self.in_reasoning_mode:
+            if self.game.game_over:
+                self.turn_var.set("◆ 推理模式 · 分支结束")
+            else:
+                self.turn_var.set(
+                    f"◆ 推理模式 · {color_name(self.game.current_player)}推演"
+                )
+        elif self.game.game_over:
             self.turn_var.set("对局结束")
         elif self.ai_busy:
             self.turn_var.set(
@@ -1195,9 +1406,17 @@ class GoApp:
         self.capture_var.set(
             f"提子：黑 {self.game.captures[BLACK]}  ·  白 {self.game.captures[WHITE]}"
         )
-        self.move_var.set(
-            f"手数：{self.game.move_number}  ·  连续虚手：{self.game.consecutive_passes}"
-        )
+        session = self._reasoning_session
+        if session is not None:
+            self.move_var.set(
+                f"正式 {session.start_move_number} 手  ·  "
+                f"推演 +{session.variation_move_count} 手  ·  "
+                f"连续虚手 {self.game.consecutive_passes}"
+            )
+        else:
+            self.move_var.set(
+                f"手数：{self.game.move_number}  ·  连续虚手：{self.game.consecutive_passes}"
+            )
         if self.game.moves:
             last = self.game.moves[-1]
             if last.kind == "play" and last.row is not None and last.col is not None:
@@ -1210,6 +1429,18 @@ class GoApp:
         else:
             self.last_var.set("上一手：—")
 
+        if self.in_reasoning_mode:
+            self.reasoning_button.configure(
+                text="退出推理  F3",
+                style="ReasoningActive.TButton",
+                state="normal",
+            )
+        else:
+            self.reasoning_button.configure(
+                text="开启推理  F3",
+                style="Header.TButton",
+                state="disabled" if self.game.game_over else "normal",
+            )
         self.undo_button.configure(state="normal" if self.game.can_undo else "disabled")
         action_state = "normal" if self._human_can_act() else "disabled"
         self.pass_button.configure(state=action_state)
@@ -1282,7 +1513,8 @@ class GoApp:
             phase=heuristic.phase,
         )
         self._winrate_cache_key = self._position_cache_key()
-        self._winrate_source = f"KataGo · {decision.analysis_visits} visits"
+        source = "HumanSL" if is_human_sl_difficulty(self.active_difficulty) else "KataGo"
+        self._winrate_source = f"{source} · {decision.analysis_visits} visits"
 
     def _draw_winrate_bar(self) -> None:
         if not hasattr(self, "winrate_bar"):
@@ -1325,8 +1557,13 @@ class GoApp:
 
     def _refresh_move_log(self) -> None:
         self.move_log.delete(0, tk.END)
+        session = self._reasoning_session
         for index, move in enumerate(self.game.moves, start=1):
+            if session is not None and index == session.start_move_number + 1:
+                self.move_log.insert(tk.END, "──── 推理分支起点 ────")
             self.move_log.insert(tk.END, self._format_move(index, move))
+        if session is not None and self.game.move_number == session.start_move_number:
+            self.move_log.insert(tk.END, "──── 推理分支起点 ────")
         if self.game.moves:
             self.move_log.see(tk.END)
 
@@ -1346,7 +1583,7 @@ class GoApp:
         return f"{COLUMN_NAMES[col]}{self.game.size - row}"
 
     def _show_game_over(self) -> None:
-        if self._end_dialog_shown:
+        if self.in_reasoning_mode or self._end_dialog_shown:
             return
         self._end_dialog_shown = True
         if self.game.score_result is not None:

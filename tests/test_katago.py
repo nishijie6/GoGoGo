@@ -5,12 +5,18 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from weiqi.ai import KATAGO_DIFFICULTIES
+from weiqi.ai import HUMANSL_DIFFICULTIES, KATAGO_DIFFICULTIES
 from weiqi.engine import GoGame
 from weiqi.katago import (
+    HUMANSL_PROFILE_NAMES,
+    HUMANSL_PROFILES,
     KATAGO_PROFILES,
+    KataGoAI,
+    KataGoConfigurationError,
     KataGoEngine,
+    KataGoEngineError,
     KataGoSettings,
     build_analysis_query,
     point_to_vertex,
@@ -89,6 +95,36 @@ class KataGoProtocolTests(unittest.TestCase):
             0.5,
         )
 
+    def test_human_rank_profiles_cover_20k_through_9d(self) -> None:
+        self.assertEqual(
+            tuple(profile.label for profile in HUMANSL_PROFILES),
+            HUMANSL_DIFFICULTIES,
+        )
+        self.assertEqual(
+            tuple(profile.human_sl_profile for profile in HUMANSL_PROFILES),
+            HUMANSL_PROFILE_NAMES,
+        )
+        self.assertEqual(HUMANSL_PROFILE_NAMES[0], "rank_20k")
+        self.assertEqual(HUMANSL_PROFILE_NAMES[-1], "rank_9d")
+        self.assertTrue(
+            all(profile.selection_mode == "human_rank" for profile in HUMANSL_PROFILES)
+        )
+        self.assertTrue(all(profile.max_visits == 64 for profile in HUMANSL_PROFILES))
+
+    def test_human_rank_query_omits_professional_blend_overrides(self) -> None:
+        profile = HUMANSL_PROFILES[17]
+        query = build_analysis_query(GoGame(19), profile, "human-rank", True)
+
+        self.assertTrue(query["includePolicy"])
+        self.assertEqual(query["maxVisits"], 64)
+        self.assertEqual(
+            query["overrideSettings"],
+            {
+                "humanSLProfile": profile.human_sl_profile,
+                "ignorePreRootHistory": False,
+            },
+        )
+
     def test_empty_game_query_sets_initial_player(self) -> None:
         game = GoGame(13)
         query = build_analysis_query(game, KATAGO_PROFILES[0], "empty", False)
@@ -123,6 +159,42 @@ class KataGoSettingsAndDecisionTests(unittest.TestCase):
             settings.save(settings_path)
             loaded = KataGoSettings.load(settings_path)
             self.assertEqual(loaded.fingerprint, settings.fingerprint)
+
+    def test_local_discovery_reuses_legacy_install_but_prefers_standard_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            standard = root / "katago"
+            legacy = root / "vendor" / "katago"
+            (legacy / "runtime").mkdir(parents=True)
+            (legacy / "models").mkdir(parents=True)
+            legacy_executable = legacy / "runtime" / "katago.exe"
+            legacy_model = legacy / "models" / "legacy.bin.gz"
+            legacy_human = legacy / "models" / "legacy-human.bin.gz"
+            for path in (legacy_executable, legacy_model, legacy_human):
+                path.write_bytes(b"test")
+
+            with patch("weiqi.katago.KATAGO_FOLDER", standard):
+                with patch("weiqi.katago.LEGACY_KATAGO_FOLDER", legacy):
+                    discovered = KataGoSettings._discover_local_files()
+                    self.assertEqual(discovered.executable, str(legacy_executable))
+                    self.assertEqual(discovered.model, str(legacy_model))
+                    self.assertEqual(discovered.human_model, str(legacy_human))
+
+                    standard.mkdir()
+                    standard_executable = standard / "katago.exe"
+                    standard_model = standard / "standard.bin.gz"
+                    standard_human = standard / "standard-human.bin.gz"
+                    for path in (
+                        standard_executable,
+                        standard_model,
+                        standard_human,
+                    ):
+                        path.write_bytes(b"test")
+
+                    preferred = KataGoSettings._discover_local_files()
+                    self.assertEqual(preferred.executable, str(standard_executable))
+                    self.assertEqual(preferred.model, str(standard_model))
+                    self.assertEqual(preferred.human_model, str(standard_human))
 
     def test_main_network_decision_uses_selected_move_evaluation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -193,6 +265,98 @@ class KataGoSettingsAndDecisionTests(unittest.TestCase):
             self.assertIn("2023 职业棋谱风格", decision.explanation)
             self.assertIn("职业 5 段参数", decision.explanation)
             self.assertTrue(game.analyze_move(*target).legal)
+            engine.close()
+
+    def test_human_rank_samples_policy_without_faking_post_move_estimate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = self._settings(Path(temporary), with_human=True)
+            engine = KataGoEngine(settings, seed=11)
+            game = GoGame(9)
+            target = (2, 6)
+            policy = [0.0] * 82
+            policy[target[0] * game.size + target[1]] = 1.0
+            response = {
+                "moveInfos": [{"move": "D4", "order": 0}],
+                "humanPolicy": policy,
+                "rootInfo": {"winrate": 0.77, "scoreLead": 8.0, "visits": 64},
+            }
+
+            decision = engine._decision_from_response(
+                game,
+                HUMANSL_PROFILES[17],
+                response,
+                human_style_requested=True,
+            )
+
+            self.assertEqual(decision.point, target)
+            self.assertIsNone(decision.black_win_probability)
+            self.assertIsNone(decision.black_lead)
+            self.assertIn("人类棋谱策略采样", decision.explanation)
+            engine.close()
+
+    def test_human_rank_rejects_missing_or_empty_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = self._settings(Path(temporary), with_human=True)
+            engine = KataGoEngine(settings, seed=5)
+            game = GoGame(9)
+            profile = HUMANSL_PROFILES[0]
+            missing_policy = {
+                "moveInfos": [{"move": "D4", "order": 0}],
+                "rootInfo": {"visits": 64},
+            }
+            with self.assertRaisesRegex(KataGoEngineError, "长度与棋盘匹配"):
+                engine._decision_from_response(
+                    game,
+                    profile,
+                    missing_policy,
+                    human_style_requested=True,
+                )
+
+            invalid_weights = [0.0] * 82
+            invalid_weights[0] = float("nan")
+            invalid_weights[1] = float("inf")
+            empty_policy = dict(missing_policy, humanPolicy=invalid_weights)
+            with self.assertRaisesRegex(KataGoEngineError, "可采样"):
+                engine._decision_from_response(
+                    game,
+                    profile,
+                    empty_policy,
+                    human_style_requested=True,
+                )
+            engine.close()
+
+    def test_human_rank_allows_normal_search_to_choose_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = self._settings(Path(temporary), with_human=True)
+            engine = KataGoEngine(settings, seed=2)
+            game = GoGame(9)
+            policy = [0.0] * 82
+            policy[0] = 1.0
+            response = {
+                "moveInfos": [{"move": "pass", "order": 0}],
+                "humanPolicy": policy,
+                "rootInfo": {"winrate": 0.6, "scoreLead": 1.5, "visits": 64},
+            }
+
+            decision = engine._decision_from_response(
+                game,
+                HUMANSL_PROFILES[0],
+                response,
+                human_style_requested=True,
+            )
+
+            self.assertIsNone(decision.point)
+            self.assertIsNone(decision.black_win_probability)
+            self.assertIsNone(decision.black_lead)
+            self.assertIn("虚手", decision.explanation)
+            engine.close()
+
+    def test_human_rank_requires_a_configured_human_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = self._settings(Path(temporary), with_human=False)
+            engine = KataGoEngine(settings)
+            with self.assertRaisesRegex(KataGoConfigurationError, "人类风格模型"):
+                KataGoAI(engine, HUMANSL_DIFFICULTIES[0])
             engine.close()
 
     def test_professional_blend_uses_side_to_move_utility(self) -> None:

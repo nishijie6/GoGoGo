@@ -21,13 +21,28 @@ KATAGO_DIFFICULTIES = tuple(
     f"KataGo 模拟职业{dan}段" for dan in range(1, 10)
 )
 
-AI_DIFFICULTIES = BUILTIN_DIFFICULTIES + KATAGO_DIFFICULTIES
+HUMANSL_DIFFICULTIES = (
+    *(f"HumanSL {kyu}级（模拟）" for kyu in range(20, 0, -1)),
+    *(f"HumanSL {dan}段（模拟）" for dan in range(1, 10)),
+)
+
+AI_DIFFICULTIES = (
+    BUILTIN_DIFFICULTIES
+    + KATAGO_DIFFICULTIES
+    + HUMANSL_DIFFICULTIES
+)
 
 
 def is_katago_difficulty(label: str) -> bool:
-    """Return whether ``label`` is one of the KataGo professional tiers."""
+    """Return whether ``label`` requires the external KataGo engine."""
 
-    return label in KATAGO_DIFFICULTIES
+    return label in KATAGO_DIFFICULTIES or label in HUMANSL_DIFFICULTIES
+
+
+def is_human_sl_difficulty(label: str) -> bool:
+    """Return whether ``label`` directly simulates one HumanSL rank profile."""
+
+    return label in HUMANSL_DIFFICULTIES
 
 
 @dataclass(frozen=True)
@@ -78,7 +93,7 @@ class GoAI:
         difficulty: str = "中等",
     ) -> None:
         if difficulty not in BUILTIN_DIFFICULTIES:
-            if difficulty in KATAGO_DIFFICULTIES:
+            if is_katago_difficulty(difficulty):
                 raise ValueError(f"{difficulty} 需要使用 KataGo 对手")
             raise ValueError(f"未知电脑难度：{difficulty}")
         self._random = random.Random(seed)

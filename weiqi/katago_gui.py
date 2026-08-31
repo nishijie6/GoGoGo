@@ -75,15 +75,15 @@ class KataGoSettingsDialog:
         self.window.columnconfigure(0, weight=1)
         shell.columnconfigure(0, weight=1)
 
-        ttk.Label(shell, text="KataGo 职业棋手模拟", style="RuleTitle.TLabel").grid(
+        ttk.Label(shell, text="KataGo 与 HumanSL 模拟", style="RuleTitle.TLabel").grid(
             row=0, column=0, sticky="w"
         )
         ttk.Label(
             shell,
             text=(
-                "职业 1–9 段需要官方 KataGo 引擎和主神经网络。可选的人类风格"
-                "模型会使用 proyear_2023 职业棋谱策略，再以递增搜索量、逐级降低"
-                "的随机温度和更严格的主网络评价区分难度；不安装时仍可运行主网络。"
+                "职业 1–9 段需要官方 KataGo 引擎和主神经网络；人类风格模型"
+                "对职业档位是可选增强，对 HumanSL 20级–9段则是必需文件。"
+                "所有级段位均为棋谱风格模拟，不是棋力认证。"
             ),
             style="RuleIntro.TLabel",
             wraplength=730,
@@ -110,7 +110,7 @@ class KataGoSettingsDialog:
         self._path_field(
             fields,
             row=4,
-            title="3. KataGo 人类风格网络 *human*.bin.gz（推荐，可选）",
+            title="3. KataGo 人类风格网络 *human*.bin.gz（HumanSL 必需）",
             variable=self.human_model_var,
             command=self._browse_human_model,
         )
@@ -252,13 +252,12 @@ class KataGoSettingsDialog:
             self.status_label.configure(fg="#9d3d31")
         elif settings.human_style_enabled:
             self.status_var.set(
-                "配置完整：将使用 KataGo 主网络分析，并结合 2023 职业棋谱风格"
-                "模拟职业 1–9 段行棋。"
+                "配置完整：职业 1–9 段和 HumanSL 20级–9段均可使用。"
             )
             self.status_label.configure(fg="#315e43")
         else:
             self.status_var.set(
-                "可以运行：将使用 KataGo 主网络和递增搜索量。若希望更像对应段位真人，"
+                "可以运行职业 1–9 段的主网络模式；HumanSL 20级–9段仍不可用，"
                 "请再配置官方人类风格模型。"
             )
             self.status_label.configure(fg="#7b5b28")

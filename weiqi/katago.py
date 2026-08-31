@@ -20,15 +20,16 @@ import uuid
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
-from .ai import AIMove, KATAGO_DIFFICULTIES
+from .ai import AIMove, HUMANSL_DIFFICULTIES, KATAGO_DIFFICULTIES
 from .engine import BLACK, WHITE, GoGame, MoveRecord, Point
 
 
 GTP_COLUMNS = "ABCDEFGHJKLMNOPQRST"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 KATAGO_FOLDER = PROJECT_ROOT / "katago"
+LEGACY_KATAGO_FOLDER = PROJECT_ROOT / "vendor" / "katago"
 DEFAULT_ANALYSIS_CONFIG = PROJECT_ROOT / "config" / "katago_analysis.cfg"
 
 
@@ -46,19 +47,20 @@ class KataGoEngineError(KataGoError):
 
 @dataclass(frozen=True)
 class KataGoProfile:
-    """One simulated professional tier.
+    """One professional-strength or HumanSL rank simulation profile.
 
-    The optional human SL model supplies a modern professional-game style.
-    Search visits increase while temperature and utility scale decrease, so
-    higher tiers choose more accurately and consistently.
+    Professional tiers blend modern professional-game priors with searched
+    utility. Human-rank tiers sample the selected HumanSL policy directly for
+    non-pass moves while retaining a small normal search to decide when to pass.
     """
 
     label: str
-    dan: int
+    dan: Optional[int]
     max_visits: int
     human_sl_profile: str
     move_temperature: float
     utility_scale: float
+    selection_mode: Literal["professional", "human_rank"] = "professional"
 
 
 _VISITS_BY_DAN = (24, 36, 54, 80, 120, 180, 270, 400, 600)
@@ -77,11 +79,33 @@ KATAGO_PROFILES = tuple(
     for index, label in enumerate(KATAGO_DIFFICULTIES)
 )
 
+HUMANSL_PROFILE_NAMES = (
+    *(f"rank_{kyu}k" for kyu in range(20, 0, -1)),
+    *(f"rank_{dan}d" for dan in range(1, 10)),
+)
+HUMANSL_PASS_VISITS = 64
+HUMANSL_PROFILES = tuple(
+    KataGoProfile(
+        label=label,
+        dan=None,
+        max_visits=HUMANSL_PASS_VISITS,
+        human_sl_profile=profile_name,
+        move_temperature=1.0,
+        utility_scale=1.0,
+        selection_mode="human_rank",
+    )
+    for label, profile_name in zip(
+        HUMANSL_DIFFICULTIES,
+        HUMANSL_PROFILE_NAMES,
+    )
+)
+ALL_KATAGO_PROFILES = KATAGO_PROFILES + HUMANSL_PROFILES
+
 
 def profile_for_difficulty(label: str) -> KataGoProfile:
     """Return the KataGo search profile for a UI difficulty label."""
 
-    for profile in KATAGO_PROFILES:
+    for profile in ALL_KATAGO_PROFILES:
         if profile.label == label:
             return profile
     raise ValueError(f"未知 KataGo 难度：{label}")
@@ -130,16 +154,19 @@ class KataGoSettings:
         return cls(
             executable=(
                 os.environ.get("KATAGO_EXE", "").strip()
+                or os.environ.get("WEIQI_KATAGO_EXE", "").strip()
                 or saved.get("executable", "")
                 or discovered.executable
             ),
             model=(
                 os.environ.get("KATAGO_MODEL", "").strip()
+                or os.environ.get("WEIQI_KATAGO_MODEL", "").strip()
                 or saved.get("model", "")
                 or discovered.model
             ),
             human_model=(
                 os.environ.get("KATAGO_HUMAN_MODEL", "").strip()
+                or os.environ.get("WEIQI_KATAGO_HUMAN_MODEL", "").strip()
                 or saved.get("human_model", "")
                 or discovered.human_model
             ),
@@ -151,6 +178,8 @@ class KataGoSettings:
         for candidate in (
             KATAGO_FOLDER / "katago.exe",
             KATAGO_FOLDER / "katago",
+            LEGACY_KATAGO_FOLDER / "runtime" / "katago.exe",
+            LEGACY_KATAGO_FOLDER / "runtime" / "katago",
         ):
             if candidate.is_file():
                 executable = str(candidate)
@@ -158,20 +187,26 @@ class KataGoSettings:
         if not executable:
             executable = shutil.which("katago") or ""
 
-        human_candidates = sorted(
-            path
-            for path in KATAGO_FOLDER.glob("*.bin.gz")
-            if "human" in path.name.lower()
+        model_folders = (
+            KATAGO_FOLDER,
+            LEGACY_KATAGO_FOLDER / "models",
         )
-        main_candidates = sorted(
-            path
-            for path in KATAGO_FOLDER.glob("*.bin.gz")
-            if "human" not in path.name.lower()
-        )
+
+        def newest_model(*, human: bool) -> str:
+            for folder in model_folders:
+                candidates = sorted(
+                    path
+                    for path in folder.glob("*.bin.gz")
+                    if ("human" in path.name.lower()) is human
+                )
+                if candidates:
+                    return str(candidates[-1])
+            return ""
+
         return cls(
             executable=executable,
-            model=str(main_candidates[-1]) if main_candidates else "",
-            human_model=str(human_candidates[-1]) if human_candidates else "",
+            model=newest_model(human=False),
+            human_model=newest_model(human=True),
         )
 
     def save(self, path: Optional[Path] = None) -> Path:
@@ -321,12 +356,18 @@ def build_analysis_query(
         query["initialPlayer"] = "B" if game.current_player == BLACK else "W"
     if human_style:
         query["includePolicy"] = True
-        query["overrideSettings"] = {
+        override_settings: dict[str, Any] = {
             "humanSLProfile": profile.human_sl_profile,
             "ignorePreRootHistory": False,
-            "humanSLRootExploreProbWeightless": 0.5,
-            "humanSLCpuctPermanent": 2.0,
         }
+        if profile.selection_mode == "professional":
+            override_settings.update(
+                {
+                    "humanSLRootExploreProbWeightless": 0.5,
+                    "humanSLCpuctPermanent": 2.0,
+                }
+            )
+        query["overrideSettings"] = override_settings
     return query
 
 
@@ -336,7 +377,7 @@ class KataGoEngine:
     def __init__(
         self,
         settings: KataGoSettings,
-        timeout_seconds: float = 300.0,
+        timeout_seconds: float = 600.0,
         seed: Optional[int] = None,
     ) -> None:
         settings.require_valid()
@@ -545,14 +586,29 @@ class KataGoEngine:
             human_style_requested
             and (has_human_priors or has_human_policy)
         )
+        if profile.selection_mode == "human_rank" and not human_style_requested:
+            raise KataGoEngineError("HumanSL 人类段位请求缺少人类风格模型")
+        if profile.selection_mode == "human_rank" and not has_human_policy:
+            raise KataGoEngineError(
+                "HumanSL 没有返回长度与棋盘匹配的人类策略"
+            )
 
         if top_vertex.strip().upper() == "PASS":
             point: Optional[Point] = None
         elif used_human_style:
-            point = self._sample_professional_moves(game, move_infos, profile)
-            if point is None and has_human_policy:
+            point = None
+            if profile.selection_mode == "human_rank" and has_human_policy:
                 assert isinstance(human_policy, list)
                 point = self._sample_human_policy(game, human_policy, profile)
+                if point is None:
+                    raise KataGoEngineError(
+                        "HumanSL 没有返回可采样的合法非虚手落点"
+                    )
+            elif profile.selection_mode == "professional":
+                point = self._sample_professional_moves(game, move_infos, profile)
+                if point is None and has_human_policy:
+                    assert isinstance(human_policy, list)
+                    point = self._sample_human_policy(game, human_policy, profile)
             if point is None:
                 point = self._first_legal_candidate(game, move_infos)
         else:
@@ -577,14 +633,27 @@ class KataGoEngine:
             ),
             None,
         )
-        evaluation = selected_info if selected_info is not None else root_info
+        if (
+            profile.selection_mode == "human_rank"
+            and point is not None
+            and selected_info is None
+        ):
+            evaluation: dict[str, Any] = {}
+        else:
+            evaluation = selected_info if selected_info is not None else root_info
         black_win_probability = self._optional_probability(evaluation.get("winrate"))
         black_lead = self._optional_float(evaluation.get("scoreLead"))
         visits = int(root_info.get("visits", profile.max_visits) or 0)
 
         if point is None:
             reason = f"KataGo 判断当前应当虚手，完成约 {visits} 次搜索"
+        elif used_human_style and profile.selection_mode == "human_rank":
+            reason = (
+                f"{profile.label}，按该水平人类棋谱策略采样；"
+                f"普通搜索完成约 {visits} 次访问并负责判断虚手"
+            )
         elif used_human_style:
+            assert profile.dan is not None
             reason = (
                 "KataGo 人类风格模型按 2023 职业棋谱风格选点，"
                 f"以模拟职业 {profile.dan} 段参数完成约 {visits} 次局面核验"
@@ -649,7 +718,7 @@ class KataGoEngine:
                 weight = float(raw_weight)
             except (TypeError, ValueError):
                 continue
-            if weight <= 0:
+            if not math.isfinite(weight) or weight <= 0:
                 continue
             point = (index // game.size, index % game.size)
             if game.analyze_move(*point).legal:
@@ -744,6 +813,13 @@ class KataGoAI:
         self.engine = engine
         self.difficulty = difficulty
         self.profile = profile_for_difficulty(difficulty)
+        if (
+            self.profile.selection_mode == "human_rank"
+            and not engine.settings.human_style_enabled
+        ):
+            raise KataGoConfigurationError(
+                "HumanSL 人类段位需要先配置人类风格模型"
+            )
 
     def choose_move(self, game: GoGame) -> AIMove:
         return self.engine.choose_move(game, self.profile)

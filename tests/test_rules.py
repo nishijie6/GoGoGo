@@ -30,10 +30,13 @@ class RulesContentTests(unittest.TestCase):
             "公气",
             "实时胜率",
             "KataGo",
-            "业余段位档位已移除",
+            "不是棋力认证",
             "F1",
             "推理训练",
             "F2",
+            "推理模式",
+            "F3",
+            "HumanSL",
         ):
             self.assertIn(required_term, content)
 

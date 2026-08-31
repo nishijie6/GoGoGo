@@ -3,19 +3,23 @@
 from .ai import (
     AI_DIFFICULTIES,
     BUILTIN_DIFFICULTIES,
+    HUMANSL_DIFFICULTIES,
     KATAGO_DIFFICULTIES,
     AIMove,
     GoAI,
+    is_human_sl_difficulty,
     is_katago_difficulty,
 )
 from .engine import BLACK, EMPTY, WHITE, GoGame, MoveAnalysis, ScoreResult
 from .katago import (
+    HUMANSL_PROFILES,
     KATAGO_PROFILES,
     KataGoAI,
     KataGoEngine,
     KataGoProfile,
     KataGoSettings,
 )
+from .reasoning import ReasoningSession
 from .rl_config import (
     DEFAULT_RL_CONFIG_PATH,
     DEFAULT_RL_PRESET,
@@ -43,6 +47,8 @@ __all__ = [
     "EMPTY",
     "GoAI",
     "GoGame",
+    "HUMANSL_DIFFICULTIES",
+    "HUMANSL_PROFILES",
     "KATAGO_DIFFICULTIES",
     "KATAGO_PROFILES",
     "KataGoAI",
@@ -56,6 +62,7 @@ __all__ = [
     "RL_PRESET_NAMES",
     "RLConfigError",
     "RLTrainingConfig",
+    "ReasoningSession",
     "ScoreResult",
     "TRAINING_CATEGORIES",
     "TRAINING_LESSONS",
@@ -64,6 +71,7 @@ __all__ = [
     "WHITE",
     "WinRateEstimate",
     "WinRateEstimator",
+    "is_human_sl_difficulty",
     "is_katago_difficulty",
     "load_rl_training_config",
     "resolve_rl_training_config",
