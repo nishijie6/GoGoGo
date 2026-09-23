@@ -76,6 +76,8 @@ class RLTrainingConfigTests(unittest.TestCase):
         self.assertEqual(custom.hardware.device, "cuda:1")
         self.assertEqual(custom.network.channels, 96)
         self.assertEqual(custom.self_play.workers, 4)
+        self.assertEqual(custom.evaluation.position_suite_path, "")
+        self.assertEqual(custom.evaluation.teacher_labels_path, "")
         self.assertEqual(untouched.game.board_size, 9)
         self.assertEqual(untouched.network.channels, 64)
 
@@ -105,6 +107,12 @@ class RLTrainingConfigTests(unittest.TestCase):
                 "balanced",
                 {"optimizer": {"learning_rate": float("inf")}},
             )
+        with self.assertRaisesRegex(RLConfigError, "只支持 9×9"):
+            resolve_rl_training_config("balanced", {
+                "game": {"board_size": 13},
+                "evaluation": {"position_suite_path": "config/rl_eval_positions_9x9.json",
+                               "teacher_labels_path": "config/rl_eval_teacher_9x9.json"},
+            })
 
     def test_schema_version_must_be_an_integer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

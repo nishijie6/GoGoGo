@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "preset": "balanced",
+  "overrides": {
+    "hardware": {"device": "cuda:0", "precision": "float32", "data_loader_workers": 0},
+    "search": {"simulations_per_move": 8},
+    "self_play": {"games_per_iteration": 4},
+    "optimizer": {"minimum_replay_size": 32, "training_steps_per_iteration": 20},
+    "evaluation": {
+      "games": 4,
+      "simulations_per_move": 8,
+      "screen_games": 2,
+      "screen_simulations_per_move": 4,
+      "screen_min_score_rate": 0.0,
+      "full_every_iterations": 1,
+      "pool_games": 2,
+      "pool_simulations_per_move": 4,
+      "pool_every_iterations": 1,
+      "milestone_every_iterations": 1,
+      "position_simulations_per_move": 4
+    },
+    "runtime": {"output_directory": "training_runs/smoke"}
+  }
+}

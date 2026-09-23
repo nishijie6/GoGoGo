@@ -1,0 +1,4 @@
+# Optional; the Windows desktop game still needs only the standard library.
+# Choose a PyTorch wheel matching your GPU/driver. This host uses 2.7.1+cu118 in WSL.
+numpy>=1.26,<3
+torch>=2.4,<3
