@@ -37,7 +37,8 @@ def save_anchor(directory: Path, model, config: RLTrainingConfig, *, kind: str,
 
 
 def select_anchors(directory: Path, config: RLTrainingConfig, *, candidate_sha256: str,
-                   maximum: int = 4) -> list[dict]:
+                   maximum: int = 4,
+                   kinds: tuple[str, ...] = ("accepted", "milestone")) -> list[dict]:
     if maximum < 1:
         raise ValueError("Pool size must be positive")
     seen, anchors = {candidate_sha256}, []
@@ -45,8 +46,12 @@ def select_anchors(directory: Path, config: RLTrainingConfig, *, candidate_sha25
         payload, old_config = load_checkpoint(path)
         if payload.get("kind") != "model" or payload.get("model_role") != "anchor":
             raise ValueError(f"Unexpected file in frozen model pool: {path}")
+        if payload.get("anchor_kind") not in ("accepted", "milestone"):
+            raise ValueError(f"Unexpected frozen model kind: {path}")
         if old_config.game != config.game or old_config.network != config.network:
             raise ValueError(f"Frozen opponent has incompatible rules or architecture: {path}")
+        if payload["anchor_kind"] not in kinds:
+            continue
         checksum = fingerprint(payload["model"])
         if checksum in seen:
             continue

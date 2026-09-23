@@ -22,6 +22,9 @@ class GameJob:
     index: int
     seed: int
     candidate_color: int = BLACK
+    opponent_id: int = 0
+    opponent_name: str = ""
+    opponent_sha256: str | None = None
 
 
 @dataclass
@@ -36,15 +39,21 @@ class GameResult:
     moves: list[tuple[int, int]]
     seconds: float
     examples: list[tuple[np.ndarray, np.ndarray, float]] = field(default_factory=list)
+    opponent_name: str = ""
+    opponent_sha256: str | None = None
 
     def record(self, config: RLTrainingConfig) -> dict:
-        return {
+        record = {
             "index": self.index, "seed": self.seed, "candidate_color": self.candidate_color,
             "winner": self.winner, "reason": self.reason,
             "black_score": self.black_score, "white_score": self.white_score,
             "moves": self.moves, "seconds": self.seconds, "samples": len(self.examples),
             "board_size": config.game.board_size, "komi": config.game.komi,
         }
+        if self.opponent_name:
+            record["training_opponent"] = {"name": self.opponent_name,
+                                           "sha256": self.opponent_sha256}
+        return record
 
 
 def play_game(config, job, evaluate, *, training: bool) -> GameResult:
@@ -62,7 +71,10 @@ def play_game(config, job, evaluate, *, training: bool) -> GameResult:
     limit = int(config.self_play.max_game_length_factor * config.game.board_size ** 2)
     while len(moves) < limit and not state.game.game_over:
         color = state.game.current_player
-        model_id = 0 if training else int(color == job.candidate_color)
+        if training:
+            model_id = 0 if color == job.candidate_color else job.opponent_id
+        else:
+            model_id = int(color == job.candidate_color)
         evaluator = lambda features: evaluate(model_id, features)
         simulations = (
             config.search.simulations_per_move if training
@@ -99,6 +111,7 @@ def play_game(config, job, evaluate, *, training: bool) -> GameResult:
     return GameResult(
         job.index, job.seed, job.candidate_color, winner, reason,
         score.black_total, score.white_total, moves, time.monotonic() - started, examples,
+        opponent_name=job.opponent_name, opponent_sha256=job.opponent_sha256,
     )
 
 
