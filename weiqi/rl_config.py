@@ -1,8 +1,8 @@
-"""Validated configuration for the future reinforcement-learning trainer.
+"""Validated configuration shared by the reinforcement-learning trainer.
 
 This module intentionally has no PyTorch dependency.  The GUI and tests can
 therefore read, validate, and save training choices even on a computer that is
-only used to play Go.  A future trainer can consume :class:`RLTrainingConfig`
+only used to play Go.  The optional trainer consumes :class:`RLTrainingConfig`
 without duplicating defaults or silently accepting misspelled options.
 """
 
@@ -42,7 +42,7 @@ class GameTrainingConfig:
 
 @dataclass(frozen=True)
 class HardwareTrainingConfig:
-    """Hardware preferences resolved by the future PyTorch runtime."""
+    """Hardware preferences resolved by the optional PyTorch runtime."""
 
     device: str
     precision: str
@@ -55,7 +55,7 @@ class HardwareTrainingConfig:
 
 @dataclass(frozen=True)
 class NetworkTrainingConfig:
-    """Size of the fully convolutional policy-value residual network."""
+    """Size of the policy-value residual network."""
 
     channels: int
     residual_blocks: int
@@ -104,11 +104,23 @@ class OptimizerTrainingConfig:
 
 @dataclass(frozen=True)
 class EvaluationTrainingConfig:
-    """Automatic promotion gate for a newly trained checkpoint."""
+    """Cheap diagnostics, frozen references, and occasional promotion matches."""
 
     games: int
     simulations_per_move: int
     promotion_win_rate: float
+    screen_games: int
+    screen_simulations_per_move: int
+    screen_min_score_rate: float
+    full_every_iterations: int
+    pool_games: int
+    pool_simulations_per_move: int
+    pool_every_iterations: int
+    milestone_every_iterations: int
+    position_suite_path: str
+    teacher_labels_path: str
+    position_simulations_per_move: int
+    confidence_level: float
 
 
 @dataclass(frozen=True)
@@ -205,6 +217,18 @@ _BALANCED_PRESET: Dict[str, Any] = {
         "games": 20,
         "simulations_per_move": 96,
         "promotion_win_rate": 0.55,
+        "screen_games": 4,
+        "screen_simulations_per_move": 8,
+        "screen_min_score_rate": 0.25,
+        "full_every_iterations": 3,
+        "pool_games": 4,
+        "pool_simulations_per_move": 8,
+        "pool_every_iterations": 3,
+        "milestone_every_iterations": 5,
+        "position_suite_path": "config/rl_eval_positions_9x9.json",
+        "teacher_labels_path": "config/rl_eval_teacher_9x9.json",
+        "position_simulations_per_move": 8,
+        "confidence_level": 0.95,
     },
     "runtime": {
         "pause_while_game_is_active": True,
@@ -273,6 +297,18 @@ _HIGH_PERFORMANCE_PRESET: Dict[str, Any] = {
         "games": 40,
         "simulations_per_move": 800,
         "promotion_win_rate": 0.55,
+        "screen_games": 4,
+        "screen_simulations_per_move": 32,
+        "screen_min_score_rate": 0.25,
+        "full_every_iterations": 3,
+        "pool_games": 4,
+        "pool_simulations_per_move": 32,
+        "pool_every_iterations": 3,
+        "milestone_every_iterations": 5,
+        "position_suite_path": "",
+        "teacher_labels_path": "",
+        "position_simulations_per_move": 16,
+        "confidence_level": 0.95,
     },
     "runtime": {
         "pause_while_game_is_active": True,
@@ -514,6 +550,27 @@ def _validate_config(config: RLTrainingConfig) -> None:
     _require_probability("evaluation.promotion_win_rate", evaluation.promotion_win_rate)
     if evaluation.promotion_win_rate <= 0.5:
         raise _config_error("evaluation.promotion_win_rate", "必须大于 0.5")
+    for name in ("screen_games", "pool_games"):
+        value = getattr(evaluation, name)
+        _require_int(f"evaluation.{name}", value, 2)
+        if value % 2:
+            raise _config_error(f"evaluation.{name}", "必须是偶数，便于双方交换黑白")
+    for name in ("screen_simulations_per_move", "pool_simulations_per_move",
+                 "full_every_iterations", "pool_every_iterations",
+                 "milestone_every_iterations", "position_simulations_per_move"):
+        _require_int(f"evaluation.{name}", getattr(evaluation, name), 1)
+    _require_probability("evaluation.screen_min_score_rate", evaluation.screen_min_score_rate)
+    confidence = _require_number("evaluation.confidence_level", evaluation.confidence_level)
+    if not 0 < confidence < 1:
+        raise _config_error("evaluation.confidence_level", "必须大于 0 且小于 1")
+    for name in ("position_suite_path", "teacher_labels_path"):
+        value = getattr(evaluation, name)
+        if not isinstance(value, str) or "\x00" in value:
+            raise _config_error(f"evaluation.{name}", "必须是有效路径字符串")
+    if bool(evaluation.position_suite_path) != bool(evaluation.teacher_labels_path):
+        raise _config_error("evaluation", "固定局面与 KataGo 标注必须同时设置或同时留空")
+    if game.board_size != 9 and evaluation.position_suite_path:
+        raise _config_error("evaluation.position_suite_path", "当前固定局面评测只支持 9×9")
 
     runtime = config.runtime
     _require_bool(
@@ -555,6 +612,14 @@ def resolve_rl_training_config(
     if not isinstance(overrides, Mapping):
         raise _config_error("overrides", "必须是对象")
     merged = _merge_known(_PRESET_DATA[preset], overrides)
+    if merged["game"]["board_size"] != 9:
+        evaluation_overrides = overrides.get("evaluation", {})
+        if not any(key in evaluation_overrides
+                   for key in ("position_suite_path", "teacher_labels_path")):
+            # A board-size override should retain the working training path.
+            # The bundled teacher labels belong specifically to 9x9 positions.
+            merged["evaluation"]["position_suite_path"] = ""
+            merged["evaluation"]["teacher_labels_path"] = ""
     return _build_config(preset, merged)
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -133,6 +134,22 @@ class KataGoProtocolTests(unittest.TestCase):
         self.assertEqual(query["initialPlayer"], "B")
         self.assertNotIn("includePolicy", query)
 
+    def test_workbench_query_options_override_play_profile_defaults(self) -> None:
+        query = build_analysis_query(
+            GoGame(19),
+            KATAGO_PROFILES[0],
+            "workbench",
+            False,
+            max_visits=777,
+            pv_length=19,
+            include_ownership=True,
+        )
+
+        self.assertEqual(query["maxVisits"], 777)
+        self.assertEqual(query["analysisPVLen"], 19)
+        self.assertTrue(query["includeOwnership"])
+        self.assertNotIn("includePolicy", query)
+
 
 class KataGoSettingsAndDecisionTests(unittest.TestCase):
     def _settings(self, folder: Path, with_human: bool = False) -> KataGoSettings:
@@ -224,6 +241,80 @@ class KataGoSettingsAndDecisionTests(unittest.TestCase):
             self.assertAlmostEqual(decision.black_lead or 0.0, 2.75)
             self.assertEqual(decision.analysis_visits, 24)
             self.assertIn("未配置人类风格模型", decision.explanation)
+            engine.close()
+
+    def test_analyze_position_returns_raw_response_with_workbench_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = self._settings(Path(temporary))
+            engine = KataGoEngine(settings)
+            process = unittest.mock.Mock()
+            response = {
+                "id": "response-id",
+                "rootInfo": {"winrate": 0.58, "scoreLead": 1.75},
+                "moveInfos": [{"move": "D4", "pv": ["D4", "E4"]}],
+                "ownership": [0.0] * 81,
+            }
+
+            with patch.object(engine, "_ensure_started", return_value=process):
+                with patch.object(
+                    engine,
+                    "_wait_for_response",
+                    return_value=response,
+                ) as wait_for_response:
+                    result = engine.analyze_position(
+                        GoGame(9),
+                        max_visits=321,
+                        pv_length=15,
+                        include_ownership=True,
+                    )
+
+            self.assertIs(result, response)
+            serialized = process.stdin.write.call_args.args[0]
+            query = json.loads(serialized)
+            self.assertEqual(query["maxVisits"], 321)
+            self.assertEqual(query["analysisPVLen"], 15)
+            self.assertTrue(query["includeOwnership"])
+            self.assertNotIn("includePolicy", query)
+            wait_for_response.assert_called_once_with(query["id"])
+            process.stdin.flush.assert_called_once_with()
+            engine.close()
+
+    def test_stop_detaches_process_and_reaps_it_off_the_calling_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = self._settings(Path(temporary))
+            engine = KataGoEngine(settings)
+            process = unittest.mock.Mock()
+            process.poll.return_value = None
+            engine._process = process
+
+            with patch("weiqi.katago.threading.Thread") as thread_type:
+                engine.stop()
+
+            self.assertIsNone(engine._process)
+            process.terminate.assert_called_once_with()
+            process.wait.assert_not_called()
+            thread_type.assert_called_once()
+            thread_type.return_value.start.assert_called_once_with()
+            engine.close()
+
+    def test_cancelled_workbench_request_never_starts_katago(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = self._settings(Path(temporary))
+            engine = KataGoEngine(settings)
+            cancel_event = threading.Event()
+            cancel_event.set()
+
+            with patch("weiqi.katago.subprocess.Popen") as popen:
+                with self.assertRaisesRegex(KataGoEngineError, "取消"):
+                    engine.analyze_position(
+                        GoGame(9),
+                        max_visits=8,
+                        pv_length=4,
+                        cancel_event=cancel_event,
+                    )
+
+            popen.assert_not_called()
+            self.assertFalse(engine.running)
             engine.close()
 
     def test_human_policy_selects_rank_style_legal_point(self) -> None:

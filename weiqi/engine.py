@@ -115,11 +115,14 @@ class GoGame:
 
     SUPPORTED_SIZES = (9, 13, 19)
 
-    def __init__(self, size: int = 19, komi: float = 6.5) -> None:
+    def __init__(
+        self, size: int = 19, komi: float = 6.5, *, record_undo: bool = True
+    ) -> None:
         if size not in self.SUPPORTED_SIZES:
             raise ValueError(f"棋盘大小必须是 {self.SUPPORTED_SIZES} 之一")
 
         self.size = size
+        self._record_undo = record_undo
         self.komi = float(komi)
         self.board: list[list[int]] = [
             [EMPTY for _ in range(size)] for _ in range(size)
@@ -152,7 +155,7 @@ class GoGame:
     def clone(self) -> "GoGame":
         """Return an independent copy suitable for AI analysis."""
 
-        clone = GoGame(self.size, self.komi)
+        clone = GoGame(self.size, self.komi, record_undo=self._record_undo)
         clone.board = [row[:] for row in self.board]
         clone.current_player = self.current_player
         clone.captures = dict(self.captures)
@@ -431,6 +434,8 @@ class GoGame:
         )
 
     def _push_snapshot(self) -> None:
+        if not self._record_undo:
+            return
         self._undo_stack.append(
             _Snapshot(
                 board=self.board_hash(),

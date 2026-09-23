@@ -1,0 +1,7 @@
+{
+  "games": 100,
+  "simulations_per_move": 64,
+  "full_every_iterations": 5,
+  "pool_games": 8,
+  "pool_every_iterations": 2
+}
