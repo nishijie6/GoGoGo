@@ -162,27 +162,82 @@ class Trainer:
             jobs.extend((GameJob(pair * 2, seed, BLACK), GameJob(pair * 2 + 1, seed, WHITE)))
         return jobs
 
+    def selfplay_jobs(self, iteration: int):
+        """Pair learner-vs-champion colors and rotate frozen accepted versions."""
+        config = self.config
+        count = config.self_play.games_per_iteration
+        possible_pairs = count // 2
+        target_pairs = min(possible_pairs, int(
+            possible_pairs * config.self_play.champion_fraction + 0.5))
+        learner_sha = fingerprint(cpu_state(self.model))
+        champions = (select_anchors(self.anchors, config,
+                                    candidate_sha256=learner_sha,
+                                    kinds=("accepted",)) if target_pairs else [])
+        if not champions:
+            target_pairs = 0
+
+        evaluators = {0: self.runtime.evaluator(self.model)}
+        best_sha = fingerprint(cpu_state(self.best))
+        for model_id, champion in enumerate(champions, 1):
+            if champion["sha256"] == best_sha:
+                frozen = self.best
+            else:
+                payload, old_config = load_checkpoint(champion["path"])
+                frozen = PolicyValueNet(old_config).to(self.runtime.device)
+                frozen.load_state_dict(payload["model"])
+            evaluators[model_id] = self.runtime.evaluator(frozen)
+            champion["model_id"] = model_id
+
+        jobs = []
+        for pair in range(target_pairs):
+            champion = champions[((iteration - 1) * target_pairs + pair) % len(champions)]
+            seed = int(self.rng.integers(0, 2 ** 32))
+            for color in (BLACK, WHITE):
+                jobs.append(GameJob(len(jobs), seed, color,
+                                    opponent_id=champion["model_id"],
+                                    opponent_name=champion["name"],
+                                    opponent_sha256=champion["sha256"]))
+        for _ in range(count - len(jobs)):
+            jobs.append(GameJob(len(jobs), int(self.rng.integers(0, 2 ** 32)),
+                                opponent_name="candidate_self",
+                                opponent_sha256=learner_sha))
+        return jobs, evaluators, champions
+
     def run_iteration(self) -> dict:
         config, number = self.config, self.iteration + 1
         directory = self.output / "iterations" / f"{number:06d}"
         started = time.monotonic()
         self.progress.phase = "selfplay"
         self.progress({"event": "iteration_started", "iteration": number})
-        jobs = [GameJob(index, int(self.rng.integers(0, 2 ** 32)))
-                for index in range(config.self_play.games_per_iteration)]
-        # Keep generating new data with the learner even when the conservative
-        # promotion gate has not yet accepted it as a published best model.
-        games = run_games(config, jobs, {0: self.runtime.evaluator(self.model)}, training=True,
+        jobs, evaluators, champions = self.selfplay_jobs(number)
+        self.progress({"event": "selfplay_schedule", "iteration": number,
+                       "champion_games": sum(job.opponent_id > 0 for job in jobs),
+                       "candidate_self_games": sum(job.opponent_id == 0 for job in jobs),
+                       "champions": [{"name": champion["name"],
+                                      "sha256": champion["sha256"]}
+                                     for champion in champions]})
+        games = run_games(config, jobs, evaluators, training=True,
                           check=self.control, progress=self.progress)
         write_games(games, config, directory / "selfplay")
         for game in games:
             self.replay.extend(game.examples)
+        opponent_rows = {}
+        for game in games:
+            name = game.opponent_name or "candidate_self"
+            row = opponent_rows.setdefault(name, {"name": name,
+                                                  "sha256": game.opponent_sha256,
+                                                  "games": 0, "finished": 0,
+                                                  "samples": 0})
+            row["games"] += 1
+            row["finished"] += int(game.reason != "length_limit")
+            row["samples"] += len(game.examples)
         summary = {
             "iteration": number, "selfplay_games": len(games),
             "selfplay_finished": sum(game.reason != "length_limit" for game in games),
             "selfplay_truncated": sum(game.reason == "length_limit" for game in games),
             "new_samples": sum(len(game.examples) for game in games), "replay_samples": len(self.replay),
             "selfplay_seconds": time.monotonic() - started,
+            "selfplay_opponents": list(opponent_rows.values()),
         }
         if len(self.replay) >= config.optimizer.minimum_replay_size:
             self.progress.phase = "training"

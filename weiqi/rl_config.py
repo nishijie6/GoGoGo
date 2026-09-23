@@ -83,6 +83,7 @@ class SelfPlayTrainingConfig:
     workers: int
     games_per_iteration: int
     inference_batch_size: int
+    champion_fraction: float
     max_game_length_factor: float
     resign_threshold: Optional[float]
     resign_min_move: int
@@ -198,6 +199,7 @@ _BALANCED_PRESET: Dict[str, Any] = {
         "workers": 2,
         "games_per_iteration": 16,
         "inference_batch_size": 8,
+        "champion_fraction": 0.5,
         "max_game_length_factor": 2.5,
         # Early models must not poison their own data with false resignations.
         "resign_threshold": None,
@@ -279,6 +281,7 @@ _HIGH_PERFORMANCE_PRESET: Dict[str, Any] = {
         "workers": 8,
         "games_per_iteration": 64,
         "inference_batch_size": 64,
+        "champion_fraction": 0.5,
         "max_game_length_factor": 2.5,
         "resign_threshold": None,
         "resign_min_move": 0,
@@ -482,6 +485,7 @@ def _validate_config(config: RLTrainingConfig) -> None:
     _require_int("self_play.workers", self_play.workers, 1)
     _require_int("self_play.games_per_iteration", self_play.games_per_iteration, 1)
     _require_int("self_play.inference_batch_size", self_play.inference_batch_size, 1)
+    _require_probability("self_play.champion_fraction", self_play.champion_fraction)
     if _require_number(
         "self_play.max_game_length_factor",
         self_play.max_game_length_factor,

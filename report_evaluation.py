@@ -40,6 +40,10 @@ def render(run: Path) -> str:
         "| 轮次 | 均匀策略 MCTS | 固定初始模型 | 初筛 | 晋级对战 | 晋级 |",
         "| ---: | ---: | ---: | ---: | --- | --- |",
     ]
+    training_opponents = [
+        "| 轮次 | 候选自我对弈 | 历史冠军对局 | 冠军版本 |",
+        "| ---: | ---: | ---: | --- |",
+    ]
     protocols = set()
     for path, summary in zip(paths, summaries):
         quality = summary.get("position_quality", {})
@@ -79,6 +83,18 @@ def render(run: Path) -> str:
             f"{_percent(screening.get('score_rate'))} | {result} | "
             f"{'是' if summary.get('promoted') else '否'} |"
         )
+        opponents = summary.get("selfplay_opponents")
+        if opponents is None:
+            training_opponents.append(f"| {summary['iteration']} | — | — | 旧版记录缺少对手信息 |")
+        else:
+            self_games = sum(row["games"] for row in opponents
+                             if row["name"] == "candidate_self")
+            champions = [row for row in opponents if row["name"] != "candidate_self"]
+            count = sum(row["games"] for row in champions)
+            labels = "、".join(f"{row['name']} ({row['games']}局)" for row in champions) or "—"
+            training_opponents.append(
+                f"| {summary['iteration']} | {self_games}局 | {count}局 | {labels} |"
+            )
     explanation = (
         "KataGo 指标来自同一组局面、老师模型和候选搜索预算。负对数概率下降及首选着法"
         "一致率上升仅表示更贴近该老师的策略，整体棋力仍需看固定对手的换色对战。\n\n"
@@ -93,6 +109,7 @@ def render(run: Path) -> str:
     return "\n".join([
         MARKER, "# 9×9 训练评测趋势", "",
         f"运行目录：`{run}`。已完成 {len(summaries)} 轮。", "",
+        "## 训练对手", "", *training_opponents, "",
         "## 固定局面", "", *samples, "", "## 换色对战", "", *matches,
         "", explanation, "",
     ])

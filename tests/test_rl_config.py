@@ -25,6 +25,7 @@ class RLTrainingConfigTests(unittest.TestCase):
         self.assertEqual(config.game.board_size, 9)
         self.assertEqual(config.action_size, 82)
         self.assertEqual(config.self_play.workers, 2)
+        self.assertEqual(config.self_play.champion_fraction, 0.5)
         self.assertEqual(config.network.channels, 64)
         self.assertLessEqual(config.hardware.gpu_memory_fraction, 0.60)
         self.assertTrue(config.runtime.pause_while_game_is_active)
@@ -106,6 +107,10 @@ class RLTrainingConfigTests(unittest.TestCase):
             resolve_rl_training_config(
                 "balanced",
                 {"optimizer": {"learning_rate": float("inf")}},
+            )
+        with self.assertRaisesRegex(RLConfigError, "0 到 1"):
+            resolve_rl_training_config(
+                "balanced", {"self_play": {"champion_fraction": 1.1}}
             )
         with self.assertRaisesRegex(RLConfigError, "只支持 9×9"):
             resolve_rl_training_config("balanced", {
