@@ -18,6 +18,12 @@
       "board_size": 9,
       "training_config": "config/rl_training.rtx5070ti.json",
       "min_stage_samples": 10000000,
+      "initial_champion_model": "gogogo-s31967232-d4973021",
+      "fixed_baseline_models": [
+        "gogogo-s9562112-d1610962",
+        "gogogo-s31655936-d4929572",
+        "gogogo-s31819776-d4952345"
+      ],
       "autotune_batches": [],
       "indefinite": false
     },

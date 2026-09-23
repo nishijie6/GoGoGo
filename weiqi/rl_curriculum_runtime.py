@@ -15,8 +15,8 @@ have all succeeded.
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
-import html
 import json
 import math
 import os
@@ -56,6 +56,7 @@ from .rl_curriculum import (
     summarize_match_sgfs,
     validate_training_profiles,
     verify_checkpoint_loads,
+    render_curriculum_dashboard,
 )
 from .rl_metrics import parse_model_name
 
@@ -422,6 +423,61 @@ class CurriculumRuntime:
             trained_samples=parsed[0], latest_model=latest, entry_model=entry
         )
 
+    def _ensure_opponent_pools(self, state: CurriculumState) -> None:
+        """Initialize each pool once, and protect its models before cleanup."""
+        candidate_state = copy.deepcopy(state)
+        active = candidate_state.active
+        definition = self.config.stages[state.active_stage_index]
+        runner = self._stage_runner(state)
+        fixed = active.fixed_baseline_models or list(definition.fixed_baseline_models) or [active.baseline_model]
+        champion = active.champion_model or definition.initial_champion_model or active.latest_model
+        for name in [*fixed, champion]:
+            self._model_path(runner, name)
+        changed = not active.fixed_baseline_models or not active.champion_model
+        if changed:
+            if active.baseline_model != fixed[0]:
+                active.consecutive_passes = 0
+                if candidate_state.phase == "transition_ready":
+                    candidate_state.phase = "training"
+            active.fixed_baseline_models = list(fixed)
+            active.baseline_model = fixed[0]
+            active.champion_model = champion
+        protected = list(dict.fromkeys(state.protected_models + list(fixed) + [champion]))
+        if changed or protected != state.protected_models:
+            candidate_state.protected_models = protected
+            self.store.save(candidate_state)
+            state.__dict__.update(candidate_state.__dict__)
+
+    def refresh_dashboard(self) -> Path:
+        """Prepare the two opponent pools and refresh the page without training."""
+        with GlobalCurriculumLock(self.state_root):
+            state = self._adopt_existing_9x9()
+            with self._stage_runner(state).lock():
+                self._ensure_opponent_pools(state)
+                self._render_dashboard(state)
+        print(str(self.dashboard_path), flush=True)
+        return self.dashboard_path
+
+    def evaluate_now(self) -> dict[str, object]:
+        """Run one bounded evaluation suite, without starting self-play training."""
+        with GlobalCurriculumLock(self.state_root):
+            state = self._adopt_existing_9x9()
+            with self._stage_runner(state).lock():
+                if state.phase not in {"training", "evaluating"}:
+                    raise CurriculumStateError("只可在训练或评测阶段执行独立评测")
+                if any(
+                    row.get("candidate_model") == state.active.latest_model and row.get("opponents")
+                    for row in state.active.evaluations
+                ):
+                    self._render_dashboard(state)
+                    print("当前模型已有两类评测成绩，保留原结果；新模型导出后再评测。", flush=True)
+                    return self._status_dict(state)
+                self._evaluate(state)
+                self._render_dashboard(state)
+                if state.active.evaluations and state.active.evaluations[-1].get("error"):
+                    raise CurriculumStateError(str(state.active.evaluations[-1]["error"]))
+            return self._status_dict(state)
+
     @staticmethod
     def _read_metric_records(runner: KataGoRLRunner) -> list[dict[str, object]]:
         path = runner.metric_store.jsonl_path
@@ -546,150 +602,145 @@ class CurriculumRuntime:
             / f"s{active.samples}-{candidate}-{token}-{uuid.uuid4().hex[:8]}"
         )
 
+    def _match_opponent(self, state, runner, candidate_name, baseline_name, roles, output_dir):
+        """Play the same color-swapped opening suite against one pool opponent."""
+        candidate = self._model_path(runner, candidate_name)
+        baseline = self._model_path(runner, baseline_name)
+        output_dir.mkdir(parents=True, exist_ok=False)
+        opening_count = self.config.evaluation_games // 2
+        openings = ensure_evaluation_opening_suite(
+            self.state_root,
+            board_size=state.active.board_size,
+            opening_count=opening_count,
+        )
+        suite_manifest = openings[0].parent / "manifest.json"
+        _atomic_write_json(
+            output_dir / "evaluation_manifest.json",
+            {
+                "protocol_version": 2,
+                "roles": roles,
+                "candidate_model": candidate_name,
+                "candidate_path": str(candidate),
+                "candidate_sha256": _sha256_file(candidate),
+                "baseline_model": baseline_name,
+                "baseline_path": str(baseline),
+                "baseline_sha256": _sha256_file(baseline),
+                "board_size": state.active.board_size,
+                "visits": runner.config.evaluation.simulations_per_move,
+                "komi": 6.5,
+                "games": self.config.evaluation_games,
+                "opening_pairs": opening_count,
+                "opening_suite": str(suite_manifest),
+                "opening_suite_sha256": _sha256_file(suite_manifest),
+                "root_noise": False,
+                "temperature": 0.0,
+                "resignation": False,
+                "created_at": _now(),
+            },
+        )
+        environment = katago_subprocess_environment()
+        environment["PYTHONUTF8"] = "1"
+        for index, opening in enumerate(openings):
+            pair_root = output_dir / "pairs" / f"opening-{index:03d}"
+            sgf_dir = pair_root / "sgfs"
+            sgf_dir.mkdir(parents=True, exist_ok=False)
+            config_path = pair_root / "match.cfg"
+            config_text = build_match_config(
+                candidate_model=candidate,
+                baseline_model=baseline,
+                board_size=state.active.board_size,
+                visits=runner.config.evaluation.simulations_per_move,
+                games=2,
+                game_threads=2,
+                inference_batch_size=runner.config.self_play.inference_batch_size,
+                gpu_index=0,
+                opening_directory=opening,
+            )
+            _atomic_write_text(config_path, config_text)
+            execution = self._run_external(
+                [
+                    runner.katago_executable,
+                    "match",
+                    "-config",
+                    config_path,
+                    "-sgf-output-dir",
+                    sgf_dir,
+                ],
+                cwd=self.project_root,
+                env=environment,
+                log_path=pair_root / "match.log",
+            )
+            if execution.returncode:
+                raise RuntimeError(
+                    f"固定开局 {index:03d} 的 KataGo match 退出代码 {execution.returncode}"
+                )
+            pair_summary = summarize_match_sgfs(
+                sorted(sgf_dir.glob("*.sgfs")),
+                candidate_name="candidate",
+                requested_games=2,
+            )
+            if (
+                pair_summary.candidate_black_games != 1
+                or pair_summary.candidate_white_games != 1
+            ):
+                raise RuntimeError(
+                    f"固定开局 {index:03d} 未完成严格黑白互换"
+                )
+        summary = summarize_match_sgfs(
+            sorted(output_dir.rglob("*.sgfs")),
+            candidate_name="candidate",
+            requested_games=self.config.evaluation_games,
+        )
+        _atomic_write_json(output_dir / "match-result.json", summary.to_dict())
+        return summary
+
     def _evaluate(self, state: CurriculumState) -> None:
         runner = self._stage_runner(state)
-        candidate_name = state.active.latest_model
-        baseline_name = self.controller.evaluation_baseline(state)
         committed = False
         try:
-            candidate = self._model_path(runner, candidate_name)
-            baseline = self._model_path(runner, baseline_name)
+            self._ensure_opponent_pools(state)
+            candidate_name = state.active.latest_model
+            opponents = self.controller.evaluation_opponents(state)
+            if not opponents:
+                raise CurriculumStateError("尚无不同于候选模型的评测对手，请先继续训练")
             output_dir = self._evaluation_directory(state)
-            output_dir.mkdir(parents=True, exist_ok=False)
-            opening_count = self.config.evaluation_games // 2
-            openings = ensure_evaluation_opening_suite(
-                self.state_root,
-                board_size=state.active.board_size,
-                opening_count=opening_count,
-            )
-            suite_manifest = openings[0].parent / "manifest.json"
-            _atomic_write_json(
-                output_dir / "evaluation_manifest.json",
-                {
-                    "protocol_version": 1,
-                    "candidate_model": candidate_name,
-                    "candidate_path": str(candidate),
-                    "candidate_sha256": _sha256_file(candidate),
-                    "baseline_model": baseline_name,
-                    "baseline_path": str(baseline),
-                    "baseline_sha256": _sha256_file(baseline),
-                    "board_size": state.active.board_size,
-                    "visits": runner.config.evaluation.simulations_per_move,
-                    "komi": 6.5,
-                    "games": self.config.evaluation_games,
-                    "opening_pairs": opening_count,
-                    "opening_suite": str(suite_manifest),
-                    "opening_suite_sha256": _sha256_file(suite_manifest),
-                    "root_noise": False,
-                    "temperature": 0.0,
-                    "resignation": False,
-                    "created_at": _now(),
-                },
-            )
-            environment = katago_subprocess_environment()
-            environment["PYTHONUTF8"] = "1"
-            for index, opening in enumerate(openings):
-                pair_root = output_dir / "pairs" / f"opening-{index:03d}"
-                sgf_dir = pair_root / "sgfs"
-                sgf_dir.mkdir(parents=True, exist_ok=False)
-                config_path = pair_root / "match.cfg"
-                config_text = build_match_config(
-                    candidate_model=candidate,
-                    baseline_model=baseline,
-                    board_size=state.active.board_size,
-                    visits=runner.config.evaluation.simulations_per_move,
-                    games=2,
-                    game_threads=2,
-                    inference_batch_size=runner.config.self_play.inference_batch_size,
-                    gpu_index=0,
-                    opening_directory=opening,
+            results = {}
+            for index, (name, roles) in enumerate(opponents.items()):
+                print(f"评测 {candidate_name} vs {name}（{' / '.join(roles)}）", flush=True)
+                results[name] = self._match_opponent(
+                    state, runner, candidate_name, name, roles,
+                    output_dir / f"opponent-{index:02d}-{name}",
                 )
-                _atomic_write_text(config_path, config_text)
-                execution = self._run_external(
-                    [
-                        runner.katago_executable,
-                        "match",
-                        "-config",
-                        config_path,
-                        "-sgf-output-dir",
-                        sgf_dir,
-                    ],
-                    cwd=self.project_root,
-                    env=environment,
-                    log_path=pair_root / "match.log",
-                )
-                if execution.returncode:
-                    raise RuntimeError(
-                        f"固定开局 {index:03d} 的 KataGo match 退出代码 {execution.returncode}"
-                    )
-                pair_summary = summarize_match_sgfs(
-                    sorted(sgf_dir.glob("*.sgfs")),
-                    candidate_name="candidate",
-                    requested_games=2,
-                )
-                if (
-                    pair_summary.candidate_black_games != 1
-                    or pair_summary.candidate_white_games != 1
-                ):
-                    raise RuntimeError(
-                        f"固定开局 {index:03d} 未完成严格黑白互换"
-                    )
-            summary = summarize_match_sgfs(
-                sorted(output_dir.rglob("*.sgfs")),
-                candidate_name="candidate",
-                requested_games=self.config.evaluation_games,
-            )
+            baseline_name = state.active.baseline_model
+            if baseline_name not in results:
+                raise CurriculumStateError("课程固定基准不能与候选模型相同")
+            summary = results[baseline_name]
             health = self._health(runner)
             gate = self.controller.record_evaluation(
-                state,
-                candidate_model=str(candidate_name),
-                match=summary,
-                health=health,
+                state, candidate_model=str(candidate_name), match=summary,
+                health=health, opponent_results=results,
             )
             committed = True
-            _atomic_write_json(
-                output_dir / "summary.json",
-                {
-                    "candidate_model": candidate_name,
-                    "baseline_model": baseline_name,
-                    "stage_samples": state.active.samples,
-                    "passed": gate.passed,
-                    "reasons": list(gate.reasons),
-                    "match": summary.to_dict(),
-                    "health": health.to_dict(),
-                    "completed_at": _now(),
-                },
-            )
+            _atomic_write_json(output_dir / "summary.json", state.active.evaluations[-1])
+            if state.active.evaluations[-1].get("champion_promoted"):
+                print(f"滚动冠军已更新：{state.active.champion_model}", flush=True)
             if gate.passed:
-                print(
-                    f"评测通过：{summary.win_rate:.1%}，Wilson 下界 {summary.wilson_lower:.1%}",
-                    flush=True,
-                )
+                print(f"课程门槛通过：固定基准胜率 {summary.win_rate:.1%}", flush=True)
             else:
-                state.warnings.append(
-                    {
-                        "timestamp": _now(),
-                        "kind": "quality_gate",
-                        "message": "；".join(gate.reasons) or "质量门槛未通过",
-                    }
-                )
+                state.warnings.append({
+                    "timestamp": _now(), "kind": "quality_gate",
+                    "message": "；".join(gate.reasons) or "课程门槛未通过",
+                })
                 self.store.save(state)
-                print("评测未达标，继续当前棋盘训练。", flush=True)
+                print("课程门槛未达标，继续当前棋盘训练。", flush=True)
         except Exception as error:
             if committed:
-                state.warnings.append(
-                    {
-                        "timestamp": _now(),
-                        "kind": "evaluation_artifact",
-                        "message": f"评测状态已提交，但辅助文件或输出失败：{error}",
-                    }
-                )
+                state.warnings.append({
+                    "timestamp": _now(), "kind": "evaluation_artifact",
+                    "message": f"评测状态已提交，但辅助文件或输出失败：{error}",
+                })
                 self.store.save(state)
-                print(
-                    f"评测状态已提交；辅助文件记录失败：{error}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                print(f"评测状态已提交；辅助文件记录失败：{error}", file=sys.stderr, flush=True)
             else:
                 self.controller.record_evaluation_error(state, str(error))
                 print(f"评测失败但检查点保持完好：{error}", file=sys.stderr, flush=True)
@@ -1306,142 +1357,15 @@ class CurriculumRuntime:
             self.store.save(state)
             raise
 
-    @staticmethod
-    def _pct(value: object) -> str:
-        try:
-            return f"{float(value) * 100:.1f}%"
-        except (TypeError, ValueError):
-            return "—"
-
-    @staticmethod
-    def _num(value: object) -> str:
-        try:
-            return f"{int(value):,}"
-        except (TypeError, ValueError):
-            return "—"
-
-    def _evaluation_chart(self, evaluations: Sequence[Mapping[str, object]]) -> str:
-        points: list[tuple[float, float]] = []
-        for index, record in enumerate(evaluations):
-            match = record.get("match")
-            if isinstance(match, Mapping):
-                try:
-                    points.append((float(index), float(match["win_rate"])))
-                except (KeyError, TypeError, ValueError):
-                    pass
-        if not points:
-            return '<div class="empty">首轮固定评测后显示胜率曲线。</div>'
-        width, height, pad = 760, 220, 34
-        x_denominator = max(1.0, points[-1][0])
-        coords = " ".join(
-            f"{pad + x / x_denominator * (width - pad * 2):.1f},"
-            f"{height - pad - max(0.0, min(1.0, y)) * (height - pad * 2):.1f}"
-            for x, y in points
-        )
-        threshold_y = height - pad - self.config.promotion_win_rate * (height - pad * 2)
-        return (
-            f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="固定评测胜率曲线">'
-            f'<line class="threshold" x1="{pad}" y1="{threshold_y:.1f}" '
-            f'x2="{width-pad}" y2="{threshold_y:.1f}"/>'
-            f'<text x="{width-pad}" y="{threshold_y-7:.1f}" text-anchor="end">60% 晋级线</text>'
-            f'<polyline class="series" points="{coords}"/>'
-            f'<text x="{pad}" y="{height-8}">较早</text>'
-            f'<text x="{width-pad}" y="{height-8}" text-anchor="end">最新</text>'
-            "</svg>"
-        )
-
     def _render_dashboard(self, state: CurriculumState) -> None:
-        active = state.active
-        definition = self.config.stages[state.active_stage_index]
-        latest_eval = active.evaluations[-1] if active.evaluations else {}
-        match = latest_eval.get("match", {}) if isinstance(latest_eval, Mapping) else {}
-        try:
-            health: Mapping[str, object] = self._health(
-                self._stage_runner(state)
-            ).to_dict()
-        except (OSError, ValueError, CurriculumStateError):
-            health = (
-                latest_eval.get("health", {})
-                if isinstance(latest_eval, Mapping)
-                else {}
-            )
-        if not isinstance(match, Mapping):
-            match = {}
-        if not isinstance(health, Mapping):
-            health = {}
-        minimum = definition.min_stage_samples
-        remaining = max(0, minimum - active.samples) if minimum is not None else None
-        try:
-            disk_free = float(state.disk.get("free_gib", 0.0))
-        except (TypeError, ValueError):
-            disk_free = 0.0
-        disk_status = state.disk.get("status", "unknown")
-        disk_labels = {
-            "healthy": "正常",
-            "cleanup": "已触发主动清理",
-            "paused": "空间不足，已暂停",
-            "unknown": "待检测",
-        }
-        cleanup = state.disk.get("last_cleanup", {})
-        stage_rows: list[str] = []
-        for index, stage in enumerate(self.config.stages):
-            progress = state.stages.get(stage.key)
-            marker = "当前" if index == state.active_stage_index else ("完成" if index < state.active_stage_index else "等待")
-            samples = progress.samples if progress else 0
-            target = "持续" if stage.indefinite else self._num(stage.min_stage_samples)
-            stage_rows.append(
-                "<tr>"
-                f"<td>{stage.board_size}×{stage.board_size}</td><td>{marker}</td>"
-                f"<td>{self._num(samples)}</td><td>{target}</td>"
-                f"<td>{html.escape(str(progress.latest_model if progress else '—'))}</td>"
-                "</tr>"
-            )
-        warning_rows = "".join(
-            f"<li><time>{html.escape(str(item.get('timestamp', '')))}</time> "
-            f"{html.escape(str(item.get('message', '')))}</li>"
-            for item in state.warnings[-8:]
-        ) or "<li>暂无警告</li>"
-        cleanup_text = "—"
-        if isinstance(cleanup, Mapping):
-            cleanup_text = (
-                f"{self._num(cleanup.get('files', 0))} 文件 / "
-                f"{self._num(cleanup.get('directories', 0))} 目录 / "
-                f"{float(cleanup.get('bytes', 0) or 0) / 1024**3:.2f} GiB"
-            )
-        generated = _now()
-        document = f"""<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="30"><title>KataGo 自动课程训练</title>
-<style>
-:root{{--bg:#09101d;--panel:#121c2d;--line:#283650;--text:#e9f1ff;--muted:#96a8c4;--cyan:#38d9e6;--green:#57e389;--amber:#ffd166;--red:#ff6b7a}}
-*{{box-sizing:border-box}} body{{margin:0;background:linear-gradient(145deg,#08101d,#101b2d);color:var(--text);font:15px/1.5 system-ui,"Microsoft YaHei",sans-serif}}
-main{{max-width:1180px;margin:auto;padding:28px}} h1{{margin:0 0 4px;font-size:28px}} .sub{{color:var(--muted);margin-bottom:22px}}
-.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}} .card,.panel{{background:rgba(18,28,45,.94);border:1px solid var(--line);border-radius:14px;padding:17px;box-shadow:0 10px 35px #0004}}
-.label{{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}} .value{{font-size:24px;font-weight:700;margin-top:6px}} .ok{{color:var(--green)}} .warn{{color:var(--amber)}} .bad{{color:var(--red)}}
-.grid{{display:grid;grid-template-columns:1.6fr 1fr;gap:14px;margin-top:14px}} h2{{font-size:17px;margin:0 0 12px}} table{{border-collapse:collapse;width:100%}} th,td{{padding:9px;border-bottom:1px solid var(--line);text-align:left}} th{{color:var(--muted)}}
-svg{{width:100%;height:auto;background:#0c1525;border-radius:9px}} .threshold{{stroke:var(--amber);stroke-width:1.5;stroke-dasharray:7 6}} .series{{fill:none;stroke:var(--cyan);stroke-width:3;stroke-linejoin:round;stroke-linecap:round}} svg text{{fill:var(--muted);font-size:12px}} .empty{{color:var(--muted);padding:70px 12px;text-align:center;background:#0c1525;border-radius:9px}}
-ul{{padding-left:20px;margin:0}} time{{color:var(--muted)}} .facts{{display:grid;grid-template-columns:1fr 1fr;gap:8px}} .fact{{padding:9px;background:#0c1525;border-radius:8px}} .fact b{{display:block;font-size:18px}} @media(max-width:780px){{.grid{{grid-template-columns:1fr}}}}
-</style></head><body><main>
-<h1>KataGo 9×9 → 13×13 → 19×19</h1><div class="sub">自动课程训练 · 每 30 秒刷新 · 更新于 {html.escape(generated)}</div>
-<section class="cards">
- <div class="card"><div class="label">当前棋盘</div><div class="value">{active.board_size}×{active.board_size}</div><div>{html.escape(state.phase)}</div></div>
- <div class="card"><div class="label">阶段样本</div><div class="value">{self._num(active.samples)}</div><div>剩余 {self._num(remaining) if remaining is not None else '无限持续'}</div></div>
- <div class="card"><div class="label">下次评测</div><div class="value">{self._num(active.next_evaluation_sample)}</div><div>连续达标 {active.consecutive_passes}/{self.config.required_consecutive_passes}</div></div>
- <div class="card"><div class="label">最近胜率 / Elo</div><div class="value">{self._pct(match.get('win_rate'))}</div><div>{float(match.get('elo', 0) or 0):+.0f} Elo · Wilson {self._pct(match.get('wilson_lower'))}</div></div>
- <div class="card"><div class="label">磁盘</div><div class="value {'bad' if disk_status == 'paused' else 'warn' if disk_status == 'cleanup' else 'ok'}">{disk_free:.1f} GiB</div><div>{html.escape(disk_labels.get(str(disk_status), str(disk_status)))}</div></div>
-</section>
-<section class="grid"><div class="panel"><h2>固定评测胜率</h2>{self._evaluation_chart(active.evaluations)}</div>
-<div class="panel"><h2>最近 10 轮健康窗口</h2><div class="facts">
- <div class="fact"><span>黑方得分率</span><b>{self._pct(health.get('black_win_rate'))}</b></div>
- <div class="fact"><span>黑胜 / 白胜</span><b>{self._num(health.get('black_wins'))} / {self._num(health.get('white_wins'))}</b></div>
- <div class="fact"><span>开局双停</span><b>{self._pct(health.get('immediate_double_pass_rate'))}</b></div>
- <div class="fact"><span>极端棋局</span><b>{self._pct(health.get('extreme_result_rate'))}</b></div>
- <div class="fact"><span>无结果/损坏</span><b>{self._pct(health.get('invalid_rate'))}</b></div>
-</div></div></section>
-<section class="grid"><div class="panel"><h2>阶段状态</h2><table><thead><tr><th>棋盘</th><th>状态</th><th>样本</th><th>目标</th><th>模型</th></tr></thead><tbody>{''.join(stage_rows)}</tbody></table></div>
-<div class="panel"><h2>存储与警告</h2><p>最近清理：{html.escape(cleanup_text)}</p><p>当前模型：{html.escape(str(active.latest_model or '—'))}</p><ul>{warning_rows}</ul></div></section>
-</main></body></html>"""
+        runner = self._stage_runner(state)
+        health = self._health(runner).to_dict()
+        records = self._read_metric_records(runner)
+        last_training = next((str(row["timestamp"]) for row in reversed(records)
+                              if row.get("timestamp") and row.get("source") == "completed-cycle"), None)
+        document = render_curriculum_dashboard(
+            state, self.config, latest_health=health, last_training_at=last_training,
+        )
         _atomic_write_text(self.dashboard_path, document)
 
     def run(self, iterations: int = 0, smoke: bool = False) -> dict[str, object]:
@@ -1455,6 +1379,7 @@ ul{{padding-left:20px;margin:0}} time{{color:var(--muted)}} .facts{{display:grid
             completed = 0
             while iterations == 0 or completed < iterations:
                 state = self.store.load() or state
+                self._ensure_opponent_pools(state)
                 disk_state = self._update_disk(state)
                 self._apply_retention(state)
                 self._render_dashboard(state)
@@ -1503,6 +1428,8 @@ ul{{padding-left:20px;margin:0}} time{{color:var(--muted)}} .facts{{display:grid
             "phase": state.phase,
             "samples": state.active.samples,
             "latest_model": state.active.latest_model,
+            "champion_model": state.active.champion_model,
+            "fixed_baseline_models": state.active.fixed_baseline_models,
             "next_evaluation_sample": state.active.next_evaluation_sample,
             "consecutive_passes": state.active.consecutive_passes,
             "autotune_batch": state.active.autotune_batch,

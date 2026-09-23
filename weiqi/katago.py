@@ -38,14 +38,7 @@ def katago_subprocess_environment(
     purelib: Optional[Path] = None,
     platform_name: Optional[str] = None,
 ) -> dict[str, str]:
-    """Return an environment that exposes PyTorch's bundled CUDA DLLs.
-
-    The official Windows CUDA builds of KataGo dynamically load the CUDA and
-    cuDNN runtimes.  A CUDA-enabled PyTorch wheel already ships compatible
-    copies, so reusing them avoids requiring a second system-wide CUDA Toolkit
-    installation.  Non-Windows platforms and environments without PyTorch are
-    left unchanged.
-    """
+    """Expose PyTorch's bundled CUDA DLLs to KataGo on Windows."""
 
     environment = os.environ.copy()
     if (platform_name or os.name) != "nt":
@@ -89,7 +82,7 @@ class KataGoProfile:
     human_sl_profile: str
     move_temperature: float
     utility_scale: float
-    selection_mode: Literal["professional", "human_rank"] = "professional"
+    selection_mode: Literal["professional", "human_rank", "training"] = "professional"
 
 
 _VISITS_BY_DAN = (24, 36, 54, 80, 120, 180, 270, 400, 600)
@@ -134,6 +127,8 @@ ALL_KATAGO_PROFILES = KATAGO_PROFILES + HUMANSL_PROFILES
 def profile_for_difficulty(label: str) -> KataGoProfile:
     """Return the KataGo search profile for a UI difficulty label."""
 
+    if label.startswith("训练·"):
+        return KataGoProfile(label, None, 200, "", 0.0, 0.0, "training")
     for profile in ALL_KATAGO_PROFILES:
         if profile.label == label:
             return profile
@@ -360,6 +355,10 @@ def build_analysis_query(
     profile: KataGoProfile,
     request_id: str,
     human_style: bool,
+    *,
+    max_visits: Optional[int] = None,
+    pv_length: Optional[int] = None,
+    include_ownership: bool = False,
 ) -> dict[str, Any]:
     """Build one official KataGo JSON analysis request from a game snapshot."""
 
@@ -378,9 +377,11 @@ def build_analysis_query(
         "komi": game.komi,
         "boardXSize": game.size,
         "boardYSize": game.size,
-        "maxVisits": profile.max_visits,
-        "analysisPVLen": 8,
+        "maxVisits": profile.max_visits if max_visits is None else max_visits,
+        "analysisPVLen": 8 if pv_length is None else pv_length,
     }
+    if include_ownership:
+        query["includeOwnership"] = True
     if not game.moves:
         query["initialPlayer"] = "B" if game.current_player == BLACK else "W"
     if human_style:
@@ -429,8 +430,13 @@ class KataGoEngine:
     def closed(self) -> bool:
         return self._closed
 
-    def _ensure_started(self) -> subprocess.Popen[str]:
+    def _ensure_started(
+        self,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> subprocess.Popen[str]:
         with self._state_lock:
+            if cancel_event is not None and cancel_event.is_set():
+                raise KataGoEngineError("KataGo 分析已经取消")
             if self._closed:
                 raise KataGoEngineError("KataGo 引擎已经关闭")
             if self.running:
@@ -523,13 +529,17 @@ class KataGoEngine:
             if stripped:
                 self._stderr_lines.append(stripped)
 
-    def choose_move(self, game: GoGame, profile: KataGoProfile) -> AIMove:
+    def choose_move(
+        self,
+        game: GoGame,
+        profile: KataGoProfile,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> AIMove:
         """Analyze ``game`` and return a legal KataGo move without mutating it."""
 
         if game.game_over:
             return AIMove(None, "对局已经结束")
         with self._query_lock:
-            process = self._ensure_started()
             request_id = uuid.uuid4().hex
             human_style = self.settings.human_style_enabled
             query_data = build_analysis_query(
@@ -538,24 +548,74 @@ class KataGoEngine:
                 request_id,
                 human_style,
             )
-            if process.stdin is None:
-                raise KataGoEngineError("KataGo 标准输入不可用")
-            try:
-                process.stdin.write(
-                    json.dumps(query_data, ensure_ascii=False, separators=(",", ":"))
-                    + "\n"
-                )
-                process.stdin.flush()
-            except (BrokenPipeError, OSError) as error:
-                raise KataGoEngineError(self._failure_detail("KataGo 连接已中断")) from error
-
-            response = self._wait_for_response(request_id)
+            response = self._send_analysis_query(
+                request_id,
+                query_data,
+                cancel_event=cancel_event,
+            )
             return self._decision_from_response(
                 game,
                 profile,
                 response,
                 human_style,
             )
+
+    def analyze_position(
+        self,
+        game: GoGame,
+        max_visits: int = 400,
+        pv_length: int = 12,
+        include_ownership: bool = True,
+        cancel_event: Optional[threading.Event] = None,
+        include_policy: bool = False,
+        preserve_history: bool = False,
+    ) -> dict[str, Any]:
+        """Return KataGo's raw analysis response for an unchanged game snapshot."""
+
+        with self._query_lock:
+            request_id = uuid.uuid4().hex
+            query_data = build_analysis_query(
+                game,
+                KATAGO_PROFILES[-1],
+                request_id,
+                False,
+                max_visits=max_visits,
+                pv_length=pv_length,
+                include_ownership=include_ownership,
+            )
+            if include_policy:
+                query_data["includePolicy"] = True
+            if preserve_history:
+                query_data.setdefault("overrideSettings", {})["ignorePreRootHistory"] = False
+            return self._send_analysis_query(
+                request_id,
+                query_data,
+                cancel_event=cancel_event,
+            )
+
+    def _send_analysis_query(
+        self,
+        request_id: str,
+        query_data: dict[str, Any],
+        cancel_event: Optional[threading.Event] = None,
+    ) -> dict[str, Any]:
+        """Send one serialized query and wait for its matching final response."""
+
+        process = self._ensure_started(cancel_event=cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            self.stop()
+            raise KataGoEngineError("KataGo 分析已经取消")
+        if process.stdin is None:
+            raise KataGoEngineError("KataGo 标准输入不可用")
+        try:
+            process.stdin.write(
+                json.dumps(query_data, ensure_ascii=False, separators=(",", ":"))
+                + "\n"
+            )
+            process.stdin.flush()
+        except (BrokenPipeError, OSError) as error:
+            raise KataGoEngineError(self._failure_detail("KataGo 连接已中断")) from error
+        return self._wait_for_response(request_id)
 
     def _wait_for_response(self, request_id: str) -> dict[str, Any]:
         warnings: list[str] = []
@@ -681,6 +741,8 @@ class KataGoEngine:
 
         if point is None:
             reason = f"KataGo 判断当前应当虚手，完成约 {visits} 次搜索"
+        elif profile.selection_mode == "training":
+            reason = f"{profile.label}，完成约 {visits} 次搜索并选择最高评价点"
         elif used_human_style and profile.selection_mode == "human_rank":
             reason = (
                 f"{profile.label}，按该水平人类棋谱策略采样；"
@@ -815,14 +877,14 @@ class KataGoEngine:
     def close(self) -> None:
         """Terminate the child process, including an in-flight query."""
 
-        self._stop_process(mark_closed=True)
+        self._stop_process(mark_closed=True, wait=True)
 
     def stop(self) -> None:
-        """Cancel current work while allowing a lazy restart later."""
+        """Cancel current work without blocking Tk while allowing a restart."""
 
-        self._stop_process(mark_closed=False)
+        self._stop_process(mark_closed=False, wait=False)
 
-    def _stop_process(self, mark_closed: bool) -> None:
+    def _stop_process(self, mark_closed: bool, wait: bool) -> None:
         with self._state_lock:
             if mark_closed:
                 self._closed = True
@@ -832,11 +894,34 @@ class KataGoEngine:
             return
         try:
             process.terminate()
+        except OSError:
+            # The process may already be exiting, or terminate may have been
+            # denied transiently.  The reaper still owns the detached handle
+            # and will fall back to kill instead of losing track of it.
+            pass
+        if wait:
+            self._reap_process(process)
+        else:
+            threading.Thread(
+                target=self._reap_process,
+                args=(process,),
+                name="katago-reaper",
+                daemon=True,
+            ).start()
+
+    @staticmethod
+    def _reap_process(process: subprocess.Popen[str]) -> None:
+        """Wait for a terminated engine off the Tk thread and kill if needed."""
+
+        try:
             process.wait(timeout=2.0)
         except (OSError, subprocess.TimeoutExpired):
             try:
                 process.kill()
+                process.wait(timeout=2.0)
             except OSError:
+                pass
+            except subprocess.TimeoutExpired:
                 pass
 
 
@@ -855,5 +940,13 @@ class KataGoAI:
                 "HumanSL 人类段位需要先配置人类风格模型"
             )
 
-    def choose_move(self, game: GoGame) -> AIMove:
-        return self.engine.choose_move(game, self.profile)
+    def choose_move(
+        self,
+        game: GoGame,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> AIMove:
+        return self.engine.choose_move(
+            game,
+            self.profile,
+            cancel_event=cancel_event,
+        )

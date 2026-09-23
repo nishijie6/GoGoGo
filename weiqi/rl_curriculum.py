@@ -131,6 +131,8 @@ class CurriculumStage:
     min_stage_samples: Optional[int]
     autotune_batches: tuple[int, ...]
     indefinite: bool
+    fixed_baseline_models: tuple[str, ...] = ()
+    initial_champion_model: Optional[str] = None
 
     @property
     def key(self) -> str:
@@ -267,7 +269,22 @@ def load_curriculum_config(path: Path) -> CurriculumConfig:
         path_name = f"stages[{index}]"
         if not isinstance(item, dict):
             raise CurriculumConfigError(f"{path_name} 必须是对象")
-        _require_exact_keys(item, path=path_name, required=_STAGE_FIELDS)
+        _require_exact_keys(
+            item, path=path_name, required=_STAGE_FIELDS,
+            optional={"fixed_baseline_models", "initial_champion_model"},
+        )
+        fixed_models = item.get("fixed_baseline_models", [])
+        champion = item.get("initial_champion_model")
+        if not isinstance(fixed_models, list) or any(
+            not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*", name)
+            for name in fixed_models
+        ) or len(set(fixed_models)) != len(fixed_models):
+            raise CurriculumConfigError(f"{path_name}.fixed_baseline_models 必须是不重复的模型目录名")
+        if champion is not None and (
+            not isinstance(champion, str)
+            or not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*", champion)
+        ):
+            raise CurriculumConfigError(f"{path_name}.initial_champion_model 必须是模型目录名")
         board = _positive_int(item["board_size"], f"{path_name}.board_size")
         training_config = item["training_config"]
         if not isinstance(training_config, str) or not training_config.strip():
@@ -295,6 +312,8 @@ def load_curriculum_config(path: Path) -> CurriculumConfig:
                 min_stage_samples=minimum,
                 autotune_batches=parsed_batches,
                 indefinite=indefinite,
+                fixed_baseline_models=tuple(fixed_models),
+                initial_champion_model=champion,
             )
         )
 
@@ -372,6 +391,8 @@ class StageProgress:
     baseline_model: Optional[str] = None
     latest_model: Optional[str] = None
     champion_model: Optional[str] = None
+    champion_established: bool = False
+    fixed_baseline_models: list[str] = field(default_factory=list)
     next_evaluation_sample: int = 0
     consecutive_passes: int = 0
     evaluations: list[dict[str, object]] = field(default_factory=list)
@@ -389,6 +410,8 @@ class StageProgress:
                 baseline_model=_optional_string(value.get("baseline_model")),
                 latest_model=_optional_string(value.get("latest_model")),
                 champion_model=_optional_string(value.get("champion_model")),
+                champion_established=bool(value.get("champion_established", value.get("champion_model") is not None)),
+                fixed_baseline_models=list(value.get("fixed_baseline_models", [])),
                 next_evaluation_sample=int(value.get("next_evaluation_sample", 0)),
                 consecutive_passes=int(value.get("consecutive_passes", 0)),
                 evaluations=list(value.get("evaluations", [])),
@@ -404,6 +427,8 @@ class StageProgress:
             raise CurriculumStateError("阶段状态字段无效") from error
         if progress.board_size not in EXPECTED_BOARDS or progress.samples < 0:
             raise CurriculumStateError("阶段状态棋盘或样本数无效")
+        if not all(isinstance(name, str) and name for name in progress.fixed_baseline_models):
+            raise CurriculumStateError("固定历史基准模型无效")
         return progress
 
 
@@ -1049,10 +1074,19 @@ class CurriculumController:
         return due
 
     def evaluation_baseline(self, state: CurriculumState) -> Optional[str]:
+        return state.active.champion_model or state.active.baseline_model
+
+    def evaluation_opponents(self, state: CurriculumState) -> dict[str, list[str]]:
+        """One match per distinct opponent, even when it has both pool roles."""
         active = state.active
-        if active.board_size == 19:
-            return active.champion_model or active.baseline_model
-        return active.baseline_model
+        opponents: dict[str, list[str]] = {}
+        champion = self.evaluation_baseline(state)
+        if champion and champion != active.latest_model:
+            opponents.setdefault(champion, []).append("champion")
+        for name in active.fixed_baseline_models or [active.baseline_model]:
+            if name and name != active.latest_model:
+                opponents.setdefault(name, []).append("fixed")
+        return opponents
 
     def record_evaluation(
         self,
@@ -1061,18 +1095,19 @@ class CurriculumController:
         candidate_model: str,
         match: MatchSummary,
         health: HealthSummary,
+        opponent_results: Optional[Mapping[str, MatchSummary]] = None,
     ) -> QualityGate:
         stage_definition = self.config.stages[state.active_stage_index]
-        rolling = stage_definition.indefinite
+        # Stage advancement uses a stable historical anchor. Champion promotion
+        # measures playing strength independently of self-play health and samples.
+        baseline = state.active.baseline_model
         gate = evaluate_quality_gate(
             match,
             health,
             self.config,
             stage_samples=state.active.samples,
             minimum_samples=stage_definition.min_stage_samples,
-            rolling_champion=rolling,
         )
-        baseline = self.evaluation_baseline(state)
         candidate = copy.deepcopy(state)
         record: dict[str, object] = {
             "timestamp": _now(),
@@ -1084,11 +1119,41 @@ class CurriculumController:
             "match": match.to_dict(),
             "health": health.to_dict(),
         }
-        if rolling:
-            if gate.passed:
+        champion = state.active.champion_model
+        record["champion_before"] = champion
+        if opponent_results is not None:
+            expected = self.evaluation_opponents(state)
+            if set(opponent_results) != set(expected):
+                raise CurriculumStateError("两类评测对手结果不完整")
+            if baseline not in opponent_results or opponent_results[baseline] != match:
+                raise CurriculumStateError("课程门槛必须使用首个固定历史基准的成绩")
+            if any(
+                result.games != self.config.evaluation_games
+                or result.candidate_black_games != self.config.evaluation_games // 2
+                or result.candidate_white_games != self.config.evaluation_games // 2
+                or result.damaged_games or result.no_result_games
+                for result in opponent_results.values()
+            ):
+                raise CurriculumStateError("评测局数不完整或没有严格交换黑白")
+            record["opponents"] = [
+                {"model": name, "roles": roles, "match": opponent_results[name].to_dict()}
+                for name, roles in expected.items()
+            ]
+            champion_match = opponent_results.get(champion) if champion else None
+            if champion_match is not None and (
+                champion_match.games == self.config.evaluation_games
+                and champion_match.candidate_black_games == self.config.evaluation_games // 2
+                and champion_match.candidate_white_games == self.config.evaluation_games // 2
+                and not champion_match.damaged_games
+                and not champion_match.no_result_games
+                and champion_match.win_rate >= self.config.promotion_win_rate
+                and champion_match.wilson_lower > self.config.wilson_lower_bound
+            ):
                 candidate.active.champion_model = candidate_model
-                candidate.protected_models.append(candidate_model)
+                candidate.active.champion_established = True
                 record["champion_promoted"] = True
+        record["champion_after"] = candidate.active.champion_model
+        if stage_definition.indefinite:
             candidate.active.consecutive_passes = 0
             candidate.phase = "training"
         else:
@@ -1104,7 +1169,18 @@ class CurriculumController:
         candidate.active.evaluations.append(record)
         while candidate.active.next_evaluation_sample <= candidate.active.samples:
             candidate.active.next_evaluation_sample += self.config.evaluation_interval_samples
-        candidate.protected_models = list(dict.fromkeys(candidate.protected_models))
+        candidate.protected_models = list(dict.fromkeys(
+            candidate.protected_models + candidate.active.fixed_baseline_models
+            + ([candidate.active.champion_model] if candidate.active.champion_model else [])
+        ))
+        if champion and champion != candidate.active.champion_model:
+            still_needed = {
+                name for progress in candidate.stages.values()
+                for name in [progress.entry_model, progress.baseline_model, progress.latest_model,
+                             progress.champion_model, *progress.fixed_baseline_models]
+            }
+            if champion not in still_needed:
+                candidate.protected_models = [name for name in candidate.protected_models if name != champion]
         self.store.save(candidate)
         state.__dict__.update(candidate.__dict__)
         return gate
@@ -1172,7 +1248,8 @@ class CurriculumController:
             entry_model=seed_model,
             baseline_model=seed_model,
             latest_model=seed_model,
-            champion_model=seed_model if board == 19 else None,
+            champion_model=seed_model,
+            fixed_baseline_models=[seed_model],
             next_evaluation_sample=self.config.evaluation_interval_samples,
             autotune_batch=autotune_batch,
         )
@@ -1231,61 +1308,17 @@ def _count_pair(left: object, right: object) -> str:
     return f"{int(left_number):,} / {int(right_number):,}"
 
 
-def _evaluation_chart(evaluations: Sequence[Mapping[str, object]]) -> str:
-    points: list[tuple[int, float]] = []
-    for index, evaluation in enumerate(evaluations, start=1):
-        match = evaluation.get("match")
-        if isinstance(match, Mapping):
-            rate = _finite_float(match.get("win_rate"))
-            if rate is not None:
-                points.append((index, rate))
-    if not points:
-        return '<div class="empty">达到下一个评测边界后绘制胜率趋势。</div>'
-    width, height = 760, 245
-    left, right, top, bottom = 54, 18, 18, 35
-    plot_w, plot_h = width - left - right, height - top - bottom
-    first_x, last_x = points[0][0], points[-1][0]
-
-    def sx(value: int) -> float:
-        return left + (value - first_x) / max(1, last_x - first_x) * plot_w
-
-    def sy(value: float) -> float:
-        return top + (1.0 - value) * plot_h
-
-    coordinates = " ".join(f"{sx(x):.1f},{sy(y):.1f}" for x, y in points)
-    rows = [
-        f'<svg viewBox="0 0 {width} {height}" role="img" '
-        'aria-label="候选模型固定评测胜率趋势">',
-        "<title>固定评测胜率趋势</title>",
-    ]
-    for rate in (0.5, 0.6, 0.75, 1.0):
-        y = sy(rate)
-        css = " threshold" if rate == 0.6 else ""
-        rows.append(
-            f'<line class="grid{css}" x1="{left}" y1="{y:.1f}" '
-            f'x2="{width-right}" y2="{y:.1f}" />'
-        )
-        rows.append(
-            f'<text class="axis-label" x="{left-8}" y="{y+4:.1f}" '
-            f'text-anchor="end">{rate*100:.0f}%</text>'
-        )
-    rows.append(f'<polyline class="series" points="{coordinates}" />')
-    for x, rate in points:
-        rows.append(
-            f'<circle cx="{sx(x):.1f}" cy="{sy(rate):.1f}" r="3.5">'
-            f"<title>评测 {x}: {rate*100:.1f}%</title></circle>"
-        )
-    rows.append("</svg>")
-    return "".join(rows)
-
-
 def render_curriculum_dashboard(
     state: CurriculumState,
     config: CurriculumConfig,
     *,
     generated_at: Optional[str] = None,
+    latest_health: Optional[Mapping[str, object]] = None,
+    last_training_at: Optional[str] = None,
 ) -> str:
     """Render the global, self-contained 9/13/19 curriculum dashboard."""
+
+    from .rl_evaluation_dashboard import render_opponent_pools
 
     active = state.active
     stage_definition = config.stages[state.active_stage_index]
@@ -1293,10 +1326,7 @@ def render_curriculum_dashboard(
     remaining = max(0, minimum - active.samples) if minimum is not None else None
     evaluations = active.evaluations
     latest_evaluation = evaluations[-1] if evaluations else {}
-    match = latest_evaluation.get("match", {})
-    health = latest_evaluation.get("health", {})
-    if not isinstance(match, Mapping):
-        match = {}
+    health = latest_health if latest_health is not None else latest_evaluation.get("health", {})
     if not isinstance(health, Mapping):
         health = {}
     disk = state.disk
@@ -1309,7 +1339,7 @@ def render_curriculum_dashboard(
         "waiting": "等待磁盘检查",
     }.get(disk_status_key, disk_status_key)
     phase_labels = {
-        "training": "持续训练",
+        "training": "训练阶段（保存状态）",
         "evaluating": "固定评测",
         "transition_ready": "等待迁移",
         "migrating": "安全迁移",
@@ -1321,15 +1351,8 @@ def render_curriculum_dashboard(
         ("课程状态", phase_labels.get(state.phase, state.phase)),
         ("阶段样本", f"{active.samples:,}"),
         ("距离最低门槛", "无限持续" if remaining is None else f"{remaining:,}"),
-        ("下次固定评测", f"{active.next_evaluation_sample:,}"),
+        ("下次两类评测", f"{active.next_evaluation_sample:,}"),
         ("连续达标", f"{active.consecutive_passes}/{config.required_consecutive_passes}"),
-        ("评测胜率", _percent(match.get("win_rate"))),
-        (
-            "近似 Elo",
-            f"{_finite_float(match.get('elo')):+.0f}"
-            if _finite_float(match.get("elo")) is not None
-            else "—",
-        ),
         ("黑方得分率", _percent(health.get("black_win_rate"))),
         (
             "黑胜 / 白胜",
@@ -1369,23 +1392,6 @@ def render_curriculum_dashboard(
             f"<td>{html.escape(progress.latest_model if progress and progress.latest_model else '—')}</td>"
             "</tr>"
         )
-    recent_evaluations = []
-    for evaluation in reversed(evaluations[-10:]):
-        evaluation_match = evaluation.get("match", {})
-        if not isinstance(evaluation_match, Mapping):
-            evaluation_match = {}
-        recent_evaluations.append(
-            "<tr>"
-            f"<td>{int(evaluation.get('stage_samples', 0)):,}</td>"
-            f"<td>{html.escape(str(evaluation.get('candidate_model', '—')))}</td>"
-            f"<td>{_percent(evaluation_match.get('win_rate'))}</td>"
-            f"<td>{_percent(evaluation_match.get('wilson_lower'))}</td>"
-            f"<td>{'通过' if evaluation.get('passed') else '继续训练'}</td>"
-            "</tr>"
-        )
-    evaluation_rows = "".join(recent_evaluations) or (
-        '<tr><td colspan="5" class="empty-row">尚无固定评测。</td></tr>'
-    )
     warning = state.warnings[-1].get("message") if state.warnings else "无"
     disk_class = " alarm" if state.phase == "paused_disk" else ""
     return f"""<!doctype html>
@@ -1400,15 +1406,16 @@ main{{width:min(1440px,calc(100% - 28px));margin:auto;padding:26px 0 42px}}heade
 h1{{margin:0 0 5px;font-size:clamp(25px,3vw,38px)}}p{{margin:0;color:var(--muted)}}.badge{{padding:8px 12px;border-radius:999px;background:var(--panel);border:1px solid var(--border)}}.badge.alarm{{color:var(--red);font-weight:700}}
 .stats{{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:11px}}.stat,.panel{{background:var(--panel);border:1px solid var(--border);border-radius:15px}}
 .stat{{padding:15px}}.stat span{{display:block;color:var(--muted);font-size:12px;margin-bottom:7px}}.stat strong{{font-size:clamp(17px,2vw,25px)}}.grid2{{display:grid;grid-template-columns:1.2fr .8fr;gap:14px;margin-top:14px}}
-.panel{{padding:18px;overflow:auto}}h2{{font-size:17px;margin:0 0 12px}}svg{{display:block;width:100%;height:auto}}.grid{{stroke:var(--grid);stroke-width:1}}.threshold{{stroke:var(--red);stroke-dasharray:5 4}}.axis-label{{fill:var(--muted);font-size:11px}}.series{{fill:none;stroke:var(--blue);stroke-width:2.8}}circle{{fill:var(--blue)}}
+a{{color:var(--blue)}}.panel{{padding:18px;overflow:auto}}h2{{font-size:17px;margin:0 0 12px}}svg{{display:block;width:100%;height:auto}}.grid{{stroke:var(--grid);stroke-width:1}}.threshold{{stroke:var(--red);stroke-dasharray:5 4}}.axis-label{{fill:var(--muted);font-size:11px}}.series{{fill:none;stroke:var(--blue);stroke-width:2.8}}circle{{fill:var(--blue)}}
 table{{width:100%;border-collapse:collapse;font-size:13px}}th,td{{padding:9px 10px;border-bottom:1px solid var(--border);text-align:right;white-space:nowrap}}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){{text-align:left}}th{{color:var(--muted)}}.empty{{height:220px;display:grid;place-items:center;color:var(--muted)}}.empty-row{{text-align:center!important;color:var(--muted)}}.foot{{margin-top:14px;font-size:13px;line-height:1.6}}
 @media(max-width:1000px){{.stats{{grid-template-columns:repeat(3,1fr)}}.grid2{{grid-template-columns:1fr}}}}@media(max-width:600px){{header{{align-items:flex-start;flex-direction:column}}.stats{{grid-template-columns:repeat(2,1fr)}}}}
 </style></head><body><main>
-<header><div><h1>KataGo 9×9 → 13×13 → 19×19</h1><p>固定评测门槛 · SWA 权重迁移 · 19×19 持续运行</p></div><div class="badge{disk_class}">{html.escape(disk_status)}</div></header>
+<header><div><h1>KataGo 9×9 → 13×13 → 19×19</h1><p>固定评测门槛 · 滚动冠军 + 固定历史基准 · SWA 权重迁移</p></div><div class="badge{disk_class}">{html.escape(disk_status)}</div></header>
 <section class="stats">{cards_html}</section>
-<section class="grid2"><article class="panel"><h2>评测胜率趋势（红线为 60%）</h2>{_evaluation_chart(evaluations)}</article>
-<article class="panel"><h2>课程阶段</h2><table><thead><tr><th>棋盘</th><th>状态</th><th>样本</th><th>最低门槛</th><th>最新模型</th></tr></thead><tbody>{''.join(stage_rows)}</tbody></table></article></section>
-<article class="panel" style="margin-top:14px"><h2>最近固定评测</h2><table><thead><tr><th>阶段样本</th><th>候选模型</th><th>胜率</th><th>Wilson 下界</th><th>结论</th></tr></thead><tbody>{evaluation_rows}</tbody></table></article>
+<p class="foot">最近训练记录：{html.escape(last_training_at or '尚未读取')}。页面刷新不代表训练正在运行。</p>
+<nav class="foot"><a href="../9x9/dashboard.html">9×9 损失与吞吐</a> · <a href="../13x13/dashboard.html">13×13 训练曲线（阶段启动后）</a> · <a href="../19x19/dashboard.html">19×19 训练曲线（阶段启动后）</a></nav>
+{render_opponent_pools(active)}
+<article class="panel" style="margin-top:16px"><h2>课程阶段</h2><table><thead><tr><th>棋盘</th><th>状态</th><th>样本</th><th>最低门槛</th><th>最新模型</th></tr></thead><tbody>{''.join(stage_rows)}</tbody></table></article>
 <p class="foot">最近警告：{html.escape(str(warning))}<br>生成于 {html.escape(generated)}；每 15 秒自动刷新。评测使用固定 6.5 贴目、面积计分、位置全局同形、关闭根噪声与温度且不认输。</p>
 </main></body></html>"""
 

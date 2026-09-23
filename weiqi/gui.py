@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import tkinter as tk
 from concurrent.futures import Future, ThreadPoolExecutor
 from tkinter import messagebox, ttk
@@ -13,7 +14,9 @@ from .ai import (
     GoAI,
     is_human_sl_difficulty,
     is_katago_difficulty,
+    is_training_difficulty,
 )
+from .analysis_gui import AnalysisWorkbenchWindow
 from .engine import BLACK, EMPTY, WHITE, GoGame, MoveRecord, Point, color_name
 from .katago import (
     KataGoAI,
@@ -27,6 +30,7 @@ from .reasoning import ReasoningSession
 from .rules import RULE_SECTIONS, RULES_INTRO
 from .training_gui import ReasoningTrainer
 from .winrate import WinRateEstimate, WinRateEstimator
+from .rl_opponents import load_training_opponents, settings_for_training_opponent
 
 
 MODE_AI = "人机对战"
@@ -53,6 +57,7 @@ class GoApp:
         self.winrate_estimator = WinRateEstimator()
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="go-ai")
         self.ai_future: Optional[Future[AIMove]] = None
+        self._ai_cancel_event: Optional[threading.Event] = None
         self.ai_busy = False
         self.generation = 0
         self.active_mode = MODE_AI
@@ -64,11 +69,16 @@ class GoApp:
         self._end_dialog_shown = False
         self.rules_window: Optional[tk.Toplevel] = None
         self.training_window: Optional[ReasoningTrainer] = None
+        self.analysis_window: Optional[AnalysisWorkbenchWindow] = None
         self.katago_settings_window: Optional[KataGoSettingsDialog] = None
         self._pending_katago_new_game = False
+        self._pending_analysis_open = False
+        self._closing = False
         self._winrate_cache_key: Optional[tuple[object, ...]] = None
         self._last_winrate: Optional[WinRateEstimate] = None
         self._winrate_source = "启发式估算"
+        self._training_opponents = {}
+        self.active_training_opponent = None
 
         self.mode_var = tk.StringVar(value=MODE_AI)
         self.size_var = tk.StringVar(value="9×9")
@@ -83,6 +93,7 @@ class GoApp:
         self.winlead_var = tk.StringVar()
 
         self._build_layout()
+        self._refresh_training_opponents()
         self._bind_shortcuts()
         self.new_game()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -234,18 +245,25 @@ class GoApp:
             command=self.toggle_reasoning_mode,
         )
         self.reasoning_button.grid(row=0, column=3, sticky="e", padx=(8, 0))
+        self.analysis_button = ttk.Button(
+            header,
+            text="AI 分析  F4",
+            style="Header.TButton",
+            command=self.show_analysis,
+        )
+        self.analysis_button.grid(row=0, column=4, sticky="e", padx=(8, 0))
         ttk.Button(
             header,
             text="推理训练  F2",
             style="Header.TButton",
             command=self.show_training,
-        ).grid(row=0, column=4, sticky="e", padx=(8, 0))
+        ).grid(row=0, column=5, sticky="e", padx=(8, 0))
         ttk.Button(
             header,
             text="围棋规则  F1",
             style="Header.TButton",
             command=self.show_rules,
-        ).grid(row=0, column=5, sticky="e", padx=(8, 0))
+        ).grid(row=0, column=6, sticky="e", padx=(8, 0))
 
         board_shell = tk.Frame(
             shell,
@@ -346,6 +364,7 @@ class GoApp:
             width=8,
         )
         self.size_combo.grid(row=1, column=0, sticky="ew", pady=(3, 0))
+        self.size_combo.bind("<<ComboboxSelected>>", self._refresh_training_opponents)
         self.human_combo = ttk.Combobox(
             options,
             textvariable=self.human_color_var,
@@ -364,6 +383,7 @@ class GoApp:
             textvariable=self.difficulty_var,
             values=AI_DIFFICULTIES,
             state="readonly",
+            postcommand=self._refresh_training_opponents,
         )
         self.difficulty_combo.grid(
             row=3,
@@ -485,7 +505,10 @@ class GoApp:
 
         ttk.Label(
             panel,
-            text="快捷键：Ctrl+N 新局 · Ctrl+Z 悔棋 · P 虚手\nF1 规则 · F2 推理训练 · F3 推理模式。",
+            text=(
+                "快捷键：Ctrl+N 新局 · Ctrl+Z 悔棋 · P 虚手\n"
+                "F1 规则 · F2 训练 · F3 推理 · F4 AI 分析。"
+            ),
             style="Panel.TLabel",
             wraplength=225,
             justify="left",
@@ -505,6 +528,118 @@ class GoApp:
 
     def _training_closed(self) -> None:
         self.training_window = None
+
+    @property
+    def analysis_active(self) -> bool:
+        """Whether an isolated AI analysis workbench is currently visible."""
+
+        window = getattr(self, "analysis_window", None)
+        return window is not None and window.is_alive
+
+    def show_analysis(self) -> bool:
+        """Open the KataGo analysis workbench for the unchanged formal game."""
+
+        if self.analysis_active:
+            assert self.analysis_window is not None
+            self.analysis_window.lift()
+            return True
+        if self.in_reasoning_mode:
+            self.notice_var.set(
+                "请先退出 F3 推理模式；AI 分析工作台会建立自己的多分支推演树。"
+            )
+            self.root.bell()
+            return False
+        if self.game.game_over:
+            self.notice_var.set("本局已经结束，不能从终局开启 AI 分析工作台。")
+            self.root.bell()
+            return False
+
+        settings = KataGoSettings.load()
+        try:
+            if is_training_difficulty(self.active_difficulty):
+                settings = settings_for_training_opponent(
+                    settings, self.active_training_opponent, self.game.size,
+                )
+            settings.require_valid()
+        except KataGoConfigurationError as error:
+            self._pending_analysis_open = True
+            self.notice_var.set(f"AI 分析需要先配置 KataGo：{error}。")
+            self.show_katago_settings()
+            return False
+
+        old_engine = self.katago_engine
+        if (
+            old_engine is not None
+            and not old_engine.closed
+            and old_engine.settings.fingerprint == settings.fingerprint
+        ):
+            analysis_engine = old_engine
+        else:
+            try:
+                analysis_engine = KataGoEngine(settings)
+            except KataGoError as error:
+                self.notice_var.set(f"KataGo 配置不可用：{error}。")
+                self.show_katago_settings()
+                return False
+
+        analysis_ai: Optional[KataGoAI] = None
+        if self.active_mode == MODE_AI and is_katago_difficulty(
+            self.active_difficulty
+        ):
+            try:
+                analysis_ai = KataGoAI(analysis_engine, self.active_difficulty)
+            except KataGoError as error:
+                if analysis_engine is not old_engine:
+                    analysis_engine.close()
+                self._pending_analysis_open = True
+                self.notice_var.set(f"当前 KataGo 对局配置不可用：{error}。")
+                self.show_katago_settings()
+                return False
+
+        self._invalidate_ai()
+        if old_engine is not None and old_engine is not analysis_engine:
+            old_engine.close()
+        self.katago_engine = analysis_engine
+        if analysis_ai is not None:
+            self.ai = analysis_ai
+
+        try:
+            self.analysis_window = AnalysisWorkbenchWindow(
+                self.root,
+                self.game,
+                analysis_engine,
+                self.executor,
+                on_close=self._analysis_closed,
+            )
+        except Exception as error:
+            self.analysis_window = None
+            self.notice_var.set(f"无法打开 AI 分析工作台：{error}")
+            if self._is_ai_turn():
+                self.root.after(220, self._start_ai_turn)
+            return False
+
+        self.hover_point = None
+        self._refresh(
+            "AI 分析工作台已开启：正式棋局已冻结且不会被推演修改；"
+            "关闭窗口后可从原局面继续。"
+        )
+        return True
+
+    def _analysis_closed(self) -> None:
+        """Release analysis work and resume the untouched formal position."""
+
+        self.analysis_window = None
+        if self.katago_engine is not None:
+            # Future.cancel() cannot stop work that has already entered the
+            # external process.  Stopping here also prevents a late response
+            # from occupying the shared single-worker executor.
+            self.katago_engine.stop()
+        if getattr(self, "_closing", False):
+            return
+        self.hover_point = None
+        self._refresh("AI 分析工作台已关闭，正式棋局保持不变，可继续对局。")
+        if self._is_ai_turn():
+            self.root.after(220, self._start_ai_turn)
 
     def show_katago_settings(self, pending_new_game: bool = False) -> None:
         """Open the KataGo path configuration dialog."""
@@ -528,8 +663,13 @@ class GoApp:
         """Apply new paths and resume the operation that requested setup."""
 
         should_start_new_game = self._pending_katago_new_game
+        should_open_analysis = getattr(self, "_pending_analysis_open", False)
         self._pending_katago_new_game = False
+        self._pending_analysis_open = False
         self._invalidate_ai()
+        analysis_window = getattr(self, "analysis_window", None)
+        if analysis_window is not None:
+            analysis_window.close()
         if self.katago_engine is not None:
             self.katago_engine.close()
             self.katago_engine = None
@@ -538,28 +678,39 @@ class GoApp:
             self.root.after(80, self.new_game)
             return
 
-        if self.active_mode == MODE_AI and is_katago_difficulty(
+        needs_play_engine = self.active_mode == MODE_AI and is_katago_difficulty(
             self.active_difficulty
-        ):
+        )
+        if needs_play_engine or should_open_analysis:
             try:
+                if needs_play_engine and is_training_difficulty(self.active_difficulty):
+                    settings = settings_for_training_opponent(
+                        settings, self.active_training_opponent, self.game.size,
+                    )
                 self.katago_engine = KataGoEngine(settings)
-                self.ai = KataGoAI(
-                    self.katago_engine,
-                    self.active_difficulty,
-                )
+                if needs_play_engine:
+                    self.ai = KataGoAI(
+                        self.katago_engine,
+                        self.active_difficulty,
+                    )
             except KataGoError as error:
                 if self.katago_engine is not None:
                     self.katago_engine.close()
                     self.katago_engine = None
                 self.notice_var.set(f"KataGo 配置仍不可用：{error}")
                 return
-            self.notice_var.set("KataGo 配置已更新，准备继续当前对局。")
-            if self._is_ai_turn():
+            if should_open_analysis:
+                self.notice_var.set("KataGo 配置已更新，准备打开 AI 分析工作台。")
+                self.root.after(80, self.show_analysis)
+            else:
+                self.notice_var.set("KataGo 配置已更新，准备继续当前对局。")
+            if not should_open_analysis and self._is_ai_turn():
                 self.root.after(120, self._start_ai_turn)
 
     def _katago_settings_closed(self) -> None:
         self.katago_settings_window = None
         self._pending_katago_new_game = False
+        self._pending_analysis_open = False
 
     def show_rules(self) -> None:
         """Open the in-program Go rules reference."""
@@ -703,6 +854,7 @@ class GoApp:
         self.root.bind("<F1>", lambda _event: self.show_rules())
         self.root.bind("<F2>", lambda _event: self.show_training())
         self.root.bind("<F3>", lambda _event: self.toggle_reasoning_mode())
+        self.root.bind("<F4>", lambda _event: self.show_analysis())
 
     def _bind_panel_mousewheel(self, widget: tk.Misc) -> None:
         if not isinstance(widget, (tk.Listbox, ttk.Scrollbar)):
@@ -737,6 +889,14 @@ class GoApp:
     def enter_reasoning_mode(self) -> bool:
         """Save the formal game and switch the board to a temporary variation."""
 
+        if self.analysis_active:
+            assert self.analysis_window is not None
+            self.analysis_window.lift()
+            self.notice_var.set(
+                "AI 分析工作台已经包含多分支推演；请先关闭它再进入 F3 推理模式。"
+            )
+            self.root.bell()
+            return False
         if self.game.game_over:
             self.notice_var.set("本局已经结束，不能从终局开启推理模式。")
             self.root.bell()
@@ -785,6 +945,18 @@ class GoApp:
             self.root.after(220, self._start_ai_turn)
         return True
 
+    def _refresh_training_opponents(self, _event=None) -> None:
+        size = int(self.size_var.get().split("×", maxsplit=1)[0])
+        try:
+            self._training_opponents = load_training_opponents(size)
+        except (OSError, ValueError, KeyError) as error:
+            self._training_opponents = {}
+            self.notice_var.set(f"训练对手列表暂不可用：{error}")
+        self.difficulty_combo.configure(values=(*AI_DIFFICULTIES, *self._training_opponents))
+        selected = self.difficulty_var.get()
+        if is_training_difficulty(selected) and selected not in self._training_opponents:
+            self.difficulty_var.set("中等")
+
     def new_game(self) -> None:
         """Apply the selected options and replace the current game."""
 
@@ -793,9 +965,16 @@ class GoApp:
         selected_difficulty = self.difficulty_var.get()
 
         candidate_engine: Optional[KataGoEngine] = None
+        training_opponent = None
         if selected_mode == MODE_AI and is_katago_difficulty(selected_difficulty):
             settings = KataGoSettings.load()
             try:
+                if is_training_difficulty(selected_difficulty):
+                    training_opponent = self._training_opponents.get(selected_difficulty)
+                    if training_opponent is None:
+                        self.notice_var.set("训练对手已变化，请重新选择。")
+                        return
+                    settings = settings_for_training_opponent(settings, training_opponent, size)
                 settings.require_valid()
             except KataGoConfigurationError as error:
                 self.notice_var.set(f"所选电脑难度需要先配置 KataGo：{error}。")
@@ -833,6 +1012,9 @@ class GoApp:
 
         old_engine = self.katago_engine
         self._invalidate_ai()
+        analysis_window = getattr(self, "analysis_window", None)
+        if analysis_window is not None:
+            analysis_window.close()
         self._reasoning_session = None
         if old_engine is not None and old_engine is not candidate_engine:
             old_engine.close()
@@ -840,6 +1022,7 @@ class GoApp:
         self.ai = candidate_ai
         self.active_mode = selected_mode
         self.active_difficulty = selected_difficulty
+        self.active_training_opponent = training_opponent
         self.human_color = (
             BLACK if self.human_color_var.get().startswith("黑") else WHITE
         )
@@ -876,6 +1059,12 @@ class GoApp:
         if not self._human_can_act():
             if self.ai_busy:
                 self.notice_var.set("电脑正在思考，请稍候…")
+            elif self.analysis_active:
+                self.notice_var.set(
+                    "正式棋局已暂停；请在 AI 分析工作台的棋盘中推演。"
+                )
+                assert self.analysis_window is not None
+                self.analysis_window.lift()
             elif self.game.game_over:
                 if self.in_reasoning_mode:
                     self.notice_var.set(
@@ -1233,6 +1422,13 @@ class GoApp:
                 self._show_game_over()
 
     def undo(self) -> None:
+        if self.analysis_active:
+            self.notice_var.set(
+                "正式棋局已暂停；请使用 AI 分析工作台中的“撤回”浏览推演树。"
+            )
+            assert self.analysis_window is not None
+            self.analysis_window.lift()
+            return
         if not self.game.can_undo:
             if self.in_reasoning_mode:
                 self.notice_var.set(
@@ -1268,7 +1464,16 @@ class GoApp:
         self.ai_busy = True
         request_generation = self.generation
         snapshot = self.game.clone()
-        self.ai_future = self.executor.submit(self.ai.choose_move, snapshot)
+        cancel_event = threading.Event()
+        self._ai_cancel_event = cancel_event
+        if isinstance(self.ai, KataGoAI):
+            self.ai_future = self.executor.submit(
+                self.ai.choose_move,
+                snapshot,
+                cancel_event,
+            )
+        else:
+            self.ai_future = self.executor.submit(self.ai.choose_move, snapshot)
         self._refresh(
             f"{color_name(self.ai_color)}电脑正在思考…"
             f"（{self.active_difficulty}）"
@@ -1287,6 +1492,7 @@ class GoApp:
 
         self.ai_busy = False
         self.ai_future = None
+        self._ai_cancel_event = None
         try:
             decision = future.result()
         except Exception as error:  # Keep the GUI usable if an AI bug occurs.
@@ -1344,6 +1550,10 @@ class GoApp:
 
     def _invalidate_ai(self) -> None:
         self.generation += 1
+        cancel_event = getattr(self, "_ai_cancel_event", None)
+        if cancel_event is not None:
+            cancel_event.set()
+        self._ai_cancel_event = None
         future_running = self.ai_future is not None and not self.ai_future.done()
         if self.ai_future is not None:
             self.ai_future.cancel()
@@ -1355,13 +1565,14 @@ class GoApp:
     def _is_ai_turn(self) -> bool:
         return (
             not self.in_reasoning_mode
+            and not self.analysis_active
             and self.active_mode == MODE_AI
             and not self.game.game_over
             and self.game.current_player == self.ai_color
         )
 
     def _human_can_act(self) -> bool:
-        if self.game.game_over or self.ai_busy:
+        if self.game.game_over or self.ai_busy or self.analysis_active:
             return False
         if self.in_reasoning_mode:
             return True
@@ -1386,6 +1597,8 @@ class GoApp:
                 self.turn_var.set(
                     f"◆ 推理模式 · {color_name(self.game.current_player)}推演"
                 )
+        elif self.analysis_active:
+            self.turn_var.set("◇ AI 分析工作台 · 正式棋局已暂停")
         elif self.game.game_over:
             self.turn_var.set("对局结束")
         elif self.ai_busy:
@@ -1439,9 +1652,34 @@ class GoApp:
             self.reasoning_button.configure(
                 text="开启推理  F3",
                 style="Header.TButton",
-                state="disabled" if self.game.game_over else "normal",
+                state=(
+                    "disabled"
+                    if self.game.game_over or self.analysis_active
+                    else "normal"
+                ),
             )
-        self.undo_button.configure(state="normal" if self.game.can_undo else "disabled")
+        if self.analysis_active:
+            self.analysis_button.configure(
+                text="分析已开启  F4",
+                style="ReasoningActive.TButton",
+                state="normal",
+            )
+        else:
+            self.analysis_button.configure(
+                text="AI 分析  F4",
+                style="Header.TButton",
+                state=(
+                    "disabled"
+                    if self.game.game_over or self.in_reasoning_mode
+                    else "normal"
+                ),
+            )
+        undo_state = (
+            "normal"
+            if self.game.can_undo and not self.analysis_active
+            else "disabled"
+        )
+        self.undo_button.configure(state=undo_state)
         action_state = "normal" if self._human_can_act() else "disabled"
         self.pass_button.configure(state=action_state)
         self.resign_button.configure(state=action_state)
@@ -1602,7 +1840,12 @@ class GoApp:
         messagebox.showinfo("对局结果", message, parent=self.root)
 
     def close(self) -> None:
+        self._closing = True
         self._invalidate_ai()
+        analysis_window = getattr(self, "analysis_window", None)
+        if analysis_window is not None:
+            analysis_window.close()
+            self.analysis_window = None
         if self.katago_engine is not None:
             self.katago_engine.close()
             self.katago_engine = None

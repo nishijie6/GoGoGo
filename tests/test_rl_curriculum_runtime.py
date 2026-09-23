@@ -737,6 +737,39 @@ class CurriculumRuntimeStateTests(unittest.TestCase):
             self.runtime._evaluation_directory(state),
         )
 
+    def test_suite_uses_both_pools_and_commits_once(self):
+        from test_rl_curriculum import passing_match, passing_health
+        from unittest.mock import patch
+        run_root = self.root / "9x9"
+        for name in ("gogogo-s1-d1", "gogogo-s2-d2", "gogogo-s3-d3", "gogogo-s10000000-d4"):
+            _make_model(run_root, name)
+        state = self.runtime._adopt_existing_9x9()
+        state.active.champion_model = "gogogo-s3-d3"
+        state.active.fixed_baseline_models = ["gogogo-s1-d1", "gogogo-s2-d2"]
+        calls = []
+        def match(_state, _runner, candidate, opponent, roles, path):
+            calls.append((opponent, roles))
+            path.mkdir(parents=True)
+            return passing_match()
+        with patch.object(self.runtime, "_match_opponent", side_effect=match), patch.object(self.runtime, "_health", return_value=passing_health()):
+            self.runtime._evaluate(state)
+        self.assertEqual([roles for _, roles in calls], [["champion"], ["fixed"], ["fixed"]])
+        self.assertEqual(len(state.active.evaluations), 1)
+        self.assertEqual(state.active.champion_model, "gogogo-s10000000-d4")
+        self.assertIn("gogogo-s2-d2", state.protected_models)
+
+    def test_missing_pool_model_prevents_initialization_and_cleanup(self):
+        from unittest.mock import patch
+        run_root = self.root / "9x9"
+        _make_model(run_root, "gogogo-s1-d1")
+        state = self.runtime._adopt_existing_9x9()
+        definition = replace(self.runtime.config.stages[0], fixed_baseline_models=("missing",))
+        self.runtime.config = replace(self.runtime.config, stages=(definition, *self.runtime.config.stages[1:]))
+        before = state.to_dict()
+        with self.assertRaises(CurriculumStateError):
+            self.runtime._ensure_opponent_pools(state)
+        self.assertEqual(state.to_dict(), before)
+
     def test_dashboard_contains_course_health_and_storage(self) -> None:
         run_root = self.root / "9x9"
         _make_model(run_root, "gogogo-s2048-d100")

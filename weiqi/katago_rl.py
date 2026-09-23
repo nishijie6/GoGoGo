@@ -742,6 +742,8 @@ def build_parser() -> argparse.ArgumentParser:
             "dashboard",
             "curriculum",
             "curriculum-status",
+            "curriculum-dashboard",
+            "curriculum-evaluate",
         ),
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_RTX_PROFILE)
@@ -772,7 +774,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     try:
         if args.iterations < 0:
             raise KataGoRLRunnerError("--iterations 不能小于 0")
-        if args.command in {"curriculum", "curriculum-status"}:
+        if args.command in {"curriculum", "curriculum-status", "curriculum-dashboard", "curriculum-evaluate"}:
             # Import lazily because the runtime itself builds stage runners
             # from this module.
             from .rl_curriculum_runtime import CurriculumRuntime
@@ -780,6 +782,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             curriculum = CurriculumRuntime(args.curriculum_config)
             if args.command == "curriculum-status":
                 curriculum.status()
+            elif args.command == "curriculum-dashboard":
+                curriculum.refresh_dashboard()
+            elif args.command == "curriculum-evaluate":
+                curriculum.evaluate_now()
             else:
                 curriculum.run(iterations=args.iterations, smoke=args.smoke)
             return

@@ -7,6 +7,7 @@ import os
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from weiqi.rl_curriculum import (
@@ -16,6 +17,7 @@ from weiqi.rl_curriculum import (
     CurriculumLockError,
     CurriculumMigrationError,
     CurriculumStateStore,
+    CurriculumStateError,
     GlobalCurriculumLock,
     HealthSummary,
     MatchSummary,
@@ -131,6 +133,16 @@ def passing_match() -> MatchSummary:
 
 
 class CurriculumConfigurationTests(unittest.TestCase):
+    def test_pool_names_are_validated(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            value = curriculum_dict()
+            value["stages"][0]["fixed_baseline_models"] = ["../outside"]
+            path = root / "bad.json"
+            path.write_text(json.dumps(value), encoding="utf-8")
+            with self.assertRaises(CurriculumConfigError):
+                load_curriculum_config(path)
+
     def test_strict_schema_and_real_profiles(self) -> None:
         config = load_curriculum_config(
             PROJECT_ROOT / "config" / "rl_curriculum.rtx5070ti.json"
@@ -642,6 +654,85 @@ class CheckpointMigrationTests(unittest.TestCase):
             )
             self.assertTrue(result.checkpoint.is_file())
             self.assertEqual(observed, [("load", True, 13), ("smoke", True, 13)])
+
+
+class OpponentPoolTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.config = load_test_config(self.root)
+        self.controller = CurriculumController(self.config, CurriculumStateStore(self.root / "state"))
+        self.state = self.controller.adopt_existing_9x9(
+            trained_samples=10_000_000, latest_model="new", entry_model="anchor")
+        self.state.active.champion_model = "champion"
+        self.state.active.fixed_baseline_models = ["anchor", "history"]
+        self.state.protected_models = ["anchor", "champion", "history"]
+
+    def test_strength_promotion_independent_of_course_health(self):
+        health = replace(passing_health(), passed=False, reasons=("极端结果比例超标",))
+        results = {name: passing_match() for name in ("champion", "anchor", "history")}
+        gate = self.controller.record_evaluation(
+            self.state, candidate_model="new", match=results["anchor"],
+            health=health, opponent_results=results)
+        self.assertFalse(gate.passed)
+        self.assertEqual(self.state.active.champion_model, "new")
+        self.assertTrue(self.state.active.champion_established)
+        self.assertEqual(self.state.phase, "training")
+        self.assertIn("new", self.state.protected_models)
+        self.assertIn("history", self.state.protected_models)
+        self.assertNotIn("champion", self.state.protected_models)
+        self.assertEqual(len(self.state.active.evaluations[-1]["opponents"]), 3)
+
+    def test_fixed_baseline_win_does_not_promote_losing_challenger(self):
+        loss = replace(passing_match(), candidate_wins=80, baseline_wins=120, win_rate=.4, wilson_lower=.33)
+        results = {"champion": loss, "anchor": passing_match(), "history": passing_match()}
+        gate = self.controller.record_evaluation(
+            self.state, candidate_model="new", match=results["anchor"],
+            health=passing_health(), opponent_results=results)
+        self.assertTrue(gate.passed)
+        self.assertEqual(self.state.active.champion_model, "champion")
+        self.assertEqual(self.state.active.consecutive_passes, 1)
+
+    def test_deduplicates_shared_roles_and_skips_self(self):
+        self.state.active.champion_model = "anchor"
+        self.state.active.fixed_baseline_models = ["anchor", "new"]
+        self.assertEqual(self.controller.evaluation_opponents(self.state),
+                         {"anchor": ["champion", "fixed"]})
+
+    def test_incomplete_suite_does_not_mutate_state(self):
+        before = self.state.to_dict()
+        with self.assertRaises(CurriculumStateError):
+            self.controller.record_evaluation(
+                self.state, candidate_model="new", match=passing_match(),
+                health=passing_health(), opponent_results={"anchor": passing_match()})
+        self.assertEqual(self.state.to_dict(), before)
+
+    def test_no_promotion_for_low_confidence_or_unbalanced_games(self):
+        results = {name: passing_match() for name in ("champion", "anchor", "history")}
+        results["champion"] = replace(passing_match(), wilson_lower=.49)
+        self.controller.record_evaluation(
+            self.state, candidate_model="new", match=results["anchor"],
+            health=passing_health(), opponent_results=results)
+        self.assertEqual(self.state.active.champion_model, "champion")
+        results["champion"] = replace(passing_match(), candidate_black_games=200, candidate_white_games=0)
+        with self.assertRaises(CurriculumStateError):
+            self.controller.record_evaluation(
+                self.state, candidate_model="new", match=results["anchor"],
+                health=passing_health(), opponent_results=results)
+
+    def test_page_preserves_legacy_opponent_identity(self):
+        from weiqi.rl_evaluation_dashboard import render_opponent_pools
+        self.state.active.evaluations = [{
+            "baseline_model": "old-weak-seed", "candidate_model": "new", "stage_samples": 9000000,
+            "match": replace(passing_match(), win_rate=1., elo=3600.).to_dict(),
+        }]
+        page = render_opponent_pools(self.state.active)
+        self.assertIn("old-weak-seed", page)
+        self.assertIn("暂定冠军", page)
+        self.assertIn("待评测", page)
+        self.assertIn("饱和，无法估计", page)
+        self.assertNotIn("+3600", page)
 
 
 if __name__ == "__main__":
