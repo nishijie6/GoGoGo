@@ -8,6 +8,7 @@ from queue import Empty
 import time
 import traceback
 from typing import Callable
+import uuid
 
 import numpy as np
 
@@ -133,6 +134,7 @@ def _worker(config, jobs, training, actor, requests, responses, completed, stop)
         for job in jobs:
             if stop.is_set():
                 break
+            completed.put(("game_started", {"index": job.index, "actor": actor}))
             result = play_game(config, job, evaluate, training=training)
             completed.put(("game", result))
         completed.put(("done", actor))
@@ -148,10 +150,23 @@ def run_games(
     training: bool,
     check: Callable = lambda: None,
     progress: Callable = lambda event: None,
+    metadata: dict | None = None,
 ) -> list[GameResult]:
     """Run actors and serve inference batches in this process. Always reap children."""
     if not jobs:
         return []
+    batch_id = uuid.uuid4().hex
+    job_metadata = {job.index: {
+        "index": job.index, "seed": job.seed, "candidate_color": job.candidate_color,
+        "opponent_name": job.opponent_name or ("candidate_self" if training and job.opponent_id == 0
+                                                else "unknown"),
+        "opponent_sha256": job.opponent_sha256,
+    } for job in jobs}
+    progress({**(metadata or {}), "event": "games_started", "batch_id": batch_id,
+              "total": len(jobs), "training": training,
+              "simulations_per_move": (config.search.simulations_per_move if training
+                                        else config.evaluation.simulations_per_move),
+              "jobs": list(job_metadata.values())})
     context = mp.get_context("spawn")
     workers = min(config.self_play.workers, len(jobs))
     requests, completed = context.Queue(), context.Queue()
@@ -181,9 +196,16 @@ def run_games(
                     raise RuntimeError(f"Self-play worker {payload[0]} failed:\n{payload[1]}")
                 if kind == "done":
                     done.add(payload)
+                elif kind == "game_started":
+                    progress({"event": "game_started", "batch_id": batch_id,
+                              **job_metadata[payload["index"]], "actor": payload["actor"]})
                 else:
                     results.append(payload)
-                    progress({"event": "game", "index": payload.index,
+                    progress({"event": "game", "batch_id": batch_id,
+                              **job_metadata[payload.index],
+                              "winner": payload.winner,
+                              "result": game_outcome(payload, training=training,
+                                                     opponent_name=job_metadata[payload.index]["opponent_name"]),
                               "moves": len(payload.moves), "reason": payload.reason,
                               "samples": len(payload.examples), "seconds": round(payload.seconds, 2),
                               "completed": len(results), "total": len(jobs)})
@@ -214,6 +236,7 @@ def run_games(
                 positions += len(subset)
             if time.monotonic() - last_progress >= 10:
                 progress({"event": "search_progress", "completed": len(results),
+                          "batch_id": batch_id,
                           "total": len(jobs), "inference_positions": positions,
                           "inference_batches": batches})
                 last_progress = time.monotonic()
@@ -230,6 +253,17 @@ def run_games(
         for queue in [requests, completed, *responses]:
             queue.cancel_join_thread()
             queue.close()
+
+
+def game_outcome(game: GameResult, *, training: bool, opponent_name: str) -> str:
+    """Describe completed games without treating self-play as a strength test."""
+    if game.reason == "length_limit":
+        return "truncated"
+    if game.winner is None:
+        return "draw"
+    if training and opponent_name == "candidate_self":
+        return "black_win" if game.winner == BLACK else "white_win"
+    return "win" if game.winner == game.candidate_color else "loss"
 
 
 def evaluation_summary(results: list[GameResult]) -> dict:
