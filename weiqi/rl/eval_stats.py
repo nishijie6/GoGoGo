@@ -7,15 +7,8 @@ import math
 from ..engine import BLACK, WHITE
 
 
-def paired_confidence(games, *, confidence: float = 0.95) -> dict:
-    """Conservative fixed-sample Hoeffding interval on completed pair scores.
-
-    Every pair uses the same opening and one game as each color. Outcomes within
-    a pair can be correlated; this only assumes different opening seeds are
-    independent. It must not be repeatedly peeked at as an anytime-valid gate.
-    """
-    if not 0 < confidence < 1:
-        raise ValueError("Confidence level must be between zero and one")
+def _pair_scores(games):
+    """Return one bounded outcome per complete color-swapped opening."""
     by_index = {game.index: game for game in games}
     if len(by_index) != len(games):
         raise ValueError("Evaluation game indices must be unique")
@@ -34,6 +27,19 @@ def paired_confidence(games, *, confidence: float = 0.95) -> dict:
         for game in (black, white):
             points += 0.5 if game.winner is None else float(game.winner == game.candidate_color)
         scores.append(points / 2)
+    return scores, incomplete
+
+
+def paired_confidence(games, *, confidence: float = 0.95) -> dict:
+    """Conservative fixed-sample Hoeffding interval on completed pair scores.
+
+    Every pair uses the same opening and one game as each color. Outcomes within
+    a pair can be correlated; this only assumes different opening seeds are
+    independent. It must not be repeatedly peeked at as an anytime-valid gate.
+    """
+    if not 0 < confidence < 1:
+        raise ValueError("Confidence level must be between zero and one")
+    scores, incomplete = _pair_scores(games)
     if not scores:
         return {"method": "paired_hoeffding_fixed_sample", "confidence": confidence,
                 "complete_pairs": 0, "truncated_pairs": incomplete,
@@ -46,7 +52,31 @@ def paired_confidence(games, *, confidence: float = 0.95) -> dict:
             "upper": min(1.0, mean + radius)}
 
 
-def confirmed_improvement(summary: dict, *, threshold: float) -> bool:
-    paired = summary["paired"]
-    return bool(summary["truncated"] == 0 and paired["complete_pairs"] > 0
-                and summary["score_rate"] >= threshold and paired["lower"] > 0.5)
+def paired_sign_test(games, *, confidence: float = 0.95) -> dict:
+    """One-sided exact sign test across independent opening pairs, fixed N."""
+    if not 0 < confidence < 1:
+        raise ValueError("Confidence level must be between zero and one")
+    scores, incomplete = _pair_scores(games)
+    wins = sum(score > 0.5 for score in scores)
+    losses = sum(score < 0.5 for score in scores)
+    ties = len(scores) - wins - losses
+    decisive = wins + losses
+    p_value = (sum(math.comb(decisive, count) for count in range(wins, decisive + 1))
+               / 2 ** decisive) if decisive else 1.0
+    return {"method": "paired_sign_fixed_sample", "confidence": confidence,
+            "complete_pairs": len(scores), "truncated_pairs": incomplete,
+            "wins": wins, "losses": losses, "ties": ties, "p_value": p_value}
+
+
+def confirmed_improvement(summary: dict, *, threshold: float,
+                          method: str = "paired_hoeffding") -> bool:
+    if summary["truncated"] or summary["score_rate"] < threshold:
+        return False
+    if method == "paired_sign":
+        sign = summary["paired_sign"]
+        return bool(sign["complete_pairs"] > 0 and sign["wins"] > 0
+                    and sign["p_value"] <= 1 - sign["confidence"])
+    if method == "paired_hoeffding":
+        paired = summary["paired"]
+        return bool(paired["complete_pairs"] > 0 and paired["lower"] > 0.5)
+    raise ValueError(f"Unknown promotion test: {method}")

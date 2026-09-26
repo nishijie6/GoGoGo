@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -64,9 +65,16 @@ def checkpoint_config(payload: dict):
     raw = payload["config"]
     if type(raw.get("schema_version")) is not int or raw["schema_version"] != RL_CONFIG_VERSION:
         raise ValueError("Checkpoint configuration version is unsupported")
-    return resolve_rl_training_config(
-        raw["preset"], {key: value for key, value in raw.items() if key not in ("preset", "schema_version")}
-    )
+    overrides = deepcopy({key: value for key, value in raw.items()
+                          if key not in ("preset", "schema_version")})
+    # Schema-1 checkpoints predate these policy fields. Preserve their actual
+    # training/evaluation behavior rather than inheriting newer preset defaults.
+    overrides.setdefault("self_play", {}).setdefault("milestone_fraction", 0.0)
+    evaluation = overrides.setdefault("evaluation", {})
+    evaluation.setdefault("promotion_test", "paired_hoeffding")
+    evaluation.setdefault("confirmation_max_game_length_factor",
+                          overrides["self_play"].get("max_game_length_factor", 2.5))
+    return resolve_rl_training_config(raw["preset"], overrides)
 
 
 def load_checkpoint(path: Path):

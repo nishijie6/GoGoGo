@@ -18,7 +18,7 @@ from .control import Progress, RunLock, TrainingControl
 from .eval_pool import evaluate_pool, save_anchor, select_anchors
 from .eval_positions import file_hash
 from .eval_quality import evaluate_positions
-from .eval_stats import confirmed_improvement, paired_confidence
+from .eval_stats import confirmed_improvement, paired_confidence, paired_sign_test
 from .network import PolicyValueNet, Runtime
 from .selfplay import GameJob, evaluation_summary, run_games
 from .state import FEATURE_VERSION
@@ -69,6 +69,8 @@ class Trainer:
         if (self.iteration > 0 and
                 self.iteration % config.evaluation.milestone_every_iterations == 0):
             save_anchor(self.anchors, self.model, config, kind="milestone", iteration=self.iteration)
+        if resume is not None and config.self_play.milestone_fraction > 0:
+            self._seed_previous_milestone()
         atomic_json(config.to_dict(), output / "config.resolved.json")
         self.progress({
             "event": "ready", "resumed": resume is not None, "iteration": self.iteration,
@@ -79,6 +81,26 @@ class Trainer:
             "model_sha256": fingerprint(cpu_state(self.model)),
             "gpu": torch.cuda.get_device_name(self.runtime.device) if self.runtime.device.type == "cuda" else None,
         })
+
+    def _seed_previous_milestone(self):
+        """Expose a distinct saved candidate when a legacy run adopts milestone sparring."""
+        candidate_sha = fingerprint(cpu_state(self.model))
+        if select_anchors(self.anchors, self.config, candidate_sha256=candidate_sha,
+                          kinds=("milestone",), recent=True):
+            return
+        for path in sorted((self.output / "checkpoints").glob("iteration_*.pt"), reverse=True):
+            previous, old_config = load_checkpoint(path)
+            if previous.get("kind") != "training" or previous["iteration"] >= self.iteration:
+                continue
+            if old_config.game != self.config.game or old_config.network != self.config.network:
+                raise ValueError(f"Historical checkpoint has incompatible model: {path}")
+            if fingerprint(previous["model"]) == candidate_sha:
+                continue
+            frozen = PolicyValueNet(old_config)
+            frozen.load_state_dict(previous["model"])
+            save_anchor(self.anchors, frozen, self.config,
+                        kind="milestone", iteration=previous["iteration"])
+            return
 
     def _base_payload(self):
         return {"checkpoint_version": CHECKPOINT_VERSION, "feature_version": FEATURE_VERSION,
@@ -169,40 +191,50 @@ class Trainer:
         return jobs
 
     def selfplay_jobs(self, iteration: int):
-        """Pair learner-vs-champion colors and rotate frozen accepted versions."""
+        """Pair colors against accepted champions and distinct frozen candidates."""
         config = self.config
         count = config.self_play.games_per_iteration
         possible_pairs = count // 2
-        target_pairs = min(possible_pairs, int(
+        champion_pairs = min(possible_pairs, int(
             possible_pairs * config.self_play.champion_fraction + 0.5))
+        milestone_pairs = min(possible_pairs - champion_pairs, int(
+            possible_pairs * config.self_play.milestone_fraction + 0.5))
         learner_sha = fingerprint(cpu_state(self.model))
         champions = (select_anchors(self.anchors, config,
                                     candidate_sha256=learner_sha,
-                                    kinds=("accepted",)) if target_pairs else [])
+                                    kinds=("accepted",)) if champion_pairs else [])
         if not champions:
-            target_pairs = 0
+            champion_pairs = 0
+        milestones = (select_anchors(self.anchors, config,
+                                     candidate_sha256=learner_sha,
+                                     kinds=("milestone",), recent=True) if milestone_pairs else [])
+        seen = {champion["sha256"] for champion in champions}
+        milestones = [milestone for milestone in milestones if milestone["sha256"] not in seen]
+        if not milestones:
+            milestone_pairs = 0
 
         evaluators = {0: self.runtime.evaluator(self.model)}
         best_sha = fingerprint(cpu_state(self.best))
-        for model_id, champion in enumerate(champions, 1):
-            if champion["sha256"] == best_sha:
+        for model_id, opponent in enumerate([*champions, *milestones], 1):
+            if opponent["sha256"] == best_sha:
                 frozen = self.best
             else:
-                payload, old_config = load_checkpoint(champion["path"])
+                payload, old_config = load_checkpoint(opponent["path"])
                 frozen = PolicyValueNet(old_config).to(self.runtime.device)
                 frozen.load_state_dict(payload["model"])
             evaluators[model_id] = self.runtime.evaluator(frozen)
-            champion["model_id"] = model_id
+            opponent["model_id"] = model_id
 
         jobs = []
-        for pair in range(target_pairs):
-            champion = champions[((iteration - 1) * target_pairs + pair) % len(champions)]
-            seed = int(self.rng.integers(0, 2 ** 32))
-            for color in (BLACK, WHITE):
-                jobs.append(GameJob(len(jobs), seed, color,
-                                    opponent_id=champion["model_id"],
-                                    opponent_name=champion["name"],
-                                    opponent_sha256=champion["sha256"]))
+        for pool, pairs in ((champions, champion_pairs), (milestones, milestone_pairs)):
+            for pair in range(pairs):
+                opponent = pool[((iteration - 1) * pairs + pair) % len(pool)]
+                seed = int(self.rng.integers(0, 2 ** 32))
+                for color in (BLACK, WHITE):
+                    jobs.append(GameJob(len(jobs), seed, color,
+                                        opponent_id=opponent["model_id"],
+                                        opponent_name=opponent["name"],
+                                        opponent_sha256=opponent["sha256"]))
         for _ in range(count - len(jobs)):
             jobs.append(GameJob(len(jobs), int(self.rng.integers(0, 2 ** 32)),
                                 opponent_name="candidate_self",
@@ -217,11 +249,15 @@ class Trainer:
         self.progress({"event": "iteration_started", "iteration": number})
         jobs, evaluators, champions = self.selfplay_jobs(number)
         self.progress({"event": "selfplay_schedule", "iteration": number,
-                       "champion_games": sum(job.opponent_id > 0 for job in jobs),
+                       "champion_games": sum(job.opponent_name.startswith("accepted_") for job in jobs),
+                       "milestone_games": sum(job.opponent_name.startswith("milestone_") for job in jobs),
                        "candidate_self_games": sum(job.opponent_id == 0 for job in jobs),
                        "champions": [{"name": champion["name"],
                                       "sha256": champion["sha256"]}
-                                     for champion in champions]})
+                                     for champion in champions],
+                       "milestones": list({job.opponent_name: {
+                           "name": job.opponent_name, "sha256": job.opponent_sha256}
+                           for job in jobs if job.opponent_name.startswith("milestone_")}.values())})
         games = run_games(config, jobs, evaluators, training=True,
                           check=self.control, progress=self.progress,
                           metadata={"candidate_sha256": fingerprint(cpu_state(self.model)),
@@ -319,21 +355,29 @@ class Trainer:
                         summary["screening"]["score_rate"] >= config.evaluation.screen_min_score_rate)
             if due and eligible:
                 self.progress.phase = "evaluation"
+                confirmation_config = replace(
+                    config, self_play=replace(
+                        config.self_play,
+                        max_game_length_factor=config.evaluation.confirmation_max_game_length_factor))
                 results = run_games(
-                    config, self.evaluation_jobs(),
+                    confirmation_config, self.evaluation_jobs(),
                     {0: self.runtime.evaluator(self.best), 1: self.runtime.evaluator(self.model)},
                     training=False, check=self.control, progress=self.progress,
                     metadata=match_metadata,
                 )
-                write_games(results, config, directory / "evaluation")
+                write_games(results, confirmation_config, directory / "evaluation")
                 summary["evaluation"] = {
                     **match_metadata,
                     **evaluation_summary(results),
                     "paired": paired_confidence(results, confidence=config.evaluation.confidence_level),
+                    "paired_sign": paired_sign_test(results, confidence=config.evaluation.confidence_level),
+                    "promotion_test": config.evaluation.promotion_test,
+                    "max_game_length_factor": config.evaluation.confirmation_max_game_length_factor,
                     "simulations_per_move": config.evaluation.simulations_per_move,
                 }
                 promoted = confirmed_improvement(summary["evaluation"],
-                                                 threshold=config.evaluation.promotion_win_rate)
+                                                 threshold=config.evaluation.promotion_win_rate,
+                                                 method=config.evaluation.promotion_test)
                 summary["promoted"] = promoted
                 if promoted:
                     self.best.load_state_dict(self.model.state_dict())

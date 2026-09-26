@@ -84,6 +84,7 @@ class SelfPlayTrainingConfig:
     games_per_iteration: int
     inference_batch_size: int
     champion_fraction: float
+    milestone_fraction: float
     max_game_length_factor: float
     resign_threshold: Optional[float]
     resign_min_move: int
@@ -110,6 +111,8 @@ class EvaluationTrainingConfig:
     games: int
     simulations_per_move: int
     promotion_win_rate: float
+    promotion_test: str
+    confirmation_max_game_length_factor: float
     screen_games: int
     screen_simulations_per_move: int
     screen_min_score_rate: float
@@ -199,7 +202,8 @@ _BALANCED_PRESET: Dict[str, Any] = {
         "workers": 2,
         "games_per_iteration": 16,
         "inference_batch_size": 8,
-        "champion_fraction": 0.5,
+        "champion_fraction": 0.25,
+        "milestone_fraction": 0.25,
         "max_game_length_factor": 2.5,
         # Early models must not poison their own data with false resignations.
         "resign_threshold": None,
@@ -216,9 +220,11 @@ _BALANCED_PRESET: Dict[str, Any] = {
         "use_board_symmetry_augmentation": True,
     },
     "evaluation": {
-        "games": 20,
+        "games": 40,
         "simulations_per_move": 96,
         "promotion_win_rate": 0.55,
+        "promotion_test": "paired_sign",
+        "confirmation_max_game_length_factor": 4.0,
         "screen_games": 4,
         "screen_simulations_per_move": 8,
         "screen_min_score_rate": 0.25,
@@ -282,6 +288,7 @@ _HIGH_PERFORMANCE_PRESET: Dict[str, Any] = {
         "games_per_iteration": 64,
         "inference_batch_size": 64,
         "champion_fraction": 0.5,
+        "milestone_fraction": 0.0,
         "max_game_length_factor": 2.5,
         "resign_threshold": None,
         "resign_min_move": 0,
@@ -300,6 +307,8 @@ _HIGH_PERFORMANCE_PRESET: Dict[str, Any] = {
         "games": 40,
         "simulations_per_move": 800,
         "promotion_win_rate": 0.55,
+        "promotion_test": "paired_hoeffding",
+        "confirmation_max_game_length_factor": 2.5,
         "screen_games": 4,
         "screen_simulations_per_move": 32,
         "screen_min_score_rate": 0.25,
@@ -486,6 +495,9 @@ def _validate_config(config: RLTrainingConfig) -> None:
     _require_int("self_play.games_per_iteration", self_play.games_per_iteration, 1)
     _require_int("self_play.inference_batch_size", self_play.inference_batch_size, 1)
     _require_probability("self_play.champion_fraction", self_play.champion_fraction)
+    _require_probability("self_play.milestone_fraction", self_play.milestone_fraction)
+    if self_play.champion_fraction + self_play.milestone_fraction > 1:
+        raise _config_error("self_play", "冠军与里程碑对局比例之和不能超过 1")
     if _require_number(
         "self_play.max_game_length_factor",
         self_play.max_game_length_factor,
@@ -554,6 +566,11 @@ def _validate_config(config: RLTrainingConfig) -> None:
     _require_probability("evaluation.promotion_win_rate", evaluation.promotion_win_rate)
     if evaluation.promotion_win_rate <= 0.5:
         raise _config_error("evaluation.promotion_win_rate", "必须大于 0.5")
+    if evaluation.promotion_test not in ("paired_hoeffding", "paired_sign"):
+        raise _config_error("evaluation.promotion_test", "必须是 paired_hoeffding 或 paired_sign")
+    if _require_number("evaluation.confirmation_max_game_length_factor",
+                       evaluation.confirmation_max_game_length_factor) < 1:
+        raise _config_error("evaluation.confirmation_max_game_length_factor", "不能小于 1")
     for name in ("screen_games", "pool_games"):
         value = getattr(evaluation, name)
         _require_int(f"evaluation.{name}", value, 2)

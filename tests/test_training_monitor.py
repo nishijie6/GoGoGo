@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 from urllib.parse import urlencode
@@ -91,6 +92,22 @@ class EventTailTests(unittest.TestCase):
         self.assertIsNone(match["win_rate"])
         self.assertIsNone(match["score_rate"])
         self.assertEqual(tail.progress["completed"], 0)
+
+    def test_mixed_frozen_opponents_keep_separate_live_winrates(self):
+        tail = EventTail()
+        for event in batch(opponents=("accepted_000000", "milestone_000003", "candidate_self")):
+            tail.accept(event)
+        tail.accept({"event": "game", "phase": "selfplay", "index": 0,
+                     "opponent_name": "accepted_000000", "result": "win",
+                     "completed": 1, "total": 3})
+        tail.accept({"event": "game", "phase": "selfplay", "index": 1,
+                     "opponent_name": "milestone_000003", "result": "loss",
+                     "completed": 2, "total": 3})
+        self.assertIsNone(tail.current_match("selfplay"))
+        matches = {row["opponent"]: row for row in tail.current_matches("selfplay")}
+        self.assertEqual(matches["accepted_000000"]["win_rate"], 1.0)
+        self.assertEqual(matches["milestone_000003"]["win_rate"], 0.0)
+        self.assertNotIn("candidate_self", matches)
 
     def test_all_completed_outcomes_include_truncations_in_the_denominator(self):
         tail = EventTail()
@@ -219,6 +236,47 @@ class MonitorStoreTests(unittest.TestCase):
         self.assertIsNone(snapshot["current"]["match"])
         self.assertTrue(snapshot["warnings"])
         self.assertEqual(snapshot["current"]["progress"]["completed"], 1)
+
+    def test_scheduled_milestone_is_visible_before_its_first_game(self):
+        append_events(self.run / "events.jsonl",
+                      {"event": "iteration_started", "phase": "selfplay", "iteration": 5},
+                      {"event": "selfplay_schedule", "phase": "selfplay",
+                       "champions": [{"name": "accepted_000000", "sha256": "best"}],
+                       "milestones": [{"name": "milestone_000003", "sha256": "older"}],
+                       "candidate_self_games": 8})
+        snapshot = self.store.snapshot("run_a")
+        self.assertEqual({row["name"] for row in snapshot["current"]["opponents"]},
+                         {"accepted_000000", "milestone_000003", "candidate_self"})
+
+    def test_live_snapshot_lists_frozen_opponents_without_merging_their_results(self):
+        write_json(self.run / "monitor.json", {"status": "running", "phase": "selfplay",
+                                               "updated_at_epoch": time.time()})
+        append_events(self.run / "events.jsonl",
+                      *batch(opponents=("accepted_000000", "milestone_000003", "candidate_self")),
+                      {"event": "game", "phase": "selfplay", "index": 0,
+                       "opponent_name": "accepted_000000", "result": "win",
+                       "completed": 1, "total": 3},
+                      {"event": "game", "phase": "selfplay", "index": 1,
+                       "opponent_name": "milestone_000003", "result": "loss",
+                       "completed": 2, "total": 3})
+        snapshot = self.store.snapshot("run_a")
+        self.assertIsNone(snapshot["current"]["match"])
+        rows = [row for row in snapshot["opponents"] if row.get("live")]
+        self.assertEqual({row["name"]: (row["win_rate"], row["games"], row["total"])
+                          for row in rows},
+                         {"accepted_000000": (1.0, 1, 1),
+                          "milestone_000003": (0.0, 1, 1)})
+
+    def test_history_keeps_new_promotion_test_separate_from_old_interval(self):
+        sign = {"wins": 15, "losses": 5, "ties": 0, "p_value": 0.0207}
+        write_json(self.run / "summary.json", {"iteration": 6, "evaluation": {
+            "games": 40, "wins": 30, "score_rate": 0.75,
+            "promotion_test": "paired_sign", "paired_sign": sign,
+            "paired": {"lower": 0.44, "upper": 1.0}}})
+        row = self.store.snapshot("run_a")["history"][0]["evaluation"]
+        self.assertEqual(row["promotion_test"], "paired_sign")
+        self.assertEqual(row["paired_sign"], sign)
+        self.assertEqual(row["win_rate"], 0.75)
 
     def test_history_is_sorted_and_latest_summary_does_not_duplicate_iteration(self):
         for iteration in (2, 1):

@@ -12,7 +12,7 @@ from weiqi.engine import BLACK, WHITE, GoGame
 from weiqi.rl.eval_positions import (
     atomic_json, canonical_hash, generate_suite, read_suite, replay_position,
 )
-from weiqi.rl.eval_stats import confirmed_improvement, paired_confidence
+from weiqi.rl.eval_stats import confirmed_improvement, paired_confidence, paired_sign_test
 
 @dataclass
 class MatchRecord:
@@ -62,6 +62,44 @@ class PairedEvaluationTests(unittest.TestCase):
         self.assertGreater(stats["lower"], 0.5)
         self.assertTrue(confirmed_improvement({"truncated": 0, "score_rate": 1.0,
                                                "paired": stats}, threshold=0.55))
+
+    def test_paired_sign_gate_uses_complete_opening_pairs_without_claiming_hoeffding_lower_bound(self):
+        games = [result(i, i // 2, i < 18) for i in range(20)]
+        conservative = paired_confidence(games)
+        sign = paired_sign_test(games)
+        self.assertLess(conservative["lower"], 0.5)
+        self.assertEqual((sign["wins"], sign["losses"], sign["ties"]), (9, 1, 0))
+        self.assertAlmostEqual(sign["p_value"], 11 / 1024)
+        summary = {"games": 20, "wins": 18, "truncated": 0, "score_rate": 0.9,
+                   "paired": conservative, "paired_sign": sign}
+        self.assertTrue(confirmed_improvement(summary, threshold=0.55,
+                                              method="paired_sign"))
+        games[0] = result(0, 0, True, truncated=True)
+        summary.update(truncated=1, paired_sign=paired_sign_test(games))
+        self.assertFalse(confirmed_improvement(summary, threshold=0.55,
+                                               method="paired_sign"))
+
+    def test_paired_sign_gate_rejects_ambiguous_small_samples(self):
+        games = [result(i, i // 2, i < 16) for i in range(20)]
+        sign = paired_sign_test(games)
+        self.assertEqual((sign["wins"], sign["losses"]), (8, 2))
+        self.assertGreater(sign["p_value"], 0.05)
+        self.assertFalse(confirmed_improvement(
+            {"games": 20, "wins": 16, "truncated": 0, "score_rate": 0.8,
+             "paired": paired_confidence(games), "paired_sign": sign},
+            threshold=0.55, method="paired_sign"))
+
+    def test_default_40_game_confirmation_can_accept_a_clear_paired_advantage(self):
+        games = [result(i, i // 2, i < 30) for i in range(40)]
+        sign = paired_sign_test(games)
+        self.assertEqual((sign["wins"], sign["losses"], sign["ties"]), (15, 5, 0))
+        self.assertLess(sign["p_value"], 0.05)
+        conservative = paired_confidence(games)
+        self.assertLess(conservative["lower"], 0.5)
+        self.assertTrue(confirmed_improvement({
+            "truncated": 0, "score_rate": 0.75,
+            "paired": conservative, "paired_sign": sign,
+        }, threshold=0.55, method="paired_sign"))
 
 
 class FixedPositionTests(unittest.TestCase):
@@ -132,6 +170,39 @@ class KataGoLabelTests(unittest.TestCase):
 
 
 class EvaluationOverrideTests(unittest.TestCase):
+    def test_resumed_policy_changes_only_opponents_and_confirmation(self):
+        import json
+        from train import with_training_policy
+        from weiqi.rl_config import resolve_rl_training_config
+
+        previous = resolve_rl_training_config(overrides={
+            "self_play": {"champion_fraction": 0.5, "milestone_fraction": 0.0},
+            "evaluation": {"games": 20, "promotion_test": "paired_hoeffding",
+                           "confirmation_max_game_length_factor": 2.5},
+        })
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "policy.json"
+            path.write_text(json.dumps({"self_play": {"champion_fraction": 0.25,
+                                                      "milestone_fraction": 0.25},
+                                        "evaluation": {"games": 40,
+                                                       "promotion_test": "paired_sign",
+                                                       "confirmation_max_game_length_factor": 4.0}}),
+                            encoding="utf-8")
+            adjusted = with_training_policy(previous, path)
+            self.assertEqual((adjusted.self_play.champion_fraction,
+                              adjusted.self_play.milestone_fraction), (0.25, 0.25))
+            self.assertEqual((adjusted.evaluation.games,
+                              adjusted.evaluation.promotion_test), (40, "paired_sign"))
+            self.assertEqual(adjusted.optimizer, previous.optimizer)
+            self.assertEqual(adjusted.network, previous.network)
+            self.assertEqual(adjusted.game, previous.game)
+            path.write_text(json.dumps({"network": {"channels": 128}}), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Unsupported policy section"):
+                with_training_policy(previous, path)
+            path.write_text(json.dumps({"self_play": {"workers": 99}}), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Unsupported policy field"):
+                with_training_policy(previous, path)
+
     def test_resumed_run_can_adjust_match_budget_without_changing_model(self):
         import json
         from train import with_evaluation_overrides

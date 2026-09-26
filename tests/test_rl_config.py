@@ -25,7 +25,11 @@ class RLTrainingConfigTests(unittest.TestCase):
         self.assertEqual(config.game.board_size, 9)
         self.assertEqual(config.action_size, 82)
         self.assertEqual(config.self_play.workers, 2)
-        self.assertEqual(config.self_play.champion_fraction, 0.5)
+        self.assertEqual(config.self_play.champion_fraction, 0.25)
+        self.assertEqual(config.self_play.milestone_fraction, 0.25)
+        self.assertEqual(config.evaluation.games, 40)
+        self.assertEqual(config.evaluation.promotion_test, "paired_sign")
+        self.assertEqual(config.evaluation.confirmation_max_game_length_factor, 4.0)
         self.assertEqual(config.network.channels, 64)
         self.assertLessEqual(config.hardware.gpu_memory_fraction, 0.60)
         self.assertTrue(config.runtime.pause_while_game_is_active)
@@ -47,6 +51,8 @@ class RLTrainingConfigTests(unittest.TestCase):
             balanced.search.simulations_per_move,
         )
         self.assertGreater(high.optimizer.batch_size, balanced.optimizer.batch_size)
+        self.assertEqual(high.self_play.milestone_fraction, 0.0)
+        self.assertEqual(high.evaluation.promotion_test, "paired_hoeffding")
         self.assertGreater(
             high.hardware.gpu_memory_fraction,
             balanced.hardware.gpu_memory_fraction,
@@ -111,6 +117,11 @@ class RLTrainingConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(RLConfigError, "0 到 1"):
             resolve_rl_training_config(
                 "balanced", {"self_play": {"champion_fraction": 1.1}}
+            )
+        with self.assertRaisesRegex(RLConfigError, "不能超过 1"):
+            resolve_rl_training_config(
+                "balanced", {"self_play": {"champion_fraction": 0.8,
+                                          "milestone_fraction": 0.3}}
             )
         with self.assertRaisesRegex(RLConfigError, "只支持 9×9"):
             resolve_rl_training_config("balanced", {

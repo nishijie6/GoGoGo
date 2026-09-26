@@ -38,7 +38,8 @@ def save_anchor(directory: Path, model, config: RLTrainingConfig, *, kind: str,
 
 def select_anchors(directory: Path, config: RLTrainingConfig, *, candidate_sha256: str,
                    maximum: int = 4,
-                   kinds: tuple[str, ...] = ("accepted", "milestone")) -> list[dict]:
+                   kinds: tuple[str, ...] = ("accepted", "milestone"),
+                   recent: bool = False) -> list[dict]:
     if maximum < 1:
         raise ValueError("Pool size must be positive")
     seen, anchors = {candidate_sha256}, []
@@ -61,9 +62,12 @@ def select_anchors(directory: Path, config: RLTrainingConfig, *, candidate_sha25
                         "kind": payload["anchor_kind"], "sha256": checksum})
     anchors.sort(key=lambda item: (item["iteration"], item["kind"], item["name"]))
     if len(anchors) > maximum:
-        indices = sorted({round(index * (len(anchors) - 1) / (maximum - 1))
-                          for index in range(maximum)}) if maximum > 1 else [0]
-        anchors = [anchors[index] for index in indices]
+        if recent:
+            anchors = anchors[-maximum:]
+        else:
+            indices = sorted({round(index * (len(anchors) - 1) / (maximum - 1))
+                              for index in range(maximum)}) if maximum > 1 else [0]
+            anchors = [anchors[index] for index in indices]
     return anchors
 
 
