@@ -100,9 +100,14 @@ def evaluate_pool(model, runtime: Runtime, config: RLTrainingConfig, anchors: li
         # against a later candidate will use precisely the same openings.
         jobs = match_jobs(config, games, seed_offset=(
             int(opponent["sha256"][:8], 16) if opponent["sha256"] else 0))
+        jobs = [replace(job, opponent_name=opponent["name"],
+                        opponent_sha256=opponent["sha256"]) for job in jobs]
         results = run_games(match_config, jobs,
                             {0: baseline, 1: runtime.evaluator(model)},
-                            training=False, check=check, progress=progress)
+                            training=False, check=check, progress=progress,
+                            metadata={"candidate_sha256": candidate_sha,
+                                      "opponent_name": opponent["name"],
+                                      "opponent_sha256": opponent["sha256"]})
         write_games(results, match_config, output / opponent["name"])
         row = {"opponent": opponent["name"], "opponent_sha256": opponent["sha256"],
                **evaluation_summary(results),

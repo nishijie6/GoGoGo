@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#1b2728">
+  <title>棋迹 · 训练监控</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳转到训练数据</a>
+  <aside class="sidebar" aria-label="主导航">
+    <a class="brand" href="#main" aria-label="棋迹训练监控首页">
+      <span class="brand-mark" aria-hidden="true"><i></i><b></b></span>
+      <span>棋迹<small>TRAINING MONITOR</small></span>
+    </a>
+    <div class="sidebar-label">工作空间</div>
+    <nav>
+      <a class="nav-link selected" href="#main"><span aria-hidden="true">◫</span>训练总览</a>
+      <a class="nav-link" href="#trend"><span aria-hidden="true">⌁</span>评估趋势</a>
+      <a class="nav-link" href="#opponents"><span aria-hidden="true">◉</span>对手记录</a>
+      <a class="nav-link" href="#events"><span aria-hidden="true">☷</span>训练动态</a>
+    </nav>
+    <div class="sidebar-bottom">
+      <div class="mini-board" aria-hidden="true"><i></i><b></b><em></em></div>
+      <p>每一局，向前一步。</p>
+      <span>本地训练 · 实时观测</span>
+      <div class="sidebar-refresh"><span class="small-dot"></span>每 2 秒自动刷新</div>
+    </div>
+  </aside>
+
+  <div class="workspace">
+    <header class="topbar">
+      <span class="breadcrumb">工作空间 <span>/</span> <strong>训练监控</strong></span>
+      <div class="connection" id="connection" role="status"><span class="connection-dot"></span><span id="connection-text">连接中</span></div>
+    </header>
+
+    <main id="main" tabindex="-1" aria-busy="true">
+      <div class="page-heading">
+        <div><div class="eyebrow">TRAINING OVERVIEW</div><h1>训练总览<span class="title-dot">.</span></h1><p class="page-description" id="page-description">读取训练记录，追踪候选模型与对手的表现。</p></div>
+        <div class="run-control"><label for="run-select">当前训练</label><select id="run-select" disabled><option value="">正在读取训练…</option></select><span id="last-refresh">等待首次刷新</span></div>
+      </div>
+
+      <div id="error-banner" class="notice error-notice" role="alert" hidden><span aria-hidden="true">!</span><div id="error-message"></div><button type="button" id="retry-button">重新连接</button></div>
+      <div id="warnings" class="warnings" aria-live="polite"></div>
+
+      <section id="empty-state" class="empty-state" hidden>
+        <span class="empty-stones" aria-hidden="true">● ○</span><h2>等待第一条训练记录</h2><p>开始训练后，胜率、对手和训练进度会自动出现在这里。</p><span>此页面会持续检查新的训练记录。</span>
+      </section>
+
+      <div id="dashboard">
+        <section class="status-strip" aria-label="当前训练状态">
+          <div class="status-main"><span id="state-badge" class="status-badge">读取中</span><strong id="phase-label">正在连接训练记录</strong><span class="status-detail" id="status-detail">—</span></div>
+          <div class="status-time"><span class="small-dot"></span><span id="data-age">等待数据</span></div>
+        </section>
+
+        <section class="metrics-grid" aria-label="训练关键指标">
+          <article class="metric-card featured">
+            <div class="metric-label"><span id="rate-title">候选模型胜率</span><span class="metric-symbol" aria-hidden="true">↗</span></div>
+            <div class="metric-value" id="win-rate">—</div>
+            <div class="rate-track" aria-hidden="true"><span id="win-rate-track"></span></div>
+            <p class="metric-caption" id="rate-caption">等待候选模型评估</p>
+            <div class="metric-footer" id="score-rate">含和棋折算得分率 —</div>
+          </article>
+          <article class="metric-card opponent-card">
+            <div class="metric-label"><span id="opponent-title">当前对手</span><span class="stones" aria-hidden="true"><i></i><b></b></span></div>
+            <div class="opponent-name" id="current-opponent">—</div>
+            <p class="metric-caption" id="opponent-caption">等待对手信息</p>
+            <div class="metric-footer mono" id="opponent-hash">权重标识 —</div>
+          </article>
+          <article class="metric-card">
+            <div class="metric-label">训练轮次<span class="metric-symbol" aria-hidden="true">◎</span></div>
+            <div class="metric-value iteration-value" id="iteration">—</div>
+            <p class="metric-caption" id="iteration-caption">已完成 — 轮</p>
+            <div class="metric-footer" id="best-iteration">当前最佳来自第 — 轮</div>
+          </article>
+          <article class="metric-card">
+            <div class="metric-label">当前阶段进度<span class="metric-symbol" aria-hidden="true">◴</span></div>
+            <div class="metric-value progress-value" id="progress-value">—</div>
+            <div class="progress-track" role="progressbar" id="phase-progress" aria-label="当前阶段进度" aria-valuemin="0" aria-valuemax="100"><span id="progress-fill"></span></div>
+            <p class="metric-caption" id="progress-caption">等待阶段进度</p>
+            <div class="metric-footer" id="training-steps">累计训练步数 —</div>
+          </article>
+        </section>
+
+        <div class="middle-grid">
+          <section class="panel trend-panel" id="trend" aria-labelledby="trend-title">
+            <div class="panel-header"><div><span class="section-kicker">PERFORMANCE</span><h2 id="trend-title">评估胜率趋势</h2></div><span class="soft-tag" id="history-count">0 轮记录</span></div>
+            <div class="chart-legend"><span><i class="legend-dot eval-dot"></i>晋级评估</span><span><i class="legend-dot screening-dot"></i>早期筛选</span><span class="chart-legend-note">胜场 / 总对局</span></div>
+            <div class="chart-area" id="chart-area"><svg id="trend-chart" viewBox="0 0 760 256" role="img" aria-labelledby="chart-title chart-description"><title id="chart-title">候选模型评估胜率趋势</title><desc id="chart-description">尚无评估数据</desc></svg><div class="chart-empty" id="chart-empty"><span aria-hidden="true">⌁</span><strong>评估完成后，这里会绘出趋势</strong><p>自我对弈不会产生候选模型胜率。</p></div></div>
+            <div class="chart-note"><span aria-hidden="true">ⓘ</span><span>每轮对手可能变化，胜率不能直接作为棋力增长曲线；缺失数据保留空档。</span></div>
+          </section>
+
+          <section class="panel detail-panel" aria-labelledby="detail-title">
+            <div class="panel-header"><div><span class="section-kicker">CURRENT BATCH</span><h2 id="detail-title">当前对局表现</h2></div><span class="soft-tag" id="batch-tag">等待数据</span></div>
+            <p class="batch-context" id="batch-context">候选模型的对手对局会显示在这里。</p>
+            <div class="result-bar" id="result-bar" role="img" aria-label="暂无对局结果"><span class="bar-wins" id="bar-wins"></span><span class="bar-losses" id="bar-losses"></span><span class="bar-draws" id="bar-draws"></span><span class="bar-truncated" id="bar-truncated"></span><span class="bar-unknown" id="bar-unknown"></span></div>
+            <dl class="result-grid"><div><dt><i class="result-dot wins-dot"></i>获胜</dt><dd id="wins">—</dd></div><div><dt><i class="result-dot losses-dot"></i>负局</dt><dd id="losses">—</dd></div><div><dt><i class="result-dot draws-dot"></i>和棋</dt><dd id="draws">—</dd></div><div><dt><i class="result-dot truncated-dot"></i>截断</dt><dd id="truncated">—</dd></div></dl>
+            <p class="unknown-results" id="unknown-results" hidden></p>
+            <p class="confidence-note" id="confidence-note" hidden></p>
+            <div class="detail-divider"></div>
+            <dl class="training-facts"><div><dt>训练设备</dt><dd id="device">—</dd></div><div><dt>回放样本</dt><dd id="replay-samples">—</dd></div><div><dt>最近训练损失</dt><dd id="training-loss">—</dd></div></dl>
+          </section>
+        </div>
+
+        <section class="panel opponents-panel" id="opponents" aria-labelledby="opponents-title">
+          <div class="panel-header"><div><span class="section-kicker">OPPONENTS</span><h2 id="opponents-title">对手记录</h2></div><span class="table-note">按轮次记录 · 不跨对手合并</span></div>
+          <div class="table-scroll" tabindex="0" role="region" aria-label="对手记录表，可横向滚动"><table><thead><tr><th scope="col">对手 / 权重</th><th scope="col">用途</th><th scope="col">轮次</th><th scope="col">对局</th><th scope="col">胜 / 负 / 和</th><th scope="col">截断</th><th scope="col">胜率</th><th scope="col">得分率</th></tr></thead><tbody id="opponents-body"><tr><td class="table-empty" colspan="8">等待对手记录</td></tr></tbody></table></div>
+          <div class="table-footer">胜率 = 胜场 / 总对局；得分率 =（胜场 + 0.5 × 和棋）/ 总对局。截断局单独列出。</div>
+        </section>
+
+        <section class="panel events-panel" id="events" aria-labelledby="events-title">
+          <div class="panel-header"><div><span class="section-kicker">ACTIVITY</span><h2 id="events-title">训练动态</h2></div><span class="soft-tag">最近 40 条</span></div>
+          <ol id="event-list" class="event-list"><li class="event-empty">等待训练活动</li></ol>
+        </section>
+      </div>
+      <footer class="page-footer"><span>棋迹 <span class="footer-divider">/</span> 训练监控</span><span id="footer-time">数据来源于本地训练记录</span></footer>
+    </main>
+  </div>
+</body>
+</html>
