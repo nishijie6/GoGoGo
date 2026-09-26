@@ -35,7 +35,8 @@ def strict_json(value):
 def metric(row, **extra):
     """Win rate uses every scheduled result, as does the trainer's score rate."""
     result = {key: row.get(key) for key in (
-        "games", "wins", "losses", "draws", "truncated", "paired", "simulations_per_move",
+        "games", "wins", "losses", "draws", "truncated", "paired", "paired_sign",
+        "promotion_test", "max_game_length_factor", "simulations_per_move",
         "opponent_name", "opponent_sha256", "candidate_sha256", "best_iteration")}
     games, wins = row.get("games"), row.get("wins")
     result["win_rate"] = wins / games if isinstance(games, (int, float)) and games > 0 and isinstance(wins, (int, float)) else None
@@ -149,28 +150,57 @@ class EventTail:
         self.events.append({key: value for key, value in event.items() if key not in {
             "jobs", "position_quality", "opponent_pool", "selfplay_opponents", "config"}})
 
+    def current_matches(self, phase):
+        if not self.batch or phase != self.batch.get("phase"):
+            return []
+        jobs = self.batch.get("jobs", [])
+        groups = {}
+        for job in jobs:
+            name = job.get("opponent_name") or "unknown"
+            if name != "candidate_self":
+                groups.setdefault((name, job.get("opponent_sha256")), []).append(job.get("index"))
+        scheduled = {index for indices in groups.values() for index in indices}
+        for index, row in self.results.items():
+            if index in scheduled or row.get("opponent_name") == "candidate_self":
+                continue
+            key = (row.get("opponent_name") or "unknown", row.get("opponent_sha256"))
+            if key not in groups and key[1] is None:
+                matching = [known for known in groups if known[0] == key[0]]
+                if len(matching) == 1:
+                    key = matching[0]
+            groups.setdefault(key, []).append(index)
+        matches = []
+        for (name, checksum), indices in groups.items():
+            rows = [self.results[index] for index in indices if index in self.results]
+            counts = {field: sum(row.get("opponent_name") == name
+                                 and row.get("opponent_sha256", checksum) == checksum
+                                 and row.get("result") == result for row in rows)
+                      for field, result in (("wins", "win"), ("losses", "loss"),
+                                            ("draws", "draw"), ("truncated", "truncated"))}
+            count = len(rows)
+            unknown = count - sum(counts.values())
+            matches.append({"phase": phase, "iteration": self.batch.get("iteration"),
+                            "opponent": name, "opponent_sha256": checksum,
+                            "games": count, **counts, "unknown": unknown,
+                            "total": len(indices), "batch_total": self.batch.get("total"),
+                            "win_rate": counts["wins"] / count if count and not unknown else None,
+                            "score_rate": (counts["wins"] + counts["draws"] / 2) / count
+                            if count and not unknown else None})
+        return matches
+
     def current_match(self, phase):
         if not self.batch or phase != self.batch.get("phase"):
             return None
-        rows = list(self.results.values())
-        jobs = self.batch.get("jobs", [])
-        opponents = list(dict.fromkeys(job.get("opponent_name") or "unknown" for job in jobs))
-        opponents = [name for name in opponents if name != "candidate_self"]
-        measured = [row for row in rows if row.get("opponent_name") != "candidate_self"]
-        counts = {name: sum(row.get("result") == value for row in measured)
-                  for name, value in (("wins", "win"), ("losses", "loss"), ("draws", "draw"), ("truncated", "truncated"))}
-        known = sum(counts.values())
-        unknown = len(measured) - known
-        count = len(measured)
-        hashes = list(dict.fromkeys(job.get("opponent_sha256") for job in jobs if job.get("opponent_name") != "candidate_self"))
+        matches = self.current_matches(phase)
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            return None  # Different frozen opponents have incomparable win rates.
         return {"phase": phase, "iteration": self.batch.get("iteration"),
-                "opponent": " / ".join(opponents) if opponents else "candidate_self",
-                "opponent_sha256": hashes[0] if len(hashes) == 1 else None,
-                "games": count, **counts, "unknown": unknown,
-                "total": sum(job.get("opponent_name") != "candidate_self" for job in jobs),
-                "batch_total": self.batch.get("total"),
-                "win_rate": counts["wins"] / count if count and not unknown else None,
-                "score_rate": (counts["wins"] + counts["draws"] / 2) / count if count and not unknown else None}
+                "opponent": "candidate_self", "opponent_sha256": None,
+                "games": 0, "wins": 0, "losses": 0, "draws": 0, "truncated": 0,
+                "unknown": 0, "total": 0, "batch_total": self.batch.get("total"),
+                "win_rate": None, "score_rate": None}
 
 
 class MonitorStore:
@@ -350,6 +380,7 @@ class MonitorStore:
             status = self.run_status(path, tail)
             phase = status["phase"] or tail.last.get("phase")
             config = self.read_json(path / "config.resolved.json")
+            matches = tail.current_matches(phase)
             match = tail.current_match(phase)
             jobs = (tail.batch or {}).get("jobs", []) if (tail.batch or {}).get("phase") == phase else []
             opponents = {}
@@ -359,6 +390,8 @@ class MonitorStore:
                 row["games"] += 1
             if not opponents and phase == "selfplay":
                 for row in tail.schedule.get("champions", []):
+                    opponents[(row["name"], row.get("sha256"))] = {**row, "games": None}
+                for row in tail.schedule.get("milestones", []):
                     opponents[(row["name"], row.get("sha256"))] = {**row, "games": None}
                 if tail.schedule.get("candidate_self_games"):
                     opponents[("candidate_self", None)] = {"name": "candidate_self", "sha256": None, "games": tail.schedule["candidate_self_games"]}
@@ -383,9 +416,15 @@ class MonitorStore:
                 "loss": tail.step.get("loss", latest.get("training", {}).get("loss")),
                 "progress": tail.progress if phase == tail.last.get("phase") else None,
                 "opponents": list(opponents.values()), "match": match,
+                "matches": matches,
                 "active_games": list(tail.active_games.values()) if status["state"] in {"running", "paused"} else [],
             }
+            historical_rows = self.historical_opponents(path, last_completed)
+            if status["state"] in {"running", "paused"} and phase == "selfplay":
+                historical_rows = [{**row, "name": row["opponent"],
+                                    "sha256": row["opponent_sha256"], "role": "training",
+                                    "live": True} for row in matches] + historical_rows
             return {"run": {"id": run_id, "name": run_id}, "server_time": iso_time(), "status": status,
                     "current": current, "latest": latest, "history": history,
-                    "opponents": self.historical_opponents(path, last_completed),
+                    "opponents": historical_rows,
                     "events": list(reversed(tail.events)), "warnings": warnings}

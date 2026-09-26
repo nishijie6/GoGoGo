@@ -1,0 +1,11 @@
+{
+  "self_play": {
+    "champion_fraction": 0.25,
+    "milestone_fraction": 0.25
+  },
+  "evaluation": {
+    "games": 40,
+    "promotion_test": "paired_sign",
+    "confirmation_max_game_length_factor": 4.0
+  }
+}

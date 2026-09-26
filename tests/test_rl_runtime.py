@@ -154,6 +154,49 @@ class RuntimeTests(unittest.TestCase):
             Trainer(config, root, payload)
             self.assertTrue((root / "anchors" / "milestone_000005.pt").is_file())
 
+    def test_resume_policy_seeds_previous_candidate_from_archived_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            root = Path(directory)
+            config = self.config()
+            config = replace(config, self_play=replace(config.self_play, games_per_iteration=16))
+            trainer = Trainer(config, root)
+            with torch.no_grad():
+                next(trainer.model.parameters()).add_(0.25)
+            trainer.iteration = 3
+            trainer.save()
+            previous_sha = fingerprint(cpu_state(trainer.model))
+            with torch.no_grad():
+                next(trainer.model.parameters()).add_(0.25)
+            trainer.iteration = 4
+            trainer.save()
+            payload, loaded = load_checkpoint(root / "latest.pt")
+            resumed = Trainer(loaded, root, payload)
+            anchor, _ = load_checkpoint(root / "anchors" / "milestone_000003.pt")
+            self.assertEqual(fingerprint(anchor["model"]), previous_sha)
+            jobs, _, _ = resumed.selfplay_jobs(5)
+            self.assertTrue(any(job.opponent_name == "milestone_000003" for job in jobs))
+
+    def test_legacy_checkpoint_keeps_its_original_opponent_and_promotion_policy(self):
+        from weiqi.rl.state import FEATURE_VERSION
+        from weiqi.rl.storage import CHECKPOINT_VERSION
+
+        raw = self.config().to_dict()
+        raw["self_play"]["champion_fraction"] = 0.5
+        raw["self_play"].pop("milestone_fraction")
+        raw["evaluation"]["games"] = 20
+        raw["evaluation"].pop("promotion_test")
+        raw["evaluation"].pop("confirmation_max_game_length_factor")
+        payload = {"checkpoint_version": CHECKPOINT_VERSION,
+                   "feature_version": FEATURE_VERSION, "config": raw}
+        restored = checkpoint_config(payload)
+        self.assertEqual((restored.self_play.champion_fraction,
+                          restored.self_play.milestone_fraction), (0.5, 0.0))
+        self.assertEqual((restored.evaluation.games,
+                          restored.evaluation.promotion_test,
+                          restored.evaluation.confirmation_max_game_length_factor),
+                         (20, "paired_hoeffding", raw["self_play"]["max_game_length_factor"]))
+        self.assertNotIn("milestone_fraction", raw["self_play"])
+
     def test_pause_waits_and_reports_resume(self):
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as directory:

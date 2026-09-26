@@ -41,7 +41,7 @@ def render(run: Path) -> str:
         "| ---: | ---: | ---: | ---: | --- | --- |",
     ]
     training_opponents = [
-        "| 轮次 | 候选自我对弈 | 历史冠军对局 | 冠军版本 |",
+        "| 轮次 | 候选自我对弈 | 冻结对手对局 | 对手版本 |",
         "| ---: | ---: | ---: | --- |",
     ]
     protocols = set()
@@ -73,8 +73,14 @@ def render(run: Path) -> str:
         evaluation = summary.get("evaluation", {})
         if "paired" in evaluation:
             paired = evaluation["paired"]
-            result = (f"{_percent(evaluation['score_rate'])} ({evaluation['games']}局，"
-                      f"区间 {_percent(paired['lower'])}～{_percent(paired['upper'])})")
+            if evaluation.get("promotion_test") == "paired_sign":
+                sign = evaluation["paired_sign"]
+                result = (f"{_percent(evaluation['score_rate'])} ({evaluation['games']}局，"
+                          f"换色开局优势/劣势/持平 {sign['wins']}/{sign['losses']}/{sign['ties']}，"
+                          f"单侧 p={sign['p_value']:.4f}，截断 {evaluation['truncated']}局)")
+            else:
+                result = (f"{_percent(evaluation['score_rate'])} ({evaluation['games']}局，"
+                          f"区间 {_percent(paired['lower'])}～{_percent(paired['upper'])})")
         else:
             result = evaluation.get("status", "—")
         matches.append(

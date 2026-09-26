@@ -155,16 +155,17 @@
     const current = snapshot.current || {};
     const status = snapshot.status || {};
     const batch = currentBatch(snapshot);
+    const mixed = status.phase === "selfplay" && list(current.matches).length > 1;
     const winRate = rate(batch?.win_rate);
     const scoreRate = rate(batch?.score_rate);
-    text("rate-title", batch?.historical ? `最近${phase(batch.phase)}胜率` : "候选模型胜率");
+    text("rate-title", mixed ? "分对手胜率" : batch?.historical ? `最近${phase(batch.phase)}胜率` : "候选模型胜率");
     metricValue("win-rate", winRate == null ? "—" : (winRate * 100).toFixed(1), winRate == null ? "" : "%");
     $("win-rate-track").style.width = `${(winRate || 0) * 100}%`;
     const batchGames = batch?.games;
     text("rate-caption", batch
       ? `${batch.historical ? `第 ${count(batch.iteration)} 轮 · ` : ""}${status.phase === "selfplay" ? `本批次对手对局 · ${opponentName(batch.opponent || batch.opponent_name || batch.name)}` : phase(batch.phase || status.phase)} · ${batchGames === 0 ? "等待首局结果" : `${count(batch.wins)} 胜 / ${count(batchGames)} 局`}`
-      : status.phase === "selfplay" ? "纯自我对弈不产生候选胜率" : "尚无可用的候选模型评估");
-    text("score-rate", `含和棋折算得分率 ${percent(scoreRate)}`);
+      : mixed ? "本轮有多个固定对手，逐个胜率见下方记录" : status.phase === "selfplay" ? "纯自我对弈不产生候选胜率" : "尚无可用的候选模型评估");
+    text("score-rate", mixed ? "不同对手的得分率分别列出" : `含和棋折算得分率 ${percent(scoreRate)}`);
     const active = list(current.active_games).filter((game) => game.opponent_name);
     const activeOpponents = active.map((game) => ({ name: game.opponent_name, sha256: game.opponent_sha256 }));
     const scheduled = list(current.opponents);
@@ -205,9 +206,9 @@
       text("progress-caption", "当前阶段暂无可量化进度");
     }
     text("training-steps", `累计训练步数 ${count(current.training_steps)}`);
-    text("batch-tag", batch ? batch.historical ? "最近完成" : "当前批次" : status.phase === "selfplay" ? "自我对弈" : "等待评估");
+    text("batch-tag", batch ? batch.historical ? "最近完成" : "当前批次" : mixed ? "分对手" : status.phase === "selfplay" ? "自我对弈" : "等待评估");
     text("detail-title", batch?.historical ? "最近评估表现" : "当前对局表现");
-    text("batch-context", batch ? `${batch.historical ? `第 ${count(batch.iteration)} 轮 · ` : ""}${phase(batch.phase || status.phase)} · 对手：${opponentName(batch.opponent || batch.opponent_name || batch.name)}` : status.phase === "selfplay" ? "纯自我对弈的黑白胜负不代表候选模型胜率。" : "候选模型的对手对局会显示在这里。");
+    text("batch-context", batch ? `${batch.historical ? `第 ${count(batch.iteration)} 轮 · ` : ""}${phase(batch.phase || status.phase)} · 对手：${opponentName(batch.opponent || batch.opponent_name || batch.name)}` : mixed ? `本轮对 ${list(current.matches).map((row) => opponentName(row.opponent)).join("、")} 分别计胜率；详见下方对手记录。` : status.phase === "selfplay" ? "纯自我对弈的黑白胜负不代表候选模型胜率。" : "候选模型的对手对局会显示在这里。");
     const total = batch?.games > 0 ? batch.games : 0;
     for (const key of ["wins", "losses", "draws", "truncated"]) {
       text(key, count(batch?.[key]));
@@ -218,8 +219,11 @@
     $("unknown-results").hidden = !(batch?.unknown > 0);
     text("unknown-results", `${count(batch?.unknown)} 局旧记录缺少候选方结果，无法计算完整胜率。`);
     const paired = batch?.paired;
-    $("confidence-note").hidden = !(finite(paired?.lower) && finite(paired?.upper));
-    text("confidence-note", paired ? `成对得分 ${finite(paired.confidence) ? `${Math.round(paired.confidence * 100)}% ` : ""}置信区间 ${percent(paired.lower)}–${percent(paired.upper)} · ${count(paired.complete_pairs)} 对完整对局` : "");
+    const sign = batch?.promotion_test === "paired_sign" ? batch.paired_sign : null;
+    $("confidence-note").hidden = !(sign || (finite(paired?.lower) && finite(paired?.upper)));
+    text("confidence-note", sign
+      ? `晋级判定：换色开局优势 ${count(sign.wins)} / 劣势 ${count(sign.losses)} / 持平 ${count(sign.ties)} 对 · 单侧检验 p=${finite(sign.p_value) ? sign.p_value.toFixed(4) : "—"} · 截断 ${count(batch.truncated)} 局`
+      : paired ? `成对得分 ${finite(paired.confidence) ? `${Math.round(paired.confidence * 100)}% ` : ""}置信区间 ${percent(paired.lower)}–${percent(paired.upper)} · ${count(paired.complete_pairs)} 对完整对局` : "");
     text("device", [current.device, current.gpu].filter(Boolean).join(" · ") || "未记录");
     text("replay-samples", finite(current.replay_samples) ? `${count(current.replay_samples)} 条` : "—");
     const loss = finite(current.loss) ? current.loss : current.loss?.loss ?? current.loss?.total_loss ?? current.loss?.total;
@@ -257,9 +261,9 @@
         if (value == null) { previous = null; continue; }
         const identity = metric.opponent_sha256 || metric.sha256 || "";
         const budget = metric.simulations_per_move;
-        const continuous = identity && finite(budget) && previous && previous.iteration + 1 === row.iteration && previous.identity === identity && previous.budget === budget;
+        const continuous = identity && finite(budget) && previous && previous.iteration + 1 === row.iteration && previous.identity === identity && previous.budget === budget && previous.games === metric.games;
         path += `${continuous ? "L" : "M"}${x(row.iteration).toFixed(2)},${y(value).toFixed(2)} `;
-        previous = { iteration: row.iteration, identity, budget };
+        previous = { iteration: row.iteration, identity, budget, games: metric.games };
         const label = `第 ${row.iteration} 轮，${roles[key]}，胜率 ${percent(value)}，${count(metric.games)} 局，每手搜索 ${count(budget)} 次，对手 ${opponentName(metric.opponent || metric.opponent_name || metric.name)}，权重 ${shortHash(metric.opponent_sha256 || metric.sha256)}`;
         const circle = svgElement("circle", { cx: x(row.iteration), cy: y(value), r: 4.5, fill: color, class: "chart-point", tabindex: "0", "aria-label": label });
         circle.append(svgElement("title", {}, label));
@@ -293,7 +297,7 @@
       const icon = element("span", "table-stone");
       icon.setAttribute("aria-hidden", "true");
       const description = element("div");
-      const name = element("strong", "", opponentName(opponent.name || opponent.opponent));
+      const name = element("strong", "", `${opponentName(opponent.name || opponent.opponent)}${opponent.live ? " · 本轮" : ""}`);
       name.title = String(opponent.name || opponent.opponent || "对手未记录");
       const hash = element("small", "mono", shortHash(opponent.sha256 || opponent.opponent_sha256));
       hash.title = String(opponent.sha256 || opponent.opponent_sha256 || "权重标识未记录");
@@ -303,7 +307,7 @@
       row.append(cell);
       const roleCell = element("td");
       roleCell.append(element("span", `role-tag ${roles[opponent.role] ? opponent.role : ""}`, roles[opponent.role] || "其他"));
-      row.append(roleCell, element("td", "", count(opponent.iteration)), element("td", "", count(opponent.games)));
+      row.append(roleCell, element("td", "", count(opponent.iteration)), element("td", "", opponent.live ? `${count(opponent.games)} / ${count(opponent.total)}` : count(opponent.games)));
       const isSelf = opponent.name === "candidate_self" || opponent.opponent === "candidate_self";
       const results = isSelf ? "不适用" : `${count(opponent.wins)} / ${count(opponent.losses)} / ${count(opponent.draws)}`;
       row.append(element("td", "", results), element("td", "", count(opponent.truncated)));
@@ -340,6 +344,7 @@
     if (finite(event.step)) pieces.push(`参数更新 ${event.step}${finite(event.total) ? ` / ${event.total}` : ""}`);
     if (finite(event.loss)) pieces.push(`损失 ${event.loss.toFixed(4)}`);
     if (finite(event.champion_games)) pieces.push(`历史最佳对弈 ${event.champion_games} 局`);
+    if (finite(event.milestone_games)) pieces.push(`冻结候选对弈 ${event.milestone_games} 局`);
     if (finite(event.candidate_self_games)) pieces.push(`自我对弈 ${event.candidate_self_games} 局`);
     if (event.promoted === true) pieces.push("候选模型晋升为最佳模型");
     if (event.promoted === false && event.event === "iteration_completed") pieces.push("本轮未晋级");

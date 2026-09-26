@@ -118,3 +118,36 @@ class ChampionSelfPlayTests(unittest.TestCase):
                 sequence.append(paired[0].opponent_name)
         self.assertEqual(sequence, ["accepted_000000", "accepted_000002",
                                     "accepted_000004", "accepted_000000"])
+
+    def test_candidate_sparring_rotates_a_distinct_frozen_milestone(self):
+        from copy import deepcopy
+        from weiqi.rl.eval_pool import save_anchor
+
+        config = resolve_rl_training_config(overrides={
+            "hardware": {"device": "cpu", "data_loader_workers": 0},
+            "network": {"channels": 8, "residual_blocks": 1},
+            "self_play": {"games_per_iteration": 16, "champion_fraction": 0.25,
+                          "milestone_fraction": 0.25},
+            "runtime": {"pause_while_game_is_active": False},
+        })
+        with tempfile.TemporaryDirectory() as temporary, redirect_stdout(io.StringIO()):
+            trainer = Trainer(config, Path(temporary))
+            with torch.no_grad():
+                next(trainer.model.parameters()).add_(0.25)
+            without_milestone, _, _ = trainer.selfplay_jobs(5)
+            self.assertEqual(sum(job.opponent_name == "candidate_self"
+                                 for job in without_milestone), 12)
+            frozen = deepcopy(trainer.best)
+            with torch.no_grad():
+                next(frozen.parameters()).add_(0.5)
+            save_anchor(trainer.anchors, frozen, config, kind="milestone", iteration=3)
+            jobs, evaluators, _ = trainer.selfplay_jobs(5)
+        counts = {name: sum(job.opponent_name == name for job in jobs)
+                  for name in ("accepted_000000", "milestone_000003", "candidate_self")}
+        self.assertEqual(counts, {"accepted_000000": 4,
+                                  "milestone_000003": 4, "candidate_self": 8})
+        pairs = [jobs[index:index + 2] for index in range(0, 8, 2)]
+        self.assertTrue(all(pair[0].seed == pair[1].seed and
+                            {pair[0].candidate_color, pair[1].candidate_color} == {BLACK, WHITE}
+                            for pair in pairs))
+        self.assertEqual(len(evaluators), 3)

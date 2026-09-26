@@ -26,6 +26,32 @@ def with_evaluation_overrides(config, path: Path):
                         if key not in ("schema_version", "preset")})
 
 
+def with_training_policy(config, path: Path):
+    """Opt into opponent/promotion policy without changing model or replay settings."""
+    from weiqi.rl_config import resolve_rl_training_config
+
+    changes = json.loads(path.read_text(encoding="utf-8"))
+    allowed = {
+        "self_play": {"champion_fraction", "milestone_fraction"},
+        "evaluation": {"games", "promotion_win_rate", "promotion_test",
+                       "confirmation_max_game_length_factor", "confidence_level"},
+    }
+    if not isinstance(changes, dict) or not changes:
+        raise ValueError("Policy overrides must be a nonempty JSON object")
+    for section, fields in changes.items():
+        if section not in allowed or not isinstance(fields, dict) or not fields:
+            raise ValueError(f"Unsupported policy section: {section}")
+        unknown = set(fields) - allowed[section]
+        if unknown:
+            raise ValueError(f"Unsupported policy field: {section}.{sorted(unknown)[0]}")
+    resolved = config.to_dict()
+    for section, fields in changes.items():
+        resolved[section].update(fields)
+    return resolve_rl_training_config(
+        config.preset, {key: value for key, value in resolved.items()
+                        if key not in ("schema_version", "preset")})
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="9x9 Go self-play training and evaluation")
     actions = parser.add_subparsers(dest="action", required=True)
@@ -36,6 +62,8 @@ def main(argv=None) -> int:
     train_parser.add_argument("--resume", type=Path, help="Restore model, optimizer, replay and RNG from a full checkpoint")
     train_parser.add_argument("--evaluation-overrides", type=Path,
                               help="JSON overrides for evaluation budgets only, including on resume")
+    train_parser.add_argument("--policy-overrides", type=Path,
+                              help="Safe opponent and promotion policy overrides, including on resume")
     evaluate_parser = actions.add_parser("evaluate", help="Play color-swapped paired games")
     evaluate_parser.add_argument("checkpoint", type=Path)
     evaluate_parser.add_argument("--opponent", type=Path, help="Other model; default is uniform-policy MCTS")
@@ -105,6 +133,8 @@ def main(argv=None) -> int:
                 config = load_rl_training_config(args.config or DEFAULT_RL_CONFIG_PATH)
             if args.evaluation_overrides:
                 config = with_evaluation_overrides(config, args.evaluation_overrides)
+            if args.policy_overrides:
+                config = with_training_policy(config, args.policy_overrides)
             output = args.output or (args.resume.resolve().parent if args.resume else ROOT / config.runtime.output_directory)
             output = output.resolve()
             config = replace(config, runtime=replace(config.runtime, output_directory=str(output)))
