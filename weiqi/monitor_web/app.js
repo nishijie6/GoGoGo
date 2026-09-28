@@ -32,6 +32,8 @@
   let opponentsSignature = "";
   let eventsSignature = "";
   let chartSignature = "";
+  let integrationSignature = "";
+  let baselineGroups = new Map();
 
   function finite(value) { return typeof value === "number" && Number.isFinite(value); }
   function count(value) { return finite(value) ? numberFormat.format(value) : "—"; }
@@ -128,12 +130,15 @@
   function resetRun() {
     lastSnapshot = null;
     opponentsSignature = eventsSignature = chartSignature = "";
+    integrationSignature = "";
+    $("baseline-select").replaceChildren();
     $("main").setAttribute("aria-busy", "true");
     $("dashboard").style.opacity = ".55";
     text("page-description", selectedRun ? "正在读取所选训练记录…" : "读取训练记录，追踪候选模型与对手的表现。");
     $("warnings").replaceChildren();
   }
   function currentBatch(snapshot) {
+    if (snapshot.source === "legacy") return snapshot.recent_evaluation || null;
     const current = snapshot.current || {};
     const activePhase = snapshot.status?.phase;
     if (current.match && current.match.opponent !== "candidate_self") return { ...current.match, historical: !["running", "paused"].includes(snapshot.status?.state) };
@@ -381,6 +386,119 @@
     $("event-list").replaceChildren(fragment);
     $("event-list").scrollTop = scroll;
   }
+  function compactChart(rows, fields, { probability = false, connect = true, xKey = "iteration", xLabel = "训练轮次", intervals = false } = {}) {
+    const svg = svgElement("svg", { viewBox: "0 0 680 235", role: "img", "aria-label": `${fields.map((f) => f[1]).join("、")}；横轴${xLabel}` });
+    const xs = rows.map((row) => row[xKey]).filter(finite);
+    const values = rows.flatMap((row) => fields.map(([key]) => row[key])).filter(finite);
+    if (!xs.length || !values.length) return element("p", "integration-empty", "暂无记录；数据产生后自动显示");
+    const lowX = Math.min(...xs), highX = Math.max(...xs);
+    const lowY = probability ? 0 : Math.min(0, ...values), highY = probability ? 1 : Math.max(1, ...values);
+    const x = (v) => highX === lowX ? 360 : 64 + (v - lowX) / (highX - lowX) * 592;
+    const y = (v) => 187 - (v - lowY) / (highY - lowY) * 167;
+    const fmt = (v) => probability ? percent(v) : numberFormat.format(Number(v.toFixed(2)));
+    for (let i = 0; i <= 4; i++) {
+      const value = lowY + (highY - lowY) * i / 4;
+      svg.append(svgElement("line", { x1: 64, x2: 656, y1: y(value), y2: y(value), class: "chart-grid" }),
+        svgElement("text", { x: 56, y: y(value) + 4, "text-anchor": "end", class: "chart-axis-label" }, !probability && Math.abs(value) >= 10000 ? new Intl.NumberFormat("zh-CN", { notation: "compact", maximumFractionDigits: 1 }).format(value) : fmt(value)));
+    }
+    for (const [value, anchor] of lowX === highX ? [[lowX, "middle"]] : [[lowX, "start"], [highX, "end"]]) svg.append(svgElement("text", { x: x(value), y: 207, "text-anchor": anchor, class: "chart-axis-label" }, count(value)));
+    svg.append(svgElement("text", { x: 360, y: 230, "text-anchor": "middle", class: "chart-x-title" }, xLabel));
+    for (const [key, label, color] of fields) {
+      let path = "", previous = null;
+      for (const row of rows) {
+        if (!finite(row[xKey]) || !finite(row[key])) { previous = null; continue; }
+        const px = x(row[xKey]), py = y(row[key]);
+        const continuous = connect && previous && (xKey !== "iteration" || row[xKey] === previous[xKey] + 1);
+        path += `${continuous ? "L" : "M"}${px},${py} `;
+        previous = row;
+      }
+      svg.append(svgElement("path", { d: path, stroke: color, class: "chart-path" }));
+      for (const row of rows) {
+        if (!finite(row[xKey]) || !finite(row[key])) continue;
+        const px = x(row[xKey]), py = y(row[key]);
+        const interval = row.interval;
+        if (intervals && rate(interval?.lower) != null && rate(interval?.upper) != null) {
+          svg.append(svgElement("line", { x1: px, x2: px, y1: y(interval.lower), y2: y(interval.upper), stroke: color, opacity: ".5" }));
+        }
+        const detail = `${xLabel} ${count(row[xKey])}，${label} ${fmt(row[key])}${intervals ? `，${count(row.games)} 局，${interval?.method || "未记录区间"} ${percent(interval?.lower)}–${percent(interval?.upper)}` : ""}`;
+        const point = svgElement("circle", { cx: px, cy: py, r: rows.length > 80 ? 2 : 4, fill: color, tabindex: "0", class: "chart-point", "aria-label": detail });
+        point.append(svgElement("title", {}, detail));
+        svg.append(point);
+      }
+    }
+    return svg;
+  }
+  function renderIntegrated(snapshot) {
+    const signature = JSON.stringify([snapshot.run?.id, snapshot.diagnostics, snapshot.evaluations, snapshot.health, snapshot.curriculum]);
+    if (signature === integrationSignature) return;
+    integrationSignature = signature;
+    const legacy = snapshot.source === "legacy";
+    text("source-label", legacy ? "旧版 KataGo 历史" : "实时训练记录");
+    const rows = list(snapshot.diagnostics);
+    const cards = [
+      [legacy ? "累计训练样本" : "回放样本", [["samples", "样本数", "#2d7b65"]]],
+      ["总训练损失", [["loss", "总损失", "#2d7b65"]]],
+      ["策略与价值损失", [["policy_loss", "策略损失", "#c3a36b"], ["value_loss", "价值损失", "#718bb5"]]],
+      [legacy ? "参数训练吞吐（样本 / 秒）" : "自我对弈采样（样本 / 秒）", [["samples_per_second", "样本 / 秒", "#2d7b65"]]],
+    ].map(([title, fields]) => {
+      const card = element("article", "diagnostic-card");
+      card.append(element("h3", "", title), compactChart(rows, fields));
+      const legend = element("div", "diagnostic-legend");
+      for (const [, label, color] of fields) { const item = element("span", "", label); item.style.color = color; legend.append(item); }
+      card.append(legend);
+      return card;
+    });
+    $("diagnostic-charts").replaceChildren(...cards);
+    const h = snapshot.health || {};
+    const health = [["健康窗口", finite(h.games) ? `${count(h.games)} 局` : "未记录"], ["健康结论", h.complete === false ? "样本收集中" : h.passed === true ? "通过" : h.passed === false ? "未达标" : "未记录"],
+      ["黑方得分率", percent(h.black_score_rate)], ["极端结果", percent(h.extreme_rate)], ["无效棋局", percent(h.invalid_rate)], ["开局双虚手", percent(h.double_pass_rate)]];
+    $("health-metrics").hidden = !snapshot.health;
+    $("health-metrics").replaceChildren(...health.map(([label, value]) => { const item = element("div"); item.append(element("dt", "", label), element("dd", "", value)); return item; }));
+    const c = snapshot.curriculum;
+    $("curriculum-detail").hidden = !c?.board_size;
+    text("curriculum-detail", c ? `课程棋盘 ${c.board_size} × ${c.board_size} · 已训练 ${count(c.samples)} 样本 · 下次评测 ${count(c.next_evaluation_sample)} 样本 · 连续通过 ${count(c.passes)} 次 · 冠军 ${c.champion || "未记录"} · 磁盘剩余 ${finite(c.disk_free_gib) ? c.disk_free_gib.toFixed(1) : "—"} GiB` : "");
+    text("diagnostic-note", `最多显示最近 300 轮。${legacy ? "损失为旧版检查点移动平均，吞吐为训练样本 / 参数训练耗时。" : "吞吐为新增样本 / 自我对弈耗时。"}损失下降不等同于棋力提升。`);
+    const oldValue = $("baseline-select").value;
+    baselineGroups = new Map();
+    for (const row of list(snapshot.evaluations)) {
+      const identity = row.sha256 || row.name || "未记录对手";
+      const key = JSON.stringify([row.stage, row.role, identity, row.simulations_per_move, row.games, row.max_game_length_factor, row.promotion_test, row.paired?.confidence, row.interval?.method]);
+      if (!baselineGroups.has(key)) baselineGroups.set(key, []);
+      baselineGroups.get(key).push(row);
+    }
+    const options = Array.from(baselineGroups, ([key, group]) => {
+      const row = group[0];
+      const option = element("option", "", `${row.stage ? `${row.stage} · ` : ""}${row.role === "champion" ? "滚动冠军" : row.role === "pool" ? "固定基准" : "晋级挑战"} · ${opponentName(row.name)} · ${shortHash(row.sha256)} · ${count(row.games)} 局 · 搜索 ${count(row.simulations_per_move)}`);
+      option.value = key;
+      return option;
+    });
+    if (!options.length) options.push(element("option", "", "尚无基准评测"));
+    $("baseline-select").replaceChildren(...options);
+    $("baseline-select").disabled = !baselineGroups.size;
+    if (baselineGroups.has(oldValue)) $("baseline-select").value = oldValue;
+    renderBaseline();
+  }
+  function renderBaseline() {
+    const rows = baselineGroups.get($("baseline-select").value) || [];
+    const useSamples = rows.some((row) => finite(row.samples));
+    const paired = rows[0]?.interval?.method === "成对得分区间";
+    const wilson = rows[0]?.interval?.method === "Wilson 得分区间（旧版）";
+    const points = rows.map((row) => ({ ...row, value: paired ? row.paired?.mean_score : wilson ? row.interval?.mean_score ?? row.score_rate : row.win_rate })).sort((a, b) => (a[useSamples ? "samples" : "iteration"] || 0) - (b[useSamples ? "samples" : "iteration"] || 0));
+    $("baseline-chart").replaceChildren(compactChart(points, [["value", paired ? "完整成对得分率" : wilson ? "有效对局得分率" : "候选胜率", "#2d7b65"]], { probability: true, intervals: true,
+      connect: rows[0]?.role === "pool" && Boolean(rows[0]?.sha256) && finite(rows[0]?.simulations_per_move), xKey: useSamples ? "samples" : "iteration", xLabel: useSamples ? "阶段训练样本" : "训练轮次" }));
+    const table = rows.slice(-32).reverse().map((row) => {
+      const tr = element("tr");
+      const eloRate = row.interval?.mean_score ?? row.score_rate;
+      const elo = eloRate === 0 || eloRate === 1 ? "饱和，无法估计" : finite(row.elo) ? `${row.elo >= 0 ? "+" : ""}${row.elo.toFixed(0)}` : "未记录";
+      for (const value of [count(row.samples ?? row.iteration), opponentName(row.name), row.role === "champion" ? "滚动冠军" : row.role === "pool" ? "固定基准" : "晋级挑战",
+        `${percent(row.win_rate)} / ${count(row.games)} 局`, `${row.interval?.method || "未记录"} ${percent(row.interval?.lower)}–${percent(row.interval?.upper)}`, elo,
+        row.role === "pool" ? "不适用" : row.promoted ? "已晋级" : "未晋级"]) tr.append(element("td", "", value));
+      return tr;
+    });
+    if (!table.length) { const row = element("tr"); const cell = element("td", "table-empty", "尚无独立基准评测记录"); cell.colSpan = 7; row.append(cell); table.push(row); }
+    $("baseline-body").replaceChildren(...table);
+  }
+  $("baseline-select").addEventListener("change", renderBaseline);
   function renderSnapshot(snapshot) {
     lastSnapshot = snapshot;
     const status = snapshot.status || {};
@@ -405,6 +523,32 @@
     renderChart(snapshot.history);
     renderOpponents(snapshot.opponents);
     renderEvents(snapshot.events);
+    renderIntegrated(snapshot);
+    const legacy = snapshot.source === "legacy";
+    $("dashboard").classList.toggle("legacy-dashboard", legacy);
+    $("trend").hidden = legacy;
+    $("opponents").hidden = legacy;
+    $("events").hidden = legacy;
+    document.querySelector('a[href="#opponents"]').hidden = legacy;
+    document.querySelector('a[href="#events"]').hidden = legacy;
+    document.querySelector('a[href="#trend"], a[data-trend-link]').setAttribute("data-trend-link", "true");
+    document.querySelector('a[data-trend-link]').setAttribute("href", legacy ? "#baselines" : "#trend");
+    if (legacy) {
+      const batch = snapshot.recent_evaluation;
+      text("phase-label", "旧版训练历史");
+      text("rate-title", "最近评测胜率");
+      text("rate-caption", batch ? `${count(batch.samples)} 样本 · ${count(batch.wins)} 胜 / ${count(batch.games)} 局` : "此记录没有独立对战评测");
+      text("best-iteration", snapshot.curriculum?.champion ? `冠军 ${snapshot.curriculum.champion}` : "冠军信息未记录");
+      text("training-steps", "旧记录未记录参数更新步数");
+      text("batch-context", batch ? `${count(batch.samples)} 样本 · 对手 ${opponentName(batch.name)} · ${timestamp(batch.timestamp, true)}` : "独立对战成绩见课程记录；自我对弈不产生候选胜率。");
+      text("opponent-caption", batch ? "最近完成的独立评测" : "无独立评测记录");
+      text("opponent-hash", "旧记录仅保存模型名称");
+      text("replay-samples", finite(snapshot.current?.replay_samples) ? `${count(snapshot.current.replay_samples)} 条累计生成数据` : "—");
+      if (batch?.interval) {
+        $("confidence-note").hidden = false;
+        text("confidence-note", `${batch.interval.method} ${percent(batch.interval.lower)}–${percent(batch.interval.upper)}`);
+      }
+    }
   }
   async function refresh() {
     const thisGeneration = generation;

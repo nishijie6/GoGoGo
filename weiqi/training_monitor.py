@@ -210,6 +210,37 @@ class MonitorStore:
         self.lock = threading.RLock()
         self.tails = OrderedDict()
         self.json_cache = OrderedDict()
+        self.history_cache = OrderedDict()
+
+    def read_history(self, path):
+        path = self.safe_path(path)
+        try:
+            stat = path.stat()
+            signature = (stat.st_mtime_ns, stat.st_size)
+            cached = self.history_cache.get(path)
+            if cached and cached[0] == signature:
+                return cached[1]
+            with path.open("rb") as stream:
+                if stat.st_size > MAX_JSON:
+                    stream.seek(stat.st_size - MAX_JSON)
+                    stream.readline()
+                data = stream.read(MAX_JSON)
+            rows = deque(maxlen=300)
+            # A partially written final record is retried on the next refresh.
+            for line in data[:data.rfind(b"\n") + 1].splitlines():
+                try:
+                    row = strict_json(line.decode("utf-8-sig"))
+                    if isinstance(row, dict):
+                        rows.append(row)
+                except (ValueError, UnicodeError):
+                    continue
+            result = list(rows)
+            self.history_cache[path] = (signature, result)
+            if len(self.history_cache) > 32:
+                self.history_cache.popitem(last=False)
+            return result
+        except OSError:
+            return []
 
     def safe_path(self, path):
         resolved = path.resolve()
@@ -278,7 +309,7 @@ class MonitorStore:
                     "reason": monitor.get("error") or monitor.get("reason")}
         when = timestamp(last.get("time"))
         if when is None:
-            for name in ("events.jsonl", "summary.json", "config.resolved.json"):
+            for name in ("events.jsonl", "summary.json", "config.resolved.json", "state.json", "metrics/history.jsonl"):
                 try:
                     value = self.safe_path(path / name).stat().st_mtime
                     when = max(when or 0, value)
@@ -299,7 +330,7 @@ class MonitorStore:
                         continue
                     try:
                         self.safe_path(path)
-                        if not any((path / name).is_file() for name in ("events.jsonl", "summary.json", "monitor.json", "config.resolved.json")):
+                        if not any(self.safe_path(path / name).is_file() for name in ("events.jsonl", "summary.json", "monitor.json", "config.resolved.json", "metrics/history.jsonl", "state.json")):
                             continue
                         status = self.run_status(path)
                         summary = self.read_json(path / "summary.json")
@@ -358,6 +389,10 @@ class MonitorStore:
     def snapshot(self, run_id):
         with self.lock:
             path = self.run_path(run_id)
+            if not any(self.safe_path(path / name).is_file() for name in ("events.jsonl", "summary.json", "monitor.json")) and (
+                    self.safe_path(path / "metrics/history.jsonl").is_file() or self.read_json(path / "state.json").get("stages")):
+                from .monitor_legacy import snapshot
+                return snapshot(self, path, run_id)
             tail = self.tails.setdefault(run_id, EventTail())
             self.tails.move_to_end(run_id)
             if len(self.tails) > 32:
@@ -375,7 +410,7 @@ class MonitorStore:
             history = [{"iteration": row["iteration"], "training_steps": row.get("training_steps"),
                         "replay_samples": row.get("replay_samples"), "loss": row.get("training", {}).get("loss"),
                         "screening": metric(row.get("screening", {})), "evaluation": metric(row.get("evaluation", {})),
-                        "pool": [metric(p, name=p.get("opponent"), sha256=p.get("opponent_sha256")) for p in row.get("opponent_pool", {}).get("opponents", [])],
+                        "pool": [metric(p, name=p.get("opponent"), sha256=p.get("opponent_sha256"), simulations_per_move=row.get("opponent_pool", {}).get("simulations_per_move")) for p in row.get("opponent_pool", {}).get("opponents", [])],
                         "promoted": row.get("promoted", False)} for row in summaries]
             status = self.run_status(path, tail)
             phase = status["phase"] or tail.last.get("phase")
@@ -420,11 +455,30 @@ class MonitorStore:
                 "active_games": list(tail.active_games.values()) if status["state"] in {"running", "paused"} else [],
             }
             historical_rows = self.historical_opponents(path, last_completed)
+            diagnostics = [{"iteration": row["iteration"], "samples": row.get("replay_samples"),
+                            "loss": row.get("training", {}).get("loss"),
+                            "policy_loss": row.get("training", {}).get("policy_loss"),
+                            "value_loss": row.get("training", {}).get("value_loss"),
+                            "samples_per_second": row["new_samples"] / row["selfplay_seconds"]
+                            if row.get("selfplay_seconds", 0) > 0 and row.get("new_samples") is not None else None}
+                           for row in summaries[-300:]]
+            evaluations = []
+            for row in history:
+                for role, sources in (("pool", row["pool"]), ("evaluation", [row["evaluation"]])):
+                    for source in sources:
+                        if source.get("games"):
+                            paired = source.get("paired") or {}
+                            evaluations.append({**source, "iteration": row["iteration"], "role": role,
+                                                "name": source.get("name") or source.get("opponent_name"),
+                                                "sha256": source.get("sha256") or source.get("opponent_sha256"),
+                                                "promoted": row["promoted"] if role == "evaluation" else False,
+                                                "interval": {"method": "成对得分区间" if paired else "区间未记录", "lower": paired.get("lower"), "upper": paired.get("upper")}})
             if status["state"] in {"running", "paused"} and phase == "selfplay":
                 historical_rows = [{**row, "name": row["opponent"],
                                     "sha256": row["opponent_sha256"], "role": "training",
                                     "live": True} for row in matches] + historical_rows
             return {"run": {"id": run_id, "name": run_id}, "server_time": iso_time(), "status": status,
                     "current": current, "latest": latest, "history": history,
+                    "diagnostics": diagnostics, "evaluations": evaluations, "source": "native",
                     "opponents": historical_rows,
                     "events": list(reversed(tail.events)), "warnings": warnings}

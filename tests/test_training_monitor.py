@@ -181,6 +181,70 @@ class MonitorStoreTests(unittest.TestCase):
                 self.assertEqual(status["state"], expected)
                 self.assertEqual(status["age_seconds"], age)
 
+    def test_legacy_metrics_are_discovered_and_partial_line_is_retried(self):
+        path = self.run / "metrics" / "history.jsonl"
+        path.parent.mkdir()
+        path.write_text(json.dumps({"cycle": 1, "trained_samples": 2048, "loss": 2,
+                                    "sample_delta": 100, "train_seconds": 5,
+                                    "health_window_complete": False}) + '\n{"cycle":2', encoding="utf-8")
+        self.assertEqual(self.store.runs()["runs"][0]["status"], "historical")
+        snapshot = self.store.snapshot("run_a")
+        self.assertEqual(snapshot["source"], "legacy")
+        self.assertEqual(snapshot["status"]["state"], "historical")
+        self.assertEqual(snapshot["diagnostics"][0]["samples_per_second"], 20)
+        self.assertEqual(snapshot["current"]["iteration"], 1)
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(',"trained_samples":4096}\n')
+        self.assertEqual(self.store.snapshot("run_a")["current"]["iteration"], 2)
+
+    def test_curriculum_retains_stage_and_opponent_identity_and_old_intervals(self):
+        match = {"games": 10, "candidate_wins": 6, "baseline_wins": 2, "draws": 2,
+                 "wilson_lower": 0.3, "wilson_upper": 0.9, "win_rate": 0.7, "elo": 100}
+        write_json(self.run / "state.json", {"active_board_size": 9, "phase": "training", "stages": {
+            "9x9": {"champion_model": "champ", "samples": 10000, "evaluations": [
+                {"stage_samples": 1000, "baseline_model": "old", "match": match},
+                {"stage_samples": 2000, "opponents": [
+                    {"model": "champ", "roles": ["champion"], "match": match},
+                    {"model": "fixed", "roles": ["fixed"], "match": match}]}]},
+            "13x13": {"evaluations": [{"stage_samples": 2000, "baseline_model": "old", "match": match}]}}})
+        snapshot = self.store.snapshot("run_a")
+        rows = snapshot["evaluations"]
+        self.assertEqual([(r["stage"], r["name"], r["role"]) for r in rows], [
+            ("9x9", "old", "pool"), ("9x9", "champ", "champion"),
+            ("9x9", "fixed", "pool"), ("13x13", "old", "pool")])
+        self.assertEqual(rows[0]["win_rate"], 0.6)
+        self.assertEqual(rows[0]["score_rate"], 0.7)
+        self.assertEqual(rows[0]["interval"]["lower"], 0.3)
+        self.assertEqual(rows[0]["interval"]["mean_score"], 0.7)
+        self.assertEqual(snapshot["status"]["state"], "historical")
+        self.assertEqual(snapshot["curriculum"]["champion"], "champ")
+
+    def test_native_diagnostics_preserve_pool_budget_and_paired_statistics(self):
+        write_json(self.run / "summary.json", {"iteration": 3, "new_samples": 50,
+            "selfplay_seconds": 2, "replay_samples": 200, "training": {"loss": 1, "policy_loss": 0.8},
+            "opponent_pool": {"simulations_per_move": 64, "opponents": [
+                {"opponent": "anchor", "opponent_sha256": "abc", "games": 10, "wins": 5,
+                 "paired": {"mean_score": 0.6, "lower": 0.1, "upper": 1}}]}})
+        snapshot = self.store.snapshot("run_a")
+        self.assertEqual(snapshot["diagnostics"][0]["samples_per_second"], 25)
+        self.assertEqual(snapshot["diagnostics"][0]["samples"], 200)
+        row = snapshot["evaluations"][0]
+        self.assertEqual(row["simulations_per_move"], 64)
+        self.assertEqual(row["sha256"], "abc")
+        self.assertEqual(row["paired"]["mean_score"], 0.6)
+        self.assertEqual(row["interval"]["method"], "成对得分区间")
+        self.assertNotIn("elo", row)
+
+    def test_legacy_history_is_bounded_and_truncation_invalidates_cache(self):
+        path = self.run / "metrics" / "history.jsonl"
+        path.parent.mkdir()
+        path.write_text(''.join(json.dumps({"cycle": i}) + '\n' for i in range(350)), encoding="utf-8")
+        rows = self.store.snapshot("run_a")["diagnostics"]
+        self.assertEqual(len(rows), 300)
+        self.assertEqual(rows[0]["iteration"], 50)
+        path.write_text('{"cycle":1}\n', encoding="utf-8")
+        self.assertEqual(len(self.store.snapshot("run_a")["diagnostics"]), 1)
+
     def test_old_session_sidecar_cannot_mark_new_session_completed(self):
         write_json(self.run / "monitor.json", {"session_id": "session_a", "status": "completed",
                                                "phase": "evaluation", "updated_at_epoch": 1998})

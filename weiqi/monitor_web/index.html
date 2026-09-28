@@ -21,6 +21,7 @@
       <a class="nav-link selected" href="#main"><span aria-hidden="true">◫</span>训练总览</a>
       <a class="nav-link" href="#trend"><span aria-hidden="true">⌁</span>评估趋势</a>
       <a class="nav-link" href="#opponents"><span aria-hidden="true">◉</span>对手记录</a>
+      <a class="nav-link" href="#diagnostics"><span aria-hidden="true">↗</span>训练诊断</a>
       <a class="nav-link" href="#events"><span aria-hidden="true">☷</span>训练动态</a>
     </nav>
     <div class="sidebar-bottom">
@@ -104,6 +105,23 @@
             <dl class="training-facts"><div><dt>训练设备</dt><dd id="device">—</dd></div><div><dt>回放样本</dt><dd id="replay-samples">—</dd></div><div><dt>最近训练损失</dt><dd id="training-loss">—</dd></div></dl>
           </section>
         </div>
+
+        <section class="panel integrated-panel" id="diagnostics" aria-labelledby="diagnostics-title">
+          <div class="panel-header"><div><span class="section-kicker">TRAINING HEALTH</span><h2 id="diagnostics-title">训练进展与健康</h2></div><span class="soft-tag" id="source-label">训练记录</span></div>
+          <p class="integration-note" id="curriculum-detail" hidden></p>
+          <div class="diagnostic-grid" id="diagnostic-charts"></div>
+          <dl class="health-grid" id="health-metrics"></dl>
+          <p class="integration-note" id="diagnostic-note">损失下降不等同于棋力提升；样本与吞吐量以记录中的统计口径为准。</p>
+        </section>
+
+        <section class="panel integrated-panel" id="baselines" aria-labelledby="baselines-title">
+          <div class="panel-header"><div><span class="section-kicker">REFERENCE MATCHES</span><h2 id="baselines-title">固定基准与冠军挑战</h2></div></div>
+          <div class="baseline-controls"><label for="baseline-select">选择对手与评测条件</label><select id="baseline-select"></select></div>
+          <div id="baseline-chart" class="baseline-chart"></div>
+          <p class="integration-note">固定基准按对手身份、搜索预算与局数分别查看。滚动冠军或评测条件缺失时只画独立数据点；区间沿用原记录的方法，不作为新的晋级判定。</p>
+          <div class="table-scroll" tabindex="0" role="region" aria-label="基准成绩表"><table><thead><tr><th>轮次 / 样本</th><th>对手</th><th>用途</th><th>胜率 / 局数</th><th>统计区间</th><th>相对 Elo</th><th>晋级结果</th></tr></thead><tbody id="baseline-body"></tbody></table></div>
+          <p class="integration-note">展示所选对手最近 32 项成绩。Elo 仅显示旧记录的相对值，不能跨对手比较；全胜或全负时无法给出有限估计。</p>
+        </section>
 
         <section class="panel opponents-panel" id="opponents" aria-labelledby="opponents-title">
           <div class="panel-header"><div><span class="section-kicker">OPPONENTS</span><h2 id="opponents-title">对手记录</h2></div><span class="table-note">按轮次记录 · 不跨对手合并</span></div>
