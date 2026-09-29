@@ -15,6 +15,7 @@ import queue
 import random
 import shutil
 import subprocess
+import sysconfig
 import threading
 import uuid
 from collections import deque
@@ -31,6 +32,27 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 KATAGO_FOLDER = PROJECT_ROOT / "katago"
 LEGACY_KATAGO_FOLDER = PROJECT_ROOT / "vendor" / "katago"
 DEFAULT_ANALYSIS_CONFIG = PROJECT_ROOT / "config" / "katago_analysis.cfg"
+
+
+def katago_subprocess_environment(
+    purelib: Optional[Path] = None,
+    platform_name: Optional[str] = None,
+) -> dict[str, str]:
+    """Expose PyTorch's bundled CUDA DLLs to KataGo on Windows."""
+
+    environment = os.environ.copy()
+    if (platform_name or os.name) != "nt":
+        return environment
+    package_folder = purelib or Path(sysconfig.get_path("purelib"))
+    torch_libraries = package_folder / "torch" / "lib"
+    if torch_libraries.is_dir():
+        current_path = environment.get("PATH", "")
+        environment["PATH"] = (
+            str(torch_libraries)
+            if not current_path
+            else str(torch_libraries) + os.pathsep + current_path
+        )
+    return environment
 
 
 class KataGoError(RuntimeError):
@@ -60,7 +82,7 @@ class KataGoProfile:
     human_sl_profile: str
     move_temperature: float
     utility_scale: float
-    selection_mode: Literal["professional", "human_rank"] = "professional"
+    selection_mode: Literal["professional", "human_rank", "training"] = "professional"
 
 
 _VISITS_BY_DAN = (24, 36, 54, 80, 120, 180, 270, 400, 600)
@@ -105,6 +127,8 @@ ALL_KATAGO_PROFILES = KATAGO_PROFILES + HUMANSL_PROFILES
 def profile_for_difficulty(label: str) -> KataGoProfile:
     """Return the KataGo search profile for a UI difficulty label."""
 
+    if label.startswith("训练·"):
+        return KataGoProfile(label, None, 200, "", 0.0, 0.0, "training")
     for profile in ALL_KATAGO_PROFILES:
         if profile.label == label:
             return profile
@@ -445,6 +469,7 @@ class KataGoEngine:
                 process = subprocess.Popen(
                     command,
                     cwd=str(runtime_folder),
+                    env=katago_subprocess_environment(),
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -716,6 +741,8 @@ class KataGoEngine:
 
         if point is None:
             reason = f"KataGo 判断当前应当虚手，完成约 {visits} 次搜索"
+        elif profile.selection_mode == "training":
+            reason = f"{profile.label}，完成约 {visits} 次搜索并选择最高评价点"
         elif used_human_style and profile.selection_mode == "human_rank":
             reason = (
                 f"{profile.label}，按该水平人类棋谱策略采样；"

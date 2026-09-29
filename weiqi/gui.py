@@ -14,6 +14,7 @@ from .ai import (
     GoAI,
     is_human_sl_difficulty,
     is_katago_difficulty,
+    is_training_difficulty,
 )
 from .analysis_gui import AnalysisWorkbenchWindow
 from .engine import BLACK, EMPTY, WHITE, GoGame, MoveRecord, Point, color_name
@@ -30,6 +31,7 @@ from .rl_activity import GameActivity
 from .rules import RULE_SECTIONS, RULES_INTRO
 from .training_gui import ReasoningTrainer
 from .winrate import WinRateEstimate, WinRateEstimator
+from .rl_opponents import load_training_opponents, settings_for_training_opponent
 
 
 MODE_AI = "人机对战"
@@ -76,6 +78,8 @@ class GoApp:
         self._winrate_cache_key: Optional[tuple[object, ...]] = None
         self._last_winrate: Optional[WinRateEstimate] = None
         self._winrate_source = "启发式估算"
+        self._training_opponents = {}
+        self.active_training_opponent = None
 
         self.mode_var = tk.StringVar(value=MODE_AI)
         self.size_var = tk.StringVar(value="9×9")
@@ -90,6 +94,7 @@ class GoApp:
         self.winlead_var = tk.StringVar()
 
         self._build_layout()
+        self._refresh_training_opponents()
         self._bind_shortcuts()
         self.new_game()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -371,6 +376,7 @@ class GoApp:
             width=8,
         )
         self.size_combo.grid(row=1, column=0, sticky="ew", pady=(3, 0))
+        self.size_combo.bind("<<ComboboxSelected>>", self._refresh_training_opponents)
         self.human_combo = ttk.Combobox(
             options,
             textvariable=self.human_color_var,
@@ -389,6 +395,7 @@ class GoApp:
             textvariable=self.difficulty_var,
             values=AI_DIFFICULTIES,
             state="readonly",
+            postcommand=self._refresh_training_opponents,
         )
         self.difficulty_combo.grid(
             row=3,
@@ -561,6 +568,10 @@ class GoApp:
 
         settings = KataGoSettings.load()
         try:
+            if is_training_difficulty(self.active_difficulty):
+                settings = settings_for_training_opponent(
+                    settings, self.active_training_opponent, self.game.size,
+                )
             settings.require_valid()
         except KataGoConfigurationError as error:
             self._pending_analysis_open = True
@@ -684,6 +695,10 @@ class GoApp:
         )
         if needs_play_engine or should_open_analysis:
             try:
+                if needs_play_engine and is_training_difficulty(self.active_difficulty):
+                    settings = settings_for_training_opponent(
+                        settings, self.active_training_opponent, self.game.size,
+                    )
                 self.katago_engine = KataGoEngine(settings)
                 if needs_play_engine:
                     self.ai = KataGoAI(
@@ -942,6 +957,18 @@ class GoApp:
             self.root.after(220, self._start_ai_turn)
         return True
 
+    def _refresh_training_opponents(self, _event=None) -> None:
+        size = int(self.size_var.get().split("×", maxsplit=1)[0])
+        try:
+            self._training_opponents = load_training_opponents(size)
+        except (OSError, ValueError, KeyError) as error:
+            self._training_opponents = {}
+            self.notice_var.set(f"训练对手列表暂不可用：{error}")
+        self.difficulty_combo.configure(values=(*AI_DIFFICULTIES, *self._training_opponents))
+        selected = self.difficulty_var.get()
+        if is_training_difficulty(selected) and selected not in self._training_opponents:
+            self.difficulty_var.set("中等")
+
     def new_game(self) -> None:
         """Apply the selected options and replace the current game."""
 
@@ -950,9 +977,16 @@ class GoApp:
         selected_difficulty = self.difficulty_var.get()
 
         candidate_engine: Optional[KataGoEngine] = None
+        training_opponent = None
         if selected_mode == MODE_AI and is_katago_difficulty(selected_difficulty):
             settings = KataGoSettings.load()
             try:
+                if is_training_difficulty(selected_difficulty):
+                    training_opponent = self._training_opponents.get(selected_difficulty)
+                    if training_opponent is None:
+                        self.notice_var.set("训练对手已变化，请重新选择。")
+                        return
+                    settings = settings_for_training_opponent(settings, training_opponent, size)
                 settings.require_valid()
             except KataGoConfigurationError as error:
                 self.notice_var.set(f"所选电脑难度需要先配置 KataGo：{error}。")
@@ -1000,6 +1034,7 @@ class GoApp:
         self.ai = candidate_ai
         self.active_mode = selected_mode
         self.active_difficulty = selected_difficulty
+        self.active_training_opponent = training_opponent
         self.human_color = (
             BLACK if self.human_color_var.get().startswith("黑") else WHITE
         )

@@ -36,7 +36,11 @@ AI_DIFFICULTIES = (
 def is_katago_difficulty(label: str) -> bool:
     """Return whether ``label`` requires the external KataGo engine."""
 
-    return label in KATAGO_DIFFICULTIES or label in HUMANSL_DIFFICULTIES
+    return label in KATAGO_DIFFICULTIES or label in HUMANSL_DIFFICULTIES or is_training_difficulty(label)
+
+
+def is_training_difficulty(label: str) -> bool:
+    return label.startswith("训练·")
 
 
 def is_human_sl_difficulty(label: str) -> bool:

@@ -7,9 +7,12 @@ GUI 的“推理训练”仍是定式和死活课程；强化学习通过下面�
 
 ## 环境与启动
 
-当前机器的 Windows 默认 Python 没有 PyTorch。`训练围棋.ps1` 使用已安装的
-WSL2 `Ubuntu-24.04`，以及 `/home/dev/.venvs/nanogpt/bin/python`。
-脚本只转发命令，不会安装软件或修改这个虚拟环境。
+`训练围棋.ps1` 优先使用项目 `.venv/Scripts/python.exe`；不存在时兼容原有
+WSL2 `Ubuntu-24.04` 的 `/home/dev/.venvs/nanogpt/bin/python`。
+脚本只转发命令，不会安装软件或修改环境。
+
+本指南对应 `train.py` 的轮流冠军训练。已有 KataGo `.ckpt` 模型请按
+[KataGo 续训指南](KATAGO_TRAINING.md) 使用 `train_rl.py`，不能作为 `--resume` 的 `.pt` 检查点。
 
 在本项目目录的 PowerShell 中运行：
 

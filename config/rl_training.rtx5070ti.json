@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "preset": "high_performance",
+  "overrides": {
+    "game": {
+      "board_size": 9
+    },
+    "hardware": {
+      "device": "cuda:0",
+      "precision": "amp_bfloat16",
+      "gpu_memory_fraction": 0.9,
+      "allow_tf32": true,
+      "compile_model": false,
+      "data_loader_workers": 4,
+      "pin_memory": true
+    },
+    "network": {
+      "channels": 128,
+      "residual_blocks": 10
+    },
+    "search": {
+      "simulations_per_move": 200,
+      "dirichlet_alpha": 0.12,
+      "temperature_moves": 15
+    },
+    "self_play": {
+      "workers": 8,
+      "games_per_iteration": 128,
+      "inference_batch_size": 128
+    },
+    "optimizer": {
+      "batch_size": 1024,
+      "minimum_replay_size": 2048,
+      "training_steps_per_iteration": 4
+    },
+    "evaluation": {
+      "games": 200,
+      "simulations_per_move": 200,
+      "promotion_win_rate": 0.6
+    },
+    "runtime": {
+      "pause_while_game_is_active": false,
+      "output_directory": "training_runs/9x9",
+      "random_seed": 20260830
+    }
+  }
+}

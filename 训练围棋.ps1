@@ -4,6 +4,16 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$localPython = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
+if (Test-Path -LiteralPath $localPython) {
+    if (-not $TrainerArgs) { $TrainerArgs = @('--help') }
+    Push-Location $PSScriptRoot
+    try {
+        & $localPython -u (Join-Path $PSScriptRoot 'train.py') @TrainerArgs
+        exit $LASTEXITCODE
+    }
+    finally { Pop-Location }
+}
 $env:WSL_UTF8 = '1'
 $windowsRoot = $PSScriptRoot.Replace('\', '/')
 $convertedRoot = & wsl -d Ubuntu-24.04 -- wslpath -a $windowsRoot

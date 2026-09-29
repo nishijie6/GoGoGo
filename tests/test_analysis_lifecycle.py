@@ -79,6 +79,75 @@ class AnalysisLifecycleTests(unittest.TestCase):
             on_close=app._analysis_closed,
         )
 
+    def test_analysis_reuses_the_game_pinned_training_model(self) -> None:
+        app = GoApp.__new__(GoApp)
+        app.root = Mock()
+        app.game = GoGame(9)
+        app.executor = Mock()
+        app.analysis_window = None
+        app._reasoning_session = None
+        app.active_mode = MODE_AI
+        app.active_difficulty = "训练·滚动冠军"
+        app.active_training_opponent = object()
+        app.notice_var = Mock()
+        app._invalidate_ai = Mock()
+        app._refresh = Mock()
+
+        saved_settings = Mock()
+        selected_settings = Mock()
+        selected_settings.fingerprint = ("exe", "selected-training-model", "")
+        selected_settings.require_valid.return_value = None
+        engine = Mock(closed=False)
+        engine.settings = selected_settings
+        app.katago_engine = engine
+
+        with patch("weiqi.gui.KataGoSettings.load", return_value=saved_settings):
+            with patch(
+                "weiqi.gui.settings_for_training_opponent",
+                return_value=selected_settings,
+            ) as select_model:
+                with patch("weiqi.gui.KataGoEngine") as engine_type:
+                    with patch("weiqi.gui.AnalysisWorkbenchWindow", return_value=Mock(is_alive=True)):
+                        self.assertTrue(app.show_analysis())
+
+        select_model.assert_called_once_with(
+            saved_settings, app.active_training_opponent, 9,
+        )
+        engine_type.assert_not_called()
+        self.assertIs(app.katago_engine, engine)
+        self.assertIs(app.ai.engine, engine)
+
+    def test_saved_settings_keep_the_training_model_for_analysis(self) -> None:
+        app = GoApp.__new__(GoApp)
+        app.root = Mock()
+        app.game = GoGame(9)
+        app._pending_katago_new_game = False
+        app._pending_analysis_open = True
+        app.analysis_window = None
+        app.katago_engine = None
+        app.active_mode = MODE_AI
+        app.active_difficulty = "训练·滚动冠军"
+        app.active_training_opponent = object()
+        app.notice_var = Mock()
+        app._invalidate_ai = Mock()
+        selected_settings = Mock()
+        engine = Mock()
+        engine.settings = selected_settings
+
+        with patch(
+            "weiqi.gui.settings_for_training_opponent",
+            return_value=selected_settings,
+        ) as select_model:
+            with patch("weiqi.gui.KataGoEngine", return_value=engine):
+                saved_settings = Mock()
+                app._katago_settings_saved(saved_settings)
+
+        select_model.assert_called_once_with(
+            saved_settings, app.active_training_opponent, 9,
+        )
+        self.assertIs(app.ai.engine, engine)
+        app.root.after.assert_called_once_with(80, app.show_analysis)
+
     def test_close_workbench_preserves_formal_state_and_resumes_ai(self) -> None:
         formal = GoGame(9)
         self.assertTrue(formal.play(4, 4).legal)
