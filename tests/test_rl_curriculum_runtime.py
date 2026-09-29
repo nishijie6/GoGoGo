@@ -253,6 +253,31 @@ class CurriculumRuntimeStateTests(unittest.TestCase):
         self.assertEqual(health.games, 1280)
         self.assertAlmostEqual(health.immediate_double_pass_rate, 20 / 1280)
 
+    def test_stage_extreme_limit_only_applies_to_configured_board(self) -> None:
+        config = json.loads(self.config_path.read_text(encoding="utf-8"))
+        config["stages"][0]["extreme_result_rate_limit"] = 0.11
+        self.config_path.write_text(json.dumps(config), encoding="utf-8")
+        runtime = CurriculumRuntime(
+            self.config_path,
+            project_root=PROJECT_ROOT,
+            runner_factory=_FakeRunner,
+            disk_probe=lambda *_args, **_kwargs: DiskStatus(100.0, 500.0, "healthy"),
+        )
+        for stage in runtime.config.stages[:2]:
+            runner = runtime._make_runner(stage)
+            metrics = runner.metric_store.jsonl_path
+            metrics.parent.mkdir(parents=True, exist_ok=True)
+            record = {
+                "sgf_entries": 128,
+                "black_wins": 64,
+                "white_wins": 64,
+                "extreme_result_games": 13,
+            }
+            metrics.write_text("".join(json.dumps(record) + "\n" for _ in range(10)), encoding="utf-8")
+            health = runtime._health(runner)
+            self.assertEqual(health.extreme_result_rate, 130 / 1280)
+            self.assertEqual(health.passed, stage.board_size == 9)
+
     def test_evaluating_phase_failure_is_recorded_and_training_resumes(self) -> None:
         run_root = self.root / "9x9"
         _make_model(run_root, "gogogo-s2048-d100")

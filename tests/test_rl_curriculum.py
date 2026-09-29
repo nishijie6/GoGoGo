@@ -148,9 +148,20 @@ class CurriculumConfigurationTests(unittest.TestCase):
             PROJECT_ROOT / "config" / "rl_curriculum.rtx5070ti.json"
         )
         self.assertEqual([stage.board_size for stage in config.stages], [9, 13, 19])
+        self.assertEqual(config.stages[0].extreme_result_rate_limit, 0.11)
+        self.assertIsNone(config.stages[1].extreme_result_rate_limit)
         self.assertEqual(config.stages[1].autotune_batches, (512, 1024, 1536, 2048))
         self.assertTrue(config.stages[2].indefinite)
         validate_training_profiles(config, PROJECT_ROOT)
+
+    def test_stage_extreme_limit_must_be_probability(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "bad.json"
+            value = curriculum_dict()
+            value["stages"][0]["extreme_result_rate_limit"] = 0  # type: ignore[index]
+            path.write_text(json.dumps(value), encoding="utf-8")
+            with self.assertRaisesRegex(CurriculumConfigError, "extreme_result_rate_limit"):
+                load_curriculum_config(path)
 
     def test_unknown_key_and_wrong_stage_order_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
