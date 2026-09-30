@@ -133,7 +133,6 @@ class CurriculumStage:
     indefinite: bool
     fixed_baseline_models: tuple[str, ...] = ()
     initial_champion_model: Optional[str] = None
-    extreme_result_rate_limit: Optional[float] = None
 
     @property
     def key(self) -> str:
@@ -146,10 +145,9 @@ class CurriculumStage:
 
 @dataclass(frozen=True)
 class HealthThresholds:
-    """Fixed self-play health gates agreed for the curriculum."""
+    """Self-play health gates used for curriculum promotion."""
 
     immediate_double_pass_rate: float = 0.01
-    extreme_result_rate: float = 0.05
     black_win_rate_min: float = 0.45
     black_win_rate_max: float = 0.55
     invalid_rate: float = 0.005
@@ -272,7 +270,7 @@ def load_curriculum_config(path: Path) -> CurriculumConfig:
             raise CurriculumConfigError(f"{path_name} 必须是对象")
         _require_exact_keys(
             item, path=path_name, required=_STAGE_FIELDS,
-            optional={"fixed_baseline_models", "initial_champion_model", "extreme_result_rate_limit"},
+            optional={"fixed_baseline_models", "initial_champion_model"},
         )
         fixed_models = item.get("fixed_baseline_models", [])
         champion = item.get("initial_champion_model")
@@ -287,9 +285,6 @@ def load_curriculum_config(path: Path) -> CurriculumConfig:
         ):
             raise CurriculumConfigError(f"{path_name}.initial_champion_model 必须是模型目录名")
         board = _positive_int(item["board_size"], f"{path_name}.board_size")
-        extreme_limit = item.get("extreme_result_rate_limit")
-        if extreme_limit is not None:
-            extreme_limit = _probability(extreme_limit, f"{path_name}.extreme_result_rate_limit")
         training_config = item["training_config"]
         if not isinstance(training_config, str) or not training_config.strip():
             raise CurriculumConfigError(f"{path_name}.training_config 必须是非空路径")
@@ -318,7 +313,6 @@ def load_curriculum_config(path: Path) -> CurriculumConfig:
                 indefinite=indefinite,
                 fixed_baseline_models=tuple(fixed_models),
                 initial_champion_model=champion,
-                extreme_result_rate_limit=extreme_limit,
             )
         )
 
@@ -967,8 +961,6 @@ def compute_health_window(
         reasons.append("健康窗口不足")
     if double_rate > thresholds.immediate_double_pass_rate:
         reasons.append("开局双方立即停一手比例超标")
-    if extreme_rate > thresholds.extreme_result_rate:
-        reasons.append("极端结果比例超标")
     if not thresholds.black_win_rate_min <= black_rate <= thresholds.black_win_rate_max:
         reasons.append("黑方胜率超出 45%–55%")
     if invalid_rate > thresholds.invalid_rate:
@@ -1351,12 +1343,6 @@ def render_curriculum_dashboard(
         "paused_disk": "磁盘不足，已安全暂停",
     }
     generated = generated_at or _now()
-    active_stage = config.stages[state.active_stage_index]
-    extreme_limit = (
-        active_stage.extreme_result_rate_limit
-        if active_stage.extreme_result_rate_limit is not None
-        else config.health.extreme_result_rate
-    )
     cards = (
         ("当前棋盘", f"{active.board_size}×{active.board_size}"),
         ("课程状态", phase_labels.get(state.phase, state.phase)),
@@ -1370,7 +1356,7 @@ def render_curriculum_dashboard(
             _count_pair(health.get("black_wins"), health.get("white_wins")),
         ),
         ("开局双停率", _percent(health.get("immediate_double_pass_rate"))),
-        ("极端棋局率", f"{_percent(health.get('extreme_result_rate'))} / ≤{_percent(extreme_limit)}"),
+        ("极端棋局率（观察）", _percent(health.get("extreme_result_rate"))),
         ("无效棋谱率", _percent(health.get("invalid_rate"))),
         ("磁盘剩余", f"{disk_free:.1f} GiB" if disk_free is not None else "—"),
     )

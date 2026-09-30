@@ -148,20 +148,9 @@ class CurriculumConfigurationTests(unittest.TestCase):
             PROJECT_ROOT / "config" / "rl_curriculum.rtx5070ti.json"
         )
         self.assertEqual([stage.board_size for stage in config.stages], [9, 13, 19])
-        self.assertEqual(config.stages[0].extreme_result_rate_limit, 0.11)
-        self.assertIsNone(config.stages[1].extreme_result_rate_limit)
         self.assertEqual(config.stages[1].autotune_batches, (512, 1024, 1536, 2048))
         self.assertTrue(config.stages[2].indefinite)
         validate_training_profiles(config, PROJECT_ROOT)
-
-    def test_stage_extreme_limit_must_be_probability(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "bad.json"
-            value = curriculum_dict()
-            value["stages"][0]["extreme_result_rate_limit"] = 0  # type: ignore[index]
-            path.write_text(json.dumps(value), encoding="utf-8")
-            with self.assertRaisesRegex(CurriculumConfigError, "extreme_result_rate_limit"):
-                load_curriculum_config(path)
 
     def test_unknown_key_and_wrong_stage_order_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -259,7 +248,7 @@ class StatisticsAndSgfTests(unittest.TestCase):
         self.assertIn("hintPosesProb = 1.0", text)
         self.assertIn("nnRandSeed = gogogo-curriculum-evaluation-v1", text)
 
-    def test_health_window_requires_1280_games_and_all_limits(self) -> None:
+    def test_health_window_requires_1280_games_and_active_limits(self) -> None:
         health = passing_health()
         self.assertTrue(health.complete)
         self.assertTrue(health.passed)
@@ -278,7 +267,18 @@ class StatisticsAndSgfTests(unittest.TestCase):
         ]
         unhealthy = compute_health_window(unhealthy_records)
         self.assertFalse(unhealthy.passed)
-        self.assertGreaterEqual(len(unhealthy.reasons), 4)
+        self.assertGreaterEqual(len(unhealthy.reasons), 3)
+
+    def test_extreme_results_are_recorded_without_blocking_promotion(self) -> None:
+        records = [
+            {"games": 128, "black_wins": 64, "white_wins": 64, "extreme_games": 128}
+            for _ in range(10)
+        ]
+        health = compute_health_window(records)
+        self.assertEqual(health.extreme_games, 1280)
+        self.assertEqual(health.extreme_result_rate, 1.0)
+        self.assertTrue(health.passed)
+        self.assertEqual(health.reasons, ())
 
     def test_health_accepts_real_metric_names_and_draws_score_half(self) -> None:
         records = [
@@ -681,7 +681,7 @@ class OpponentPoolTests(unittest.TestCase):
         self.state.protected_models = ["anchor", "champion", "history"]
 
     def test_strength_promotion_independent_of_course_health(self):
-        health = replace(passing_health(), passed=False, reasons=("极端结果比例超标",))
+        health = replace(passing_health(), passed=False, reasons=("无结果或损坏棋谱比例超标",))
         results = {name: passing_match() for name in ("champion", "anchor", "history")}
         gate = self.controller.record_evaluation(
             self.state, candidate_model="new", match=results["anchor"],

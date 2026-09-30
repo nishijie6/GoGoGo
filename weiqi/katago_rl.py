@@ -521,6 +521,32 @@ class KataGoRLRunner:
             log_name=f"train-{timestamp}.log",
         )
 
+    def _batch_fitting_shuffle(self, shuffled: Path, requested: int) -> int:
+        """Fit one training epoch into the shuffled files at a new stage."""
+
+        metadata = [
+            path.with_suffix(".json")
+            for path in (shuffled / "train").glob("*.npz")
+            if path.with_suffix(".json").is_file()
+        ]
+        if not metadata:
+            return requested
+        rows = [
+            int(json.loads(path.read_text(encoding="utf-8"))["num_rows"])
+            for path in metadata
+        ]
+        steps = self.config.optimizer.training_steps_per_iteration
+        batch = requested
+        while batch > 1 and sum(count // batch for count in rows) < steps:
+            batch = max(1, batch // 2)
+        if sum(count // batch for count in rows) < steps:
+            raise KataGoRLRunnerError(
+                f"打乱数据不足以完成 {steps} 个训练批次；各文件行数：{rows}"
+            )
+        if batch != requested:
+            print(f"打乱数据较少，本轮训练批次从 {requested} 暂降到 {batch}", flush=True)
+        return batch
+
     def export_new_models(self) -> list[Path]:
         """Export every new PyTorch checkpoint into KataGo's binary format."""
 
@@ -597,13 +623,17 @@ class KataGoRLRunner:
         )
 
         stage_started = time.perf_counter()
-        self.shuffle(min_rows=min_rows, smoke=smoke)
+        shuffled = self.shuffle(min_rows=min_rows, smoke=smoke)
         shuffle_seconds = time.perf_counter() - stage_started
 
         stage_started = time.perf_counter()
+        batch = training_batch_size
+        if not smoke and isinstance(shuffled, Path):
+            batch = batch or self.config.optimizer.batch_size
+            batch = self._batch_fitting_shuffle(shuffled, batch)
         self.train(
             smoke=smoke,
-            batch_size=training_batch_size,
+            batch_size=batch,
             initial_checkpoint=initial_checkpoint,
         )
         train_seconds = time.perf_counter() - stage_started

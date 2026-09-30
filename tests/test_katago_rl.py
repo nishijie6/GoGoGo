@@ -266,6 +266,17 @@ class KataGoRLConfigurationTests(unittest.TestCase):
             ), self.assertRaisesRegex(KataGoRLRunnerError, "静默空转"):
                 runner.cycle()
 
+    def test_autotuned_batch_temporarily_fits_new_stage_data(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runner = KataGoRLRunner(DEFAULT_RTX_PROFILE, run_root_override=Path(temporary))
+            shuffled = runner.shuffled_dir / "latest" / "train"
+            shuffled.mkdir(parents=True)
+            (shuffled / "data0.npz").write_bytes(b"test")
+            (shuffled / "data0.json").write_text('{"num_rows": 5191}', encoding="utf-8")
+            self.assertEqual(runner._batch_fitting_shuffle(shuffled.parent, 2048), 1024)
+            (shuffled / "data0.json").write_text('{"num_rows": 9000}', encoding="utf-8")
+            self.assertEqual(runner._batch_fitting_shuffle(shuffled.parent, 2048), 2048)
+
     def test_curriculum_commands_have_a_dedicated_config(self) -> None:
         args = build_parser().parse_args(["curriculum-status"])
         self.assertEqual(args.command, "curriculum-status")

@@ -16,7 +16,6 @@
   "stages": [
     {
       "board_size": 9,
-      "extreme_result_rate_limit": 0.11,
       "training_config": "config/rl_training.rtx5070ti.json",
       "min_stage_samples": 10000000,
       "initial_champion_model": "gogogo-s31967232-d4973021",

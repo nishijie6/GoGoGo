@@ -26,7 +26,7 @@ import subprocess
 import sys
 import time
 import uuid
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Optional, Sequence
@@ -518,21 +518,11 @@ class CurriculumRuntime:
                     "damaged_games": record.get("damaged_games", 0),
                 }
             )
-        stage = next(
-            stage for stage in self.config.stages
-            if stage.board_size == runner.config.game.board_size
-        )
-        thresholds = self.config.health
-        if stage.extreme_result_rate_limit is not None:
-            thresholds = replace(
-                thresholds,
-                extreme_result_rate=stage.extreme_result_rate_limit,
-            )
         return compute_health_window(
             normalized,
             window_cycles=self.config.health_window_cycles,
             games_per_cycle=128,
-            thresholds=thresholds,
+            thresholds=self.config.health,
         )
 
     def _refresh_progress(
