@@ -303,6 +303,11 @@ weiqi_gui/
 │   ├── winrate.py       # 实时胜率与领先目数估算
 │   ├── rl_config.py     # 强化学习默认/高性能预设、覆盖和校验
 │   ├── rl/              # 特征、策略/价值网络、MCTS、双进程采样与训练闭环
+│   ├── katago_rl.py     # KataGo 官方自我对弈训练循环（train_rl.py）
+│   ├── rl_curriculum*.py # 9→13→19 课程：配置、状态、评测、迁移、清理与运行层
+│   ├── rl_metrics*.py、rl_metric_store.py # KataGo 训练指标、历史记录与仪表盘
+│   ├── rl_match.py、rl_retention.py、rl_benchmark.py、rl_migration.py # 课程用的对局统计、清理、批次调优与迁移
+│   ├── fileio.py、sgf.py # 原子写入/文件哈希与 SGF 解析公共工具
 │   ├── rl_activity.py   # 正常对局通知训练器暂停的跨 Windows/WSL 心跳
 │   ├── reasoning.py     # 推理模式的正式棋局快照与临时变化隔离
 │   ├── rules.py         # 程序内中文围棋规则内容
@@ -332,6 +337,7 @@ weiqi_gui/
     ├── test_rl_runtime.py # 完整续训、进程退出与运行控制
     ├── test_rl_activity.py # 正常对局暂停训练的心跳与生命周期
     ├── test_rl_evaluation.py # 配对置信区间、固定局面和历史模型不可变性
+    ├── test_rl_quality.py # playout cap、辅助目标、样本复用率与 SPRT
     ├── test_reasoning.py # 推理分支、撤回边界与正式棋局恢复测试
     ├── test_rules.py    # 程序内规则内容测试
     └── test_training.py # 定式/死活课程与回放测试
