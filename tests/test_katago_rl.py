@@ -17,8 +17,8 @@ from weiqi.katago_rl import (
     format_katago_overrides,
     model_kind_for_config,
     KataGoRLRunner,
-    build_parser,
 )
+from weiqi.katago_rl_cli import build_parser
 from weiqi.rl_config import load_rl_training_config
 
 

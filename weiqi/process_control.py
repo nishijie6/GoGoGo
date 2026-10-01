@@ -192,3 +192,31 @@ def managed_popen(*args: Any, **kwargs: Any) -> Iterator[subprocess.Popen[Any]]:
 
 
 __all__ = ["ManagedProcessError", "managed_popen"]
+
+
+def stream_command(
+    args: list[str], *, cwd: str, env: dict[str, str], log: Optional[Any] = None
+) -> tuple[int, str]:
+    """Run ``args`` with merged stdout/stderr, echoing each line to the console
+    and to the open text file ``log`` as it arrives; return (exit code, output)."""
+
+    output: list[str] = []
+    with managed_popen(
+        args,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    ) as process:
+        assert process.stdout is not None
+        for line in process.stdout:
+            output.append(line)
+            print(line, end="", flush=True)
+            if log is not None:
+                log.write(line)
+                log.flush()
+        return process.wait(), "".join(output)

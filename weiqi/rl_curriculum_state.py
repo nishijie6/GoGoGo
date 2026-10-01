@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
-from .fileio import atomic_write_json, local_timestamp
+from .fileio import FileLockHeld, acquire_file_lock, atomic_write_json, local_timestamp, release_file_lock
 from .rl_curriculum_config import EXPECTED_BOARDS
 
 
@@ -211,45 +210,16 @@ class GlobalCurriculumLock:
 
     def __enter__(self) -> "GlobalCurriculumLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        handle = self.path.open("a+b")
-        if self.path.stat().st_size == 0:
-            handle.write(b"0")
-            handle.flush()
-        handle.seek(0)
         try:
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as error:
-            handle.close()
+            self._file = acquire_file_lock(self.path)
+        except FileLockHeld as error:
             raise CurriculumLockError(f"课程训练已在运行：{self.path}") from error
-        handle.seek(0)
-        handle.write(str(os.getpid()).encode("ascii"))
-        handle.flush()
-        self._file = handle
         return self
 
     def __exit__(self, *_: object) -> None:
-        handle = self._file
-        self._file = None
-        if handle is None:
-            return
-        handle.seek(0)
-        if os.name == "nt":
-            import msvcrt
-
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        handle.close()
-
+        handle, self._file = self._file, None
+        if handle is not None:
+            release_file_lock(handle)
 
 __all__ = [
     "CurriculumLockError",

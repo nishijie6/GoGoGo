@@ -8,7 +8,6 @@ adds resumable paths, logging, process locking, and CUDA runtime discovery.
 
 from __future__ import annotations
 
-import argparse
 import contextlib
 import gzip
 import json
@@ -22,15 +21,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Mapping, Optional, Sequence
 
+from .fileio import FileLockHeld, acquire_file_lock, release_file_lock
 from .katago import katago_subprocess_environment
-from .process_control import managed_popen
-from .rl_curriculum import (
-    CurriculumConfigError,
-    CurriculumLockError,
-    CurriculumMigrationError,
-    CurriculumStateError,
-)
-from .rl_config import RLConfigError, RLTrainingConfig, load_rl_training_config
+from .process_control import stream_command
+from .rl_config import RLTrainingConfig, load_rl_training_config
 from .rl_metric_store import RLMetricStore
 from .rl_metrics import parse_selfplay_output
 from .replay_accounting import ReplayAccountingError, ReplayRowLedger
@@ -268,7 +262,6 @@ class KataGoRLRunner:
         args = [str(item) for item in command]
         print("\n$ " + subprocess.list2cmdline(args), flush=True)
         log_file = None
-        output_lines: list[str] = []
         try:
             if log_name is not None:
                 self.logs_dir.mkdir(parents=True, exist_ok=True)
@@ -277,25 +270,9 @@ class KataGoRLRunner:
                 )
                 log_file.write("\n$ " + subprocess.list2cmdline(args) + "\n")
                 log_file.flush()
-            with managed_popen(
-                args,
-                cwd=str(cwd or self.project_root),
-                env=self._environment(),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-            ) as process:
-                assert process.stdout is not None
-                for line in process.stdout:
-                    output_lines.append(line)
-                    print(line, end="", flush=True)
-                    if log_file is not None:
-                        log_file.write(line)
-                        log_file.flush()
-                return_code = process.wait()
+            return_code, output = stream_command(
+                args, cwd=str(cwd or self.project_root), env=self._environment(), log=log_file
+            )
         finally:
             if log_file is not None:
                 log_file.close()
@@ -303,7 +280,7 @@ class KataGoRLRunner:
             raise KataGoRLRunnerError(
                 f"外部阶段退出，代码 {return_code}：{subprocess.list2cmdline(args)}"
             )
-        return "".join(output_lines)
+        return output
 
     def doctor(self) -> dict[str, object]:
         """Verify pinned sources, CUDA PyTorch, GPU access, and KataGo."""
@@ -717,166 +694,16 @@ class KataGoRLRunner:
 
         self.run_root.mkdir(parents=True, exist_ok=True)
         lock_path = self.run_root / "training.lock"
-        lock_file = lock_path.open("a+b")
-        if lock_path.stat().st_size == 0:
-            lock_file.write(b"0")
-            lock_file.flush()
-        lock_file.seek(0)
         try:
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as error:
-            lock_file.close()
+            handle = acquire_file_lock(lock_path)
+        except FileLockHeld as error:
             raise KataGoRLRunnerError(
                 f"训练目录已被另一个进程占用：{lock_path}"
             ) from error
         try:
-            lock_file.seek(0)
-            lock_file.truncate()
-            lock_file.write(str(os.getpid()).encode("ascii"))
-            lock_file.flush()
             yield
         finally:
-            lock_file.seek(0)
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-            lock_file.close()
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="运行可续训的 KataGo 单机强化学习闭环"
-    )
-    parser.add_argument(
-        "command",
-        nargs="?",
-        default="cycle",
-        choices=(
-            "doctor",
-            "status",
-            "selfplay",
-            "shuffle",
-            "train",
-            "export",
-            "cycle",
-            "continuous",
-            "dashboard",
-            "curriculum",
-            "curriculum-status",
-            "curriculum-dashboard",
-            "curriculum-evaluate",
-        ),
-    )
-    parser.add_argument("--config", type=Path, default=DEFAULT_RTX_PROFILE)
-    parser.add_argument(
-        "--curriculum-config",
-        type=Path,
-        default=DEFAULT_CURRICULUM_PROFILE,
-    )
-    parser.add_argument("--games", type=int)
-    parser.add_argument("--visits", type=int)
-    parser.add_argument("--min-rows", type=int)
-    parser.add_argument(
-        "--iterations",
-        type=int,
-        default=0,
-        help="continuous 的循环数；0 表示持续运行到 Ctrl+C",
-    )
-    parser.add_argument(
-        "--smoke",
-        action="store_true",
-        help="使用少量局数和访问量验证完整闭环",
-    )
-    return parser
-
-
-def main(argv: Optional[Sequence[str]] = None) -> None:
-    args = build_parser().parse_args(argv)
-    try:
-        if args.iterations < 0:
-            raise KataGoRLRunnerError("--iterations 不能小于 0")
-        if args.command in {"curriculum", "curriculum-status", "curriculum-dashboard", "curriculum-evaluate"}:
-            # Import lazily because the runtime itself builds stage runners
-            # from this module.
-            from .rl_curriculum_runtime import CurriculumRuntime
-
-            curriculum = CurriculumRuntime(args.curriculum_config)
-            if args.command == "curriculum-status":
-                curriculum.status()
-            elif args.command == "curriculum-dashboard":
-                curriculum.refresh_dashboard()
-            elif args.command == "curriculum-evaluate":
-                curriculum.evaluate_now()
-            else:
-                curriculum.run(iterations=args.iterations, smoke=args.smoke)
-            return
-        runner = KataGoRLRunner(args.config)
-        if args.command == "doctor":
-            runner.doctor()
-            return
-        if args.command == "status":
-            runner.status()
-            return
-        if args.command == "dashboard":
-            runner.dashboard()
-            return
-        with runner.lock():
-            if args.command == "selfplay":
-                runner.selfplay(
-                    games=args.games,
-                    visits=args.visits,
-                    smoke=args.smoke,
-                )
-            elif args.command == "shuffle":
-                runner.shuffle(min_rows=args.min_rows, smoke=args.smoke)
-            elif args.command == "train":
-                runner.train(smoke=args.smoke)
-            elif args.command == "export":
-                runner.export_new_models()
-            elif args.command == "cycle":
-                runner.cycle(
-                    smoke=args.smoke,
-                    games=args.games,
-                    visits=args.visits,
-                    min_rows=args.min_rows,
-                )
-            else:
-                completed = 0
-                while args.iterations <= 0 or completed < args.iterations:
-                    print(f"\n===== 强化学习循环 {completed + 1} =====", flush=True)
-                    runner.cycle(
-                        smoke=args.smoke,
-                        games=args.games,
-                        visits=args.visits,
-                        min_rows=args.min_rows,
-                    )
-                    completed += 1
-    except KeyboardInterrupt:
-        print("\n已收到中断，KataGo 会保留可续训产物。", file=sys.stderr)
-        raise SystemExit(130)
-    except (
-        KataGoRLRunnerError,
-        RLConfigError,
-        CurriculumConfigError,
-        CurriculumLockError,
-        CurriculumMigrationError,
-        CurriculumStateError,
-        OSError,
-    ) as error:
-        print(f"强化学习失败：{error}", file=sys.stderr)
-        raise SystemExit(1) from error
+            release_file_lock(handle)
 
 
 __all__ = [
@@ -887,6 +714,5 @@ __all__ = [
     "KataGoRLRunnerError",
     "build_selfplay_overrides",
     "format_katago_overrides",
-    "main",
     "model_kind_for_config",
 ]

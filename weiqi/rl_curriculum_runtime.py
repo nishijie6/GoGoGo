@@ -28,7 +28,7 @@ from typing import Callable, Mapping, Optional, Sequence
 
 from .fileio import atomic_write_text, local_timestamp
 from .katago_rl import PROJECT_ROOT, KataGoRLRunner
-from .process_control import managed_popen
+from .process_control import stream_command
 from .rl_curriculum import (
     CurriculumController,
     CurriculumStage,
@@ -308,28 +308,11 @@ class CurriculumRuntime(EvaluationSteps, TransitionSteps, CleanupSteps):
             atomic_write_text(log_path, execution.stdout)
             return execution
 
-        output: list[str] = []
         with log_path.open("a", encoding="utf-8", newline="") as log:
             log.write("$ " + subprocess.list2cmdline(args) + "\n")
             log.flush()
-            with managed_popen(
-                args,
-                cwd=str(cwd),
-                env=dict(env),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-            ) as process:
-                assert process.stdout is not None
-                for line in process.stdout:
-                    output.append(line)
-                    log.write(line)
-                    log.flush()
-                    print(line, end="", flush=True)
-                return CommandExecution(process.wait(), "".join(output))
+            returncode, output = stream_command(args, cwd=str(cwd), env=dict(env), log=log)
+        return CommandExecution(returncode, output)
 
     def _cycle(self, state: CurriculumState, *, smoke: bool) -> None:
         runner = self._stage_runner(state)

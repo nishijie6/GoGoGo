@@ -8,6 +8,7 @@ import tempfile
 import time
 import uuid
 
+from ..fileio import FileLockHeld, acquire_file_lock, release_file_lock
 from ..rl_activity import game_is_active
 
 
@@ -22,26 +23,14 @@ class RunLock:
         self.path = directory / "run.lock"
 
     def __enter__(self):
-        self.stream = self.path.open("a+b")
-        if self.stream.tell() == 0:
-            self.stream.write(b"0")
-            self.stream.flush()
-        self.stream.seek(0)
         try:
-            if os.name == "nt":
-                import msvcrt
-                msvcrt.locking(self.stream.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(self.stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as error:
-            self.stream.close()
+            self.stream = acquire_file_lock(self.path)
+        except FileLockHeld as error:
             raise ValueError(f"Another trainer owns {self.path.parent}") from error
         return self
 
     def __exit__(self, *_):
-        self.stream.close()
-
+        release_file_lock(self.stream)
 
 class Progress:
     def __init__(self, directory: Path, *, operation: str = "train"):

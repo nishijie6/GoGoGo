@@ -17,6 +17,10 @@ from pathlib import Path
 from typing import IO, Iterator
 
 
+class FileLockHeld(OSError):
+    """Another process already holds the lock."""
+
+
 def local_timestamp() -> str:
     """Local wall-clock time with offset, to the second, for persisted records."""
 
@@ -68,3 +72,53 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def acquire_file_lock(path: Path) -> IO[bytes]:
+    """Take a nonblocking OS lock on ``path`` and record this process ID in it.
+
+    The operating system releases the lock if the process dies. Raises
+    :class:`FileLockHeld` when another process holds it; release with
+    :func:`release_file_lock`.
+    """
+
+    handle = path.open("a+b")
+    try:
+        if path.stat().st_size == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            raise FileLockHeld(f"{path} is locked by another process") from error
+        handle.seek(0)
+        handle.truncate()
+        handle.write(str(os.getpid()).encode("ascii"))
+        handle.flush()
+    except BaseException:
+        handle.close()
+        raise
+    return handle
+
+
+def release_file_lock(handle: IO[bytes]) -> None:
+    handle.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()

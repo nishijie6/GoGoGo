@@ -303,7 +303,7 @@ weiqi_gui/
 │   ├── winrate.py       # 实时胜率与领先目数估算
 │   ├── rl_config.py     # 强化学习默认/高性能预设、覆盖和校验
 │   ├── rl/              # 特征、策略/价值网络、MCTS、双进程采样与训练闭环
-│   ├── katago_rl.py     # KataGo 官方自我对弈训练循环（train_rl.py）
+│   ├── katago_rl.py、katago_rl_cli.py # KataGo 官方自我对弈训练循环与 train_rl.py 命令行
 │   ├── rl_curriculum*.py # 9→13→19 课程：配置、状态、评测、迁移、清理与运行层
 │   ├── rl_metrics*.py、rl_metric_store.py # KataGo 训练指标、历史记录与仪表盘
 │   ├── rl_match.py、rl_retention.py、rl_benchmark.py、rl_migration.py # 课程用的对局统计、清理、批次调优与迁移
