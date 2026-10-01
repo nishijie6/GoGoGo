@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "preset": "balanced",
+  "overrides": {
+    "search": {
+      "leaf_batch_size": 4
+    },
+    "self_play": {
+      "workers": 12,
+      "inference_batch_size": 48
+    }
+  }
+}

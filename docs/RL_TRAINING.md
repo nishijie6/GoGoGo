@@ -44,6 +44,23 @@ WSL2 `Ubuntu-24.04` 的 `/home/dev/.venvs/nanogpt/bin/python`。
 指定新目录。已有运行必须使用 `--resume`，以免误覆盖。训练过程按指定轮数结束，
 不会自动建立长期后台任务。
 
+## 多核并行配置
+
+默认配置面向普通机器：2 个对弈进程、顺序搜索。核数较多时可使用
+`config/rl_training.balanced.parallel.json`：它仍是 `balanced` 预设，只把自我对弈进程
+提到 12、推理批量提到 48，并让每次网络调用合并 4 个搜索叶节点
+（`search.leaf_batch_size=4`，用虚拟损失选叶；设为 1 即顺序搜索）。
+
+```powershell
+.\训练围棋.ps1 train --config config/rl_training.balanced.parallel.json --output training_runs/parallel
+```
+
+在 16 线程 + RTX 5070 Ti 上实测（每轮 32 局自我对弈，12 轮）：相同训练量下耗时约
+为默认配置的三分之一（245 s 对 769 s）。两份各 12 轮的模型直接对弈 100 局为 53:42
+（5 局截断），95% 区间 [0.34, 0.74]，没有检测到强度差异；但训练量很小，检验功效低。
+批量搜索会略微改变搜索结果，长期训练建议先在短运行里对比晋级率和固定局面指标。
+续训已有检查点时沿用检查点内保存的配置，不会被此文件改变。
+
 ## 默认规模和预热
 
 | 参数 | balanced |

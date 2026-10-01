@@ -66,6 +66,19 @@ class RLTrainingConfigTests(unittest.TestCase):
         self.assertEqual(example.preset, "high_performance")
         self.assertEqual(example.hardware.device, "cuda:0")
 
+    def test_parallel_config_only_tunes_self_play_throughput(self) -> None:
+        parallel = load_rl_training_config(
+            DEFAULT_RL_CONFIG_PATH.parent / "rl_training.balanced.parallel.json"
+        )
+        balanced = resolve_rl_training_config("balanced")
+        self.assertEqual(parallel.preset, "balanced")
+        self.assertEqual(parallel.self_play.workers, 12)
+        self.assertEqual(parallel.search.leaf_batch_size, 4)
+        self.assertEqual(parallel.game, balanced.game)
+        self.assertEqual(parallel.network, balanced.network)
+        self.assertEqual(parallel.search.simulations_per_move,
+                         balanced.search.simulations_per_move)
+
     def test_nested_overrides_do_not_mutate_the_builtin_preset(self) -> None:
         custom = resolve_rl_training_config(
             "balanced",
