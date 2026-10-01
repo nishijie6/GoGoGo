@@ -25,10 +25,10 @@ from weiqi.rl_curriculum import (
 from weiqi.rl_retention import DiskStatus
 from weiqi.katago_rl import KataGoRLRunnerError
 from weiqi.replay_accounting import ReplayRowLedger
+from weiqi.rl_curriculum_openings import ensure_evaluation_opening_suite
 from weiqi.rl_curriculum_runtime import (
     CommandExecution,
     CurriculumRuntime,
-    ensure_evaluation_opening_suite,
 )
 from weiqi.rl_config import load_rl_training_config
 
@@ -324,20 +324,20 @@ class CurriculumRuntimeStateTests(unittest.TestCase):
             return CommandExecution(0, "ok")
 
         self.runtime.command_runner = successful_pair
-        import weiqi.rl_curriculum_runtime as runtime_module
+        import weiqi.rl_curriculum_evaluation as evaluation_module
 
-        original = runtime_module.atomic_write_json
+        original = evaluation_module.atomic_write_json
 
         def fail_summary(path, value):
             if path.name == "summary.json":
                 raise OSError("summary disk error")
             return original(path, value)
 
-        runtime_module.atomic_write_json = fail_summary
+        evaluation_module.atomic_write_json = fail_summary
         try:
             self.runtime._evaluate(state)
         finally:
-            runtime_module.atomic_write_json = original
+            evaluation_module.atomic_write_json = original
         recovered = self.runtime.store.load()
         assert recovered is not None
         self.assertEqual(len(recovered.active.evaluations), 1)
@@ -471,9 +471,9 @@ class CurriculumRuntimeStateTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.runtime.store.save(state)
-        import weiqi.rl_curriculum_runtime as runtime_module
+        import weiqi.rl_curriculum_transition as transition_module
 
-        original = runtime_module.verify_checkpoint_loads
+        original = transition_module.verify_checkpoint_loads
         original_read_text = Path.read_text
         attempts = 0
         manifest_denials = 0
@@ -494,7 +494,7 @@ class CurriculumRuntimeStateTests(unittest.TestCase):
             if attempts == 1:
                 raise OSError("transient checkpoint read")
 
-        runtime_module.verify_checkpoint_loads = transient_then_success
+        transition_module.verify_checkpoint_loads = transient_then_success
         Path.read_text = transient_manifest_read
         try:
             self.runtime._migrate(state)
@@ -513,7 +513,7 @@ class CurriculumRuntimeStateTests(unittest.TestCase):
             self.runtime._migrate(retrying_again)
         finally:
             Path.read_text = original_read_text
-            runtime_module.verify_checkpoint_loads = original
+            transition_module.verify_checkpoint_loads = original
         recovered = self.runtime.store.load()
         assert recovered is not None
         self.assertEqual(recovered.active_stage_index, 1)
@@ -544,10 +544,10 @@ class CurriculumRuntimeStateTests(unittest.TestCase):
         target = self.root / "13x13"
         self.runtime.store.save(state)
 
-        import weiqi.rl_curriculum_runtime as runtime_module
+        import weiqi.rl_curriculum_transition as transition_module
 
-        original_prepare = runtime_module.prepare_stage_migration
-        original_verify = runtime_module.verify_checkpoint_loads
+        original_prepare = transition_module.prepare_stage_migration
+        original_verify = transition_module.verify_checkpoint_loads
         original_checks = self.runtime._migration_checks
         original_save = self.runtime.store.save
         original_load = self.runtime.store.load
@@ -582,8 +582,8 @@ class CurriculumRuntimeStateTests(unittest.TestCase):
                 raise PermissionError("transient curriculum state reload")
             return original_load()
 
-        runtime_module.prepare_stage_migration = publish_target
-        runtime_module.verify_checkpoint_loads = lambda *_args, **_kwargs: None
+        transition_module.prepare_stage_migration = publish_target
+        transition_module.verify_checkpoint_loads = lambda *_args, **_kwargs: None
         self.runtime._migration_checks = (
             lambda *_args, **_kwargs: (1024, None)
         )
@@ -617,8 +617,8 @@ class CurriculumRuntimeStateTests(unittest.TestCase):
             self.runtime.store.load = original_load
             self.runtime.store.save = original_save
             self.runtime._migration_checks = original_checks
-            runtime_module.verify_checkpoint_loads = original_verify
-            runtime_module.prepare_stage_migration = original_prepare
+            transition_module.verify_checkpoint_loads = original_verify
+            transition_module.prepare_stage_migration = original_prepare
 
     def test_source_hash_permission_error_keeps_transition_ready(self) -> None:
         state = CurriculumState(
@@ -641,16 +641,16 @@ class CurriculumRuntimeStateTests(unittest.TestCase):
         _make_model(self.root / "9x9", "gogogo-s11000000-d9")
         self.runtime.store.save(state)
 
-        import weiqi.rl_curriculum_runtime as runtime_module
+        import weiqi.rl_curriculum_transition as transition_module
 
-        original = runtime_module.sha256_file
-        runtime_module.sha256_file = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        original = transition_module.sha256_file
+        transition_module.sha256_file = lambda *_args, **_kwargs: (_ for _ in ()).throw(
             PermissionError("checkpoint temporarily shared")
         )
         try:
             self.runtime._migrate(state)
         finally:
-            runtime_module.sha256_file = original
+            transition_module.sha256_file = original
         retrying = self.runtime.store.load()
         assert retrying is not None
         self.assertEqual(retrying.phase, "transition_ready")
