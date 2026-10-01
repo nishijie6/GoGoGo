@@ -247,11 +247,13 @@ class TrainerQualityTests(unittest.TestCase):
         raw = self.config().to_dict()
         raw["network"].pop("auxiliary_heads")
         raw["search"].pop("full_search_probability")
+        raw["search"].pop("leaf_batch_size")
         raw["optimizer"].pop("target_sample_reuse")
         restored = checkpoint_config({"checkpoint_version": CHECKPOINT_VERSION,
                                       "feature_version": FEATURE_VERSION, "config": raw})
         self.assertFalse(restored.network.auxiliary_heads)
         self.assertEqual(restored.search.full_search_probability, 1.0)
+        self.assertEqual(restored.search.leaf_batch_size, 1)
         self.assertIsNone(restored.optimizer.target_sample_reuse)
         self.assertFalse(PolicyValueNet(restored).auxiliary)
 

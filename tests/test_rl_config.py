@@ -32,6 +32,7 @@ class RLTrainingConfigTests(unittest.TestCase):
         self.assertTrue(config.network.auxiliary_heads)
         self.assertEqual(config.search.full_search_probability, 0.25)
         self.assertEqual(config.optimizer.target_sample_reuse, 8.0)
+        self.assertEqual(config.search.leaf_batch_size, 4)
         self.assertEqual(config.evaluation.confirmation_max_game_length_factor, 4.0)
         self.assertEqual(config.network.channels, 64)
         self.assertLessEqual(config.hardware.gpu_memory_fraction, 0.60)

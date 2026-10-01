@@ -216,7 +216,8 @@ _BALANCED_PRESET: Dict[str, Any] = {
         "dirichlet_epsilon": 0.25,
         "root_temperature": 1.0,
         "temperature_moves": 20,
-        "leaf_batch_size": 1,
+        # Batched leaves let even two self-play workers fill GPU batches.
+        "leaf_batch_size": 4,
         "full_search_probability": 0.25,
         "fast_simulations_per_move": 16,
     },

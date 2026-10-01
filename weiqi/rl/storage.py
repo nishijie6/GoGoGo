@@ -57,6 +57,7 @@ def checkpoint_config(payload: dict):
                           overrides["self_play"].get("max_game_length_factor", 2.5))
     overrides.setdefault("network", {}).setdefault("auxiliary_heads", False)
     overrides.setdefault("search", {}).setdefault("full_search_probability", 1.0)
+    overrides["search"].setdefault("leaf_batch_size", 1)
     overrides.setdefault("optimizer", {}).setdefault("target_sample_reuse", None)
     return resolve_rl_training_config(raw["preset"], overrides)
 
