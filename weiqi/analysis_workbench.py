@@ -4,6 +4,9 @@ The public behaviour interface deliberately has only three entry points:
 ``sync_formal``, ``analyze``, and ``explore``.  Tkinter owns scheduling and
 KataGo process lifetime; this module owns detached Go positions and never
 mutates the formal ``GoGame`` supplied by the caller.
+
+Its value types, errors and actions live in ``analysis_model`` (re-exported
+here) and KataGo response parsing in ``analysis_parsing``.
 """
 
 from __future__ import annotations
@@ -13,246 +16,38 @@ import math
 import threading
 import weakref
 from dataclasses import dataclass
-from typing import Any, Literal, Mapping, NewType, Optional, Protocol, Union
+from typing import Optional
 
-from .engine import BLACK, WHITE, BoardHash, GoGame, MoveRecord, Point
-from .katago import vertex_to_point
-
-
-NodeId = NewType("NodeId", str)
-CandidateId = NewType("CandidateId", str)
-
-
-class AnalysisWorkbenchError(RuntimeError):
-    """Base error exposed at the analysis-workbench seam."""
-
-
-class WorkbenchStateError(AnalysisWorkbenchError):
-    """Raised for an action that is invalid in the current workbench state."""
-
-
-class ForeignFormalGameError(WorkbenchStateError):
-    """Raised when a workbench is reused for another formal ``GoGame``."""
-
-
-class IllegalVariationMove(AnalysisWorkbenchError):
-    """Raised when a variation move conflicts with the local rule engine."""
-
-
-class AnalysisConfigurationError(AnalysisWorkbenchError):
-    """Raised when the configured production response adapter is unavailable."""
-
-
-class AnalysisEngineError(AnalysisWorkbenchError):
-    """Raised when the external analysis dependency fails."""
-
-
-class AnalysisProtocolError(AnalysisWorkbenchError):
-    """Raised when an external response cannot be trusted or normalized."""
-
-
-class StaleAnalysis(AnalysisWorkbenchError):
-    """Raised when a response no longer matches the node that requested it."""
-
-
-class AnalysisResponsePort(Protocol):
-    """Internal seam for the true-external KataGo response dependency."""
-
-    def analyze_position(
-        self,
-        game: GoGame,
-        max_visits: int,
-        pv_length: int,
-        include_ownership: bool = True,
-        cancel_event: Optional[threading.Event] = None,
-    ) -> dict[str, Any]:
-        """Return one final raw KataGo-style response without mutating ``game``."""
-
-
-class KataGoResponseAdapter:
-    """Duck-typed production adapter for a KataGo engine.
-
-    Construction intentionally does not invoke the external engine.  Capability
-    is checked when analysis is requested, which keeps setup lazy and produces a
-    stable configuration error for an incompatible engine object.
-    """
-
-    def __init__(self, engine: object) -> None:
-        self._engine = engine
-
-    def analyze_position(
-        self,
-        game: GoGame,
-        max_visits: int,
-        pv_length: int,
-        include_ownership: bool = True,
-        cancel_event: Optional[threading.Event] = None,
-    ) -> dict[str, Any]:
-        method = getattr(self._engine, "analyze_position", None)
-        if not callable(method):
-            raise AnalysisConfigurationError(
-                "当前 KataGo 引擎尚未提供 analyze_position 响应接口"
-            )
-        response = method(
-            game,
-            max_visits=max_visits,
-            pv_length=pv_length,
-            include_ownership=include_ownership,
-            cancel_event=cancel_event,
-        )
-        if not isinstance(response, dict):
-            raise AnalysisProtocolError("KataGo 分析响应必须是 JSON 对象")
-        return response
-
-
-@dataclass(frozen=True)
-class AnalysisSpec:
-    """Search controls that affect a cached position analysis."""
-
-    max_visits: int = 400
-    top_k: int = 5
-    pv_length: int = 12
-    force_refresh: bool = False
-
-    def __post_init__(self) -> None:
-        if type(self.max_visits) is not int or self.max_visits < 1:
-            raise ValueError("max_visits 必须是正整数")
-        if type(self.top_k) is not int or not 1 <= self.top_k <= 20:
-            raise ValueError("top_k 必须在 1 到 20 之间")
-        if type(self.pv_length) is not int or not 1 <= self.pv_length <= 64:
-            raise ValueError("pv_length 必须在 1 到 64 之间")
-        if type(self.force_refresh) is not bool:
-            raise ValueError("force_refresh 必须是布尔值")
-
-
-@dataclass(frozen=True)
-class VariationMove:
-    """A locally meaningful move; raw GTP vertices never cross the seam."""
-
-    kind: Literal["play", "pass"]
-    color: int
-    point: Optional[Point] = None
-
-    def __post_init__(self) -> None:
-        if self.color not in (BLACK, WHITE):
-            raise ValueError("color 必须是 BLACK 或 WHITE")
-        if self.kind == "pass":
-            if self.point is not None:
-                raise ValueError("虚手不能带坐标")
-        elif self.kind == "play":
-            if self.point is None:
-                raise ValueError("落子必须带坐标")
-        else:
-            raise ValueError("变化着只支持 play 或 pass")
-
-
-@dataclass(frozen=True)
-class CandidateAnalysis:
-    id: CandidateId
-    order: int
-    move: VariationMove
-    pv: tuple[VariationMove, ...]
-    black_winrate: float
-    black_score_lead: float
-    visits: int
-    prior: Optional[float]
-
-
-@dataclass(frozen=True)
-class PositionAnalysis:
-    node_id: NodeId
-    position_key: str
-    black_winrate: float
-    black_score_lead: float
-    visits: int
-    ownership: tuple[float, ...]
-    candidates: tuple[CandidateAnalysis, ...]
-    warnings: tuple[str, ...]
-    engine_fingerprint: str
-
-
-@dataclass(frozen=True)
-class HistoryPoint:
-    node_id: NodeId
-    ply: int
-    black_winrate: float
-    black_score_lead: float
-    visits: int
-    source: Literal["heuristic", "katago"]
-
-
-@dataclass(frozen=True)
-class HistorySeries:
-    formal: tuple[HistoryPoint, ...]
-    active: tuple[HistoryPoint, ...]
-
-
-@dataclass(frozen=True)
-class PositionView:
-    size: int
-    komi: float
-    board: BoardHash
-    current_player: int
-    move_number: int
-    last_move: Optional[Point]
-    black_captures: int
-    white_captures: int
-    game_over: bool
-
-
-@dataclass(frozen=True)
-class TreeNodeView:
-    id: NodeId
-    parent_id: Optional[NodeId]
-    incoming_move: Optional[VariationMove]
-    ply: int
-    is_formal: bool
-    is_selected: bool
-    has_analysis: bool
-    child_ids: tuple[NodeId, ...]
-
-
-@dataclass(frozen=True)
-class WorkbenchView:
-    revision: int
-    formal_tip_id: NodeId
-    selected_node_id: NodeId
-    position: PositionView
-    selected_analysis: Optional[PositionAnalysis]
-    tree: tuple[TreeNodeView, ...]
-    history: HistorySeries
-
-
-@dataclass(frozen=True)
-class SelectNode:
-    node_id: NodeId
-
-
-@dataclass(frozen=True)
-class FollowCandidate:
-    candidate_id: CandidateId
-    pv_plies: int = 1
-
-    def __post_init__(self) -> None:
-        if type(self.pv_plies) is not int or self.pv_plies < 1:
-            raise ValueError("pv_plies 必须是正整数")
-
-
-@dataclass(frozen=True)
-class PlayMove:
-    move: VariationMove
-
-
-@dataclass(frozen=True)
-class Back:
-    plies: int = 1
-
-    def __post_init__(self) -> None:
-        if type(self.plies) is not int or self.plies < 1:
-            raise ValueError("plies 必须是正整数")
-
-
-ExploreAction = Union[SelectNode, FollowCandidate, PlayMove, Back]
+from .analysis_model import (
+    AnalysisConfigurationError,
+    AnalysisEngineError,
+    AnalysisProtocolError,
+    AnalysisResponsePort,
+    AnalysisSpec,
+    AnalysisWorkbenchError,
+    Back,
+    CandidateAnalysis,
+    CandidateId,
+    ExploreAction,
+    FollowCandidate,
+    ForeignFormalGameError,
+    HistoryPoint,
+    HistorySeries,
+    IllegalVariationMove,
+    KataGoResponseAdapter,
+    NodeId,
+    PlayMove,
+    PositionAnalysis,
+    PositionView,
+    SelectNode,
+    StaleAnalysis,
+    TreeNodeView,
+    VariationMove,
+    WorkbenchStateError,
+    WorkbenchView,
+)
+from .analysis_parsing import ResponseParsing
+from .engine import BLACK, WHITE, GoGame, MoveRecord
 
 
 @dataclass
@@ -271,7 +66,7 @@ class _Node:
         self.children: dict[tuple[object, ...], NodeId] = {}
 
 
-class AnalysisWorkbench:
+class AnalysisWorkbench(ResponseParsing):
     """Own detached analysis state behind a three-entry-point interface."""
 
     def __init__(self, response_adapter: AnalysisResponsePort) -> None:
@@ -542,238 +337,9 @@ class AnalysisWorkbench:
         if not committed.legal:
             raise IllegalVariationMove(committed.reason or "该变化着不合法")
 
-    def _parse_analysis(
-        self,
-        node_id: NodeId,
-        game: GoGame,
-        position_key: str,
-        response: object,
-        top_k: int,
-    ) -> PositionAnalysis:
-        if not isinstance(response, Mapping):
-            raise AnalysisProtocolError("KataGo 分析响应必须是 JSON 对象")
-
-        root_info = response.get("rootInfo")
-        if not isinstance(root_info, Mapping):
-            raise AnalysisProtocolError("KataGo 响应缺少 rootInfo")
-        black_winrate = self._finite_number(
-            root_info.get("winrate"), "rootInfo.winrate", minimum=0.0, maximum=1.0
-        )
-        black_score_lead = self._finite_number(
-            root_info.get("scoreLead"), "rootInfo.scoreLead"
-        )
-        visits = self._nonnegative_integer(root_info.get("visits"), "rootInfo.visits")
-
-        current_player = root_info.get("currentPlayer")
-        if current_player is not None:
-            expected = "B" if game.current_player == BLACK else "W"
-            if str(current_player).upper() != expected:
-                raise AnalysisProtocolError(
-                    "rootInfo.currentPlayer 与本地当前行棋方不一致"
-                )
-
-        raw_ownership = response.get("ownership")
-        if not isinstance(raw_ownership, (list, tuple)):
-            raise AnalysisProtocolError("KataGo 响应缺少 ownership")
-        expected_ownership = game.size * game.size
-        if len(raw_ownership) != expected_ownership:
-            raise AnalysisProtocolError(
-                f"ownership 长度应为 {expected_ownership}，实际为 {len(raw_ownership)}"
-            )
-        ownership = tuple(
-            self._finite_number(value, f"ownership[{index}]", minimum=-1.0, maximum=1.0)
-            for index, value in enumerate(raw_ownership)
-        )
-
-        raw_move_infos = response.get("moveInfos")
-        if not isinstance(raw_move_infos, list) or not raw_move_infos:
-            raise AnalysisProtocolError("KataGo 响应缺少 moveInfos 候选着")
-        move_infos: list[Mapping[str, Any]] = []
-        for index, item in enumerate(raw_move_infos):
-            if not isinstance(item, Mapping):
-                raise AnalysisProtocolError(f"moveInfos[{index}] 必须是对象")
-            move_infos.append(item)
-        move_infos.sort(
-            key=lambda item: self._nonnegative_integer(
-                item.get("order"), "moveInfos.order"
-            )
-        )
-
-        warning_items: list[str] = []
-        raw_warnings = response.get("_warnings", ())
-        if isinstance(raw_warnings, str):
-            warning_items.append(raw_warnings)
-        elif isinstance(raw_warnings, (list, tuple)):
-            warning_items.extend(str(item) for item in raw_warnings if str(item))
-
-        candidates: list[CandidateAnalysis] = []
-        for info in move_infos:
-            try:
-                candidate, candidate_warnings = self._parse_candidate(
-                    node_id,
-                    game,
-                    info,
-                )
-            except IllegalVariationMove as error:
-                warning_items.append(f"忽略非法候选：{error}")
-                continue
-            candidates.append(candidate)
-            warning_items.extend(candidate_warnings)
-            if len(candidates) >= top_k:
-                break
-        if not candidates:
-            raise AnalysisProtocolError("KataGo 没有返回符合本地规则的合法候选着")
-
-        fingerprint = str(
-            response.get("engineFingerprint", type(self._response_adapter).__name__)
-        ).strip()
-        if not fingerprint:
-            fingerprint = type(self._response_adapter).__name__
-
-        return PositionAnalysis(
-            node_id=node_id,
-            position_key=position_key,
-            black_winrate=black_winrate,
-            black_score_lead=black_score_lead,
-            visits=visits,
-            ownership=ownership,
-            candidates=tuple(candidates),
-            warnings=tuple(dict.fromkeys(warning_items)),
-            engine_fingerprint=fingerprint,
-        )
-
-    def _parse_candidate(
-        self,
-        node_id: NodeId,
-        game: GoGame,
-        info: Mapping[str, Any],
-    ) -> tuple[CandidateAnalysis, list[str]]:
-        order = self._nonnegative_integer(info.get("order"), "moveInfos.order")
-        move = self._move_from_vertex(info.get("move"), game.current_player, game.size)
-        replay = game.clone()
-        self._apply_variation_move(replay, move)
-
-        raw_pv = info.get("pv", [])
-        if raw_pv is None:
-            raw_pv = []
-        if not isinstance(raw_pv, list):
-            raise AnalysisProtocolError(f"候选 {order} 的 pv 必须是数组")
-
-        warnings: list[str] = []
-        pv: list[VariationMove] = [move]
-        remaining_vertices = raw_pv
-        if raw_pv:
-            first = self._move_from_vertex(raw_pv[0], game.current_player, game.size)
-            if first != move:
-                raise AnalysisProtocolError(f"候选 {order} 的 pv 第一手与候选着不一致")
-            remaining_vertices = raw_pv[1:]
-
-        for ply_index, raw_vertex in enumerate(remaining_vertices, start=2):
-            pv_move = self._move_from_vertex(
-                raw_vertex,
-                replay.current_player,
-                replay.size,
-            )
-            try:
-                self._apply_variation_move(replay, pv_move)
-            except IllegalVariationMove as error:
-                warnings.append(
-                    f"候选 {order} 的 PV 在第 {ply_index} 手截断：{error}"
-                )
-                break
-            pv.append(pv_move)
-
-        black_winrate = self._finite_number(
-            info.get("winrate"),
-            f"moveInfos[{order}].winrate",
-            minimum=0.0,
-            maximum=1.0,
-        )
-        black_score_lead = self._finite_number(
-            info.get("scoreLead"), f"moveInfos[{order}].scoreLead"
-        )
-        visits = self._nonnegative_integer(
-            info.get("visits"), f"moveInfos[{order}].visits"
-        )
-        prior_value = info.get("prior")
-        prior = None
-        if prior_value is not None:
-            prior = self._finite_number(
-                prior_value,
-                f"moveInfos[{order}].prior",
-                minimum=0.0,
-                maximum=1.0,
-            )
-        candidate_id = CandidateId(f"{node_id}:{self._move_token(move)}")
-        return (
-            CandidateAnalysis(
-                id=candidate_id,
-                order=order,
-                move=move,
-                pv=tuple(pv),
-                black_winrate=black_winrate,
-                black_score_lead=black_score_lead,
-                visits=visits,
-                prior=prior,
-            ),
-            warnings,
-        )
-
-    @staticmethod
-    def _move_from_vertex(raw: object, color: int, size: int) -> VariationMove:
-        if not isinstance(raw, str) or not raw.strip():
-            raise AnalysisProtocolError("候选着坐标必须是非空字符串")
-        try:
-            point = vertex_to_point(raw, size)
-        except (TypeError, ValueError) as error:
-            raise AnalysisProtocolError(f"无法解析 KataGo 坐标 {raw!r}") from error
-        if point is None:
-            return VariationMove("pass", color)
-        return VariationMove("play", color, point)
-
-    @staticmethod
-    def _finite_number(
-        value: object,
-        field: str,
-        minimum: Optional[float] = None,
-        maximum: Optional[float] = None,
-    ) -> float:
-        if isinstance(value, bool):
-            raise AnalysisProtocolError(f"{field} 必须是有限数值")
-        try:
-            number = float(value)
-        except (TypeError, ValueError) as error:
-            raise AnalysisProtocolError(f"{field} 必须是有限数值") from error
-        if not math.isfinite(number):
-            raise AnalysisProtocolError(f"{field} 必须是有限数值")
-        if minimum is not None and number < minimum:
-            raise AnalysisProtocolError(f"{field} 不能小于 {minimum}")
-        if maximum is not None and number > maximum:
-            raise AnalysisProtocolError(f"{field} 不能大于 {maximum}")
-        return number
-
-    @staticmethod
-    def _nonnegative_integer(value: object, field: str) -> int:
-        if isinstance(value, bool):
-            raise AnalysisProtocolError(f"{field} 必须是非负整数")
-        try:
-            integer = int(value)
-        except (TypeError, ValueError) as error:
-            raise AnalysisProtocolError(f"{field} 必须是非负整数") from error
-        if integer < 0 or isinstance(value, float) and not value.is_integer():
-            raise AnalysisProtocolError(f"{field} 必须是非负整数")
-        return integer
-
     @staticmethod
     def _move_key(move: VariationMove) -> tuple[object, ...]:
         return move.kind, move.color, move.point
-
-    @staticmethod
-    def _move_token(move: VariationMove) -> str:
-        if move.kind == "pass":
-            return f"{move.color}:pass"
-        assert move.point is not None
-        return f"{move.color}:{move.point[0]},{move.point[1]}"
 
     @staticmethod
     def _variation_from_record(record: MoveRecord) -> VariationMove:
@@ -953,3 +519,34 @@ class AnalysisWorkbench:
                 break
             node_id = parent_id
         return list(reversed(reversed_path))
+
+
+__all__ = [
+    "AnalysisConfigurationError",
+    "AnalysisEngineError",
+    "AnalysisProtocolError",
+    "AnalysisResponsePort",
+    "AnalysisSpec",
+    "AnalysisWorkbench",
+    "AnalysisWorkbenchError",
+    "Back",
+    "CandidateAnalysis",
+    "CandidateId",
+    "ExploreAction",
+    "FollowCandidate",
+    "ForeignFormalGameError",
+    "HistoryPoint",
+    "HistorySeries",
+    "IllegalVariationMove",
+    "KataGoResponseAdapter",
+    "NodeId",
+    "PlayMove",
+    "PositionAnalysis",
+    "PositionView",
+    "SelectNode",
+    "StaleAnalysis",
+    "TreeNodeView",
+    "VariationMove",
+    "WorkbenchStateError",
+    "WorkbenchView",
+]
