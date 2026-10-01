@@ -29,10 +29,11 @@ class RuntimeTests(unittest.TestCase):
         return resolve_rl_training_config(overrides={
             "hardware": {"device": "cpu", "precision": "float32", "data_loader_workers": 0},
             "network": {"channels": 8, "residual_blocks": 1},
-            "search": {"simulations_per_move": 1, "dirichlet_epsilon": 0.0},
+            "search": {"simulations_per_move": 1, "dirichlet_epsilon": 0.0, "full_search_probability": 1.0},
             "self_play": {"games_per_iteration": 2},
             "optimizer": {"batch_size": 4, "minimum_replay_size": 1,
-                          "training_steps_per_iteration": 2, "use_board_symmetry_augmentation": False},
+                          "training_steps_per_iteration": 2, "use_board_symmetry_augmentation": False,
+                          "target_sample_reuse": None},
             "runtime": {"pause_while_game_is_active": False},
         })
 

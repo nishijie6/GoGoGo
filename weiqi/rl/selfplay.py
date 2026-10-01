@@ -13,7 +13,7 @@ import uuid
 
 import numpy as np
 
-from ..engine import BLACK
+from ..engine import BLACK, WHITE
 from ..rl_config import RLTrainingConfig
 from .search import choose_action, search
 from .state import Position
@@ -40,7 +40,8 @@ class GameResult:
     white_score: float
     moves: list[tuple[int, int]]
     seconds: float
-    examples: list[tuple[np.ndarray, np.ndarray, float]] = field(default_factory=list)
+    # (features, policy, value, ownership, score, aux_weight); see ReplayBuffer.
+    examples: list[tuple] = field(default_factory=list)
     opponent_name: str = ""
     opponent_sha256: str | None = None
 
@@ -84,9 +85,16 @@ def play_game(config, job, evaluate, *, training: bool, evaluate_batch=None) -> 
             config.search.simulations_per_move if training
             else config.evaluation.simulations_per_move
         )
+        # Playout cap randomization: cheap moves advance the game without noise
+        # and never become policy targets. Draw only when enabled so that the
+        # default keeps the exact random stream of the uncapped search.
+        full_search = (not training or config.search.full_search_probability >= 1
+                       or rng.random() < config.search.full_search_probability)
+        if not full_search:
+            simulations = min(simulations, config.search.fast_simulations_per_move)
         policy, value = search(
             state, evaluator, config.search, rng,
-            simulations=simulations, add_noise=training,
+            simulations=simulations, add_noise=training and full_search,
             evaluate_batch=batch_evaluator,
         )
         threshold = config.self_play.resign_threshold if training else None
@@ -94,7 +102,7 @@ def play_game(config, job, evaluate, *, training: bool, evaluate_batch=None) -> 
             state.game.resign()
             reason = "resign"
             break
-        if training:
+        if training and full_search:
             samples.append((state.features(), policy, color))
         temperature = (
             config.search.root_temperature
@@ -110,9 +118,17 @@ def play_game(config, job, evaluate, *, training: bool, evaluate_batch=None) -> 
     winner = state.game.winner if state.game.game_over else None
     examples = []
     if state.game.game_over:
+        # A resigned board was never played out, so it has no ownership/score target.
+        scored = reason == "two_passes"
+        area = config.game.board_size ** 2
+        owners = {color: (state.ownership_target(color) if scored else np.zeros(area, dtype=np.float32))
+                  for color in (BLACK, WHITE)}
+        black_margin = (score.black_total - score.white_total) / area
         for features, policy, color in samples:
             target = 0.0 if winner is None else (1.0 if color == winner else -1.0)
-            examples.append((features, policy, target))
+            margin = black_margin if color == BLACK else -black_margin
+            examples.append((features, policy, target, owners[color],
+                             margin if scored else 0.0, 1.0 if scored else 0.0))
     return GameResult(
         job.index, job.seed, job.candidate_color, winner, reason,
         score.black_total, score.white_total, moves, time.monotonic() - started, examples,

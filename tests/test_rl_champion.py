@@ -27,7 +27,7 @@ if AVAILABLE:
 class ChampionSelfPlayTests(unittest.TestCase):
     def test_training_pair_uses_a_frozen_champion_on_both_colors(self):
         config = resolve_rl_training_config(overrides={
-            "search": {"simulations_per_move": 1, "dirichlet_epsilon": 0.0},
+            "search": {"simulations_per_move": 1, "dirichlet_epsilon": 0.0, "full_search_probability": 1.0},
         })
         selected = []
 

@@ -44,10 +44,26 @@ class PolicyValueNet(nn.Module):
             nn.Linear(net.value_channels * size * size, net.value_hidden_size),
             nn.ReLU(), nn.Linear(net.value_hidden_size, 1), nn.Tanh(),
         )
+        self.auxiliary = net.auxiliary_heads
+        if self.auxiliary:
+            # Per-point final owner logits and the final area-score margin, both
+            # from the player to move; only training reads them.
+            self.ownership = nn.Conv2d(net.channels, 1, 1)
+            self.score = nn.Sequential(
+                nn.Conv2d(net.channels, net.value_channels, 1), nn.ReLU(), nn.Flatten(),
+                nn.Linear(net.value_channels * size * size, net.value_hidden_size),
+                nn.ReLU(), nn.Linear(net.value_hidden_size, 1),
+            )
 
-    def forward(self, inputs):
+    def forward(self, inputs, auxiliary: bool = False):
         features = self.trunk(inputs)
-        return self.policy(features), self.value(features).squeeze(-1)
+        policy, value = self.policy(features), self.value(features).squeeze(-1)
+        if not auxiliary:
+            return policy, value
+        if not self.auxiliary:
+            raise ValueError("This network was built without auxiliary heads")
+        return (policy, value, self.ownership(features).flatten(1),
+                self.score(features).squeeze(-1))
 
 
 class Runtime:

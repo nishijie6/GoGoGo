@@ -466,22 +466,15 @@ class GoGame:
                     continue
                 yield row, col
 
-    def calculate_score(self) -> ScoreResult:
-        """Score the current position with Chinese area scoring.
+    def area_ownership(self) -> list[list[int]]:
+        """Owner of every point under area scoring: BLACK, WHITE, or EMPTY (neutral).
 
-        Empty regions bordered by only one color count as that color's territory.
-        Empty regions touching both colors are neutral.  Players should capture
-        dead stones before passing because automatic life-and-death adjudication
-        is intentionally outside the scope of this local game.
+        Stones belong to their color; an empty region belongs to a color only
+        when every stone bordering it has that color.
         """
 
-        black_stones = sum(row.count(BLACK) for row in self.board)
-        white_stones = sum(row.count(WHITE) for row in self.board)
-        black_territory = 0
-        white_territory = 0
-        neutral_points = 0
+        owners = [row[:] for row in self.board]
         visited: set[Point] = set()
-
         for start_row in range(self.size):
             for start_col in range(self.size):
                 if self.board[start_row][start_col] != EMPTY:
@@ -505,12 +498,26 @@ class GoGame:
                         elif value in (BLACK, WHITE):
                             borders.add(value)
 
-                if borders == {BLACK}:
-                    black_territory += len(region)
-                elif borders == {WHITE}:
-                    white_territory += len(region)
-                else:
-                    neutral_points += len(region)
+                owner = borders.pop() if len(borders) == 1 else EMPTY
+                for row, col in region:
+                    owners[row][col] = owner
+        return owners
+
+    def calculate_score(self) -> ScoreResult:
+        """Score the current position with Chinese area scoring.
+
+        Empty regions bordered by only one color count as that color's territory.
+        Empty regions touching both colors are neutral.  Players should capture
+        dead stones before passing because automatic life-and-death adjudication
+        is intentionally outside the scope of this local game.
+        """
+
+        black_stones = sum(row.count(BLACK) for row in self.board)
+        white_stones = sum(row.count(WHITE) for row in self.board)
+        owners = self.area_ownership()
+        black_territory = sum(row.count(BLACK) for row in owners) - black_stones
+        white_territory = sum(row.count(WHITE) for row in owners) - white_stones
+        neutral_points = sum(row.count(EMPTY) for row in owners)
 
         black_total = float(black_stones + black_territory)
         white_total = float(white_stones + white_territory) + self.komi

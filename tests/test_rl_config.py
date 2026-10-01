@@ -27,8 +27,11 @@ class RLTrainingConfigTests(unittest.TestCase):
         self.assertEqual(config.self_play.workers, 2)
         self.assertEqual(config.self_play.champion_fraction, 0.25)
         self.assertEqual(config.self_play.milestone_fraction, 0.25)
-        self.assertEqual(config.evaluation.games, 40)
-        self.assertEqual(config.evaluation.promotion_test, "paired_sign")
+        self.assertEqual(config.evaluation.games, 80)
+        self.assertEqual(config.evaluation.promotion_test, "paired_sprt")
+        self.assertTrue(config.network.auxiliary_heads)
+        self.assertEqual(config.search.full_search_probability, 0.25)
+        self.assertEqual(config.optimizer.target_sample_reuse, 8.0)
         self.assertEqual(config.evaluation.confirmation_max_game_length_factor, 4.0)
         self.assertEqual(config.network.channels, 64)
         self.assertLessEqual(config.hardware.gpu_memory_fraction, 0.60)
@@ -53,6 +56,10 @@ class RLTrainingConfigTests(unittest.TestCase):
         self.assertGreater(high.optimizer.batch_size, balanced.optimizer.batch_size)
         self.assertEqual(high.self_play.milestone_fraction, 0.0)
         self.assertEqual(high.evaluation.promotion_test, "paired_hoeffding")
+        # The KataGo line already has its own playout cap and auxiliary heads.
+        self.assertFalse(high.network.auxiliary_heads)
+        self.assertEqual(high.search.full_search_probability, 1.0)
+        self.assertIsNone(high.optimizer.target_sample_reuse)
         self.assertGreater(
             high.hardware.gpu_memory_fraction,
             balanced.hardware.gpu_memory_fraction,

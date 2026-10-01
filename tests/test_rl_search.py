@@ -73,7 +73,9 @@ class SearchTests(unittest.TestCase):
         policy = np.full(82, 1 / 82, dtype=np.float32)
         replay.extend([(generator.random((20, 9, 9)).astype(np.float32), policy, 1.0)
                        for _ in range(10)])
-        features, policies, values = replay.sample(16)
+        features, policies, values, ownership, scores, weights = replay.sample(16)
+        self.assertEqual(tuple(ownership.shape), (16, 81))
+        self.assertEqual(float(weights.sum()), 0.0)  # legacy 3-tuples carry no aux targets
         self.assertEqual(tuple(features.shape), (16, 20, 9, 9))
         self.assertEqual(tuple(policies.shape), (16, 82))
         self.assertEqual(tuple(values.shape), (16,))
@@ -136,7 +138,7 @@ class SearchTests(unittest.TestCase):
 
     def test_real_two_pass_episode_labels_both_players_correctly(self):
         config = resolve_rl_training_config(overrides={
-            "search": {"simulations_per_move": 1, "dirichlet_epsilon": 0.0},
+            "search": {"simulations_per_move": 1, "dirichlet_epsilon": 0.0, "full_search_probability": 1.0},
         })
         game = play_game(config, GameJob(0, 3), lambda _, x: self.pass_evaluator(x), training=True)
         self.assertEqual(game.reason, "two_passes")
@@ -151,7 +153,7 @@ class SearchTests(unittest.TestCase):
 
     def test_move_limit_does_not_create_fake_winner_or_replay_targets(self):
         config = resolve_rl_training_config(overrides={
-            "search": {"simulations_per_move": 1, "dirichlet_epsilon": 0.0},
+            "search": {"simulations_per_move": 1, "dirichlet_epsilon": 0.0, "full_search_probability": 1.0},
             "self_play": {"max_game_length_factor": 1.0},
         })
         def no_pass(_, features):

@@ -27,14 +27,17 @@ def with_evaluation_overrides(config, path: Path):
 
 
 def with_training_policy(config, path: Path):
-    """Opt into opponent/promotion policy without changing model or replay settings."""
+    """Opt into data/opponent/promotion policy without changing the model architecture."""
     from weiqi.rl_config import resolve_rl_training_config
 
     changes = json.loads(path.read_text(encoding="utf-8"))
     allowed = {
-        "self_play": {"champion_fraction", "milestone_fraction"},
+        "search": {"full_search_probability", "fast_simulations_per_move"},
+        "self_play": {"champion_fraction", "milestone_fraction", "games_per_iteration"},
+        "optimizer": {"target_sample_reuse", "training_steps_per_iteration"},
         "evaluation": {"games", "promotion_win_rate", "promotion_test",
-                       "confirmation_max_game_length_factor", "confidence_level"},
+                       "confirmation_max_game_length_factor", "confidence_level",
+                       "sprt_alpha", "sprt_beta", "sprt_pair_win_rate", "sprt_batch_pairs"},
     }
     if not isinstance(changes, dict) or not changes:
         raise ValueError("Policy overrides must be a nonempty JSON object")

@@ -1,0 +1,13 @@
+{
+  "search": {
+    "full_search_probability": 0.25,
+    "fast_simulations_per_move": 16
+  },
+  "optimizer": {
+    "target_sample_reuse": 8.0
+  },
+  "evaluation": {
+    "games": 80,
+    "promotion_test": "paired_sprt"
+  }
+}

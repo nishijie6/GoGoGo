@@ -65,6 +65,13 @@ class Position:
         result[19] = self.legal[:-1].reshape(size, size)
         return result
 
+    def ownership_target(self, perspective: int) -> np.ndarray:
+        """Final area owner per intersection: +1 ``perspective``, -1 opponent, 0 neutral."""
+        owners = np.array(self.game.area_ownership(), dtype=np.int8).ravel()
+        other = WHITE if perspective == BLACK else BLACK
+        return ((owners == perspective).astype(np.float32)
+                - (owners == other).astype(np.float32))
+
     def terminal_value(self) -> float:
         if not self.game.game_over:
             raise ValueError("A value target requires a finished game")
@@ -86,21 +93,35 @@ def augment(features: np.ndarray, policy: np.ndarray, symmetry: int):
     return np.ascontiguousarray(features), np.ascontiguousarray(policy)
 
 
-def augment_batch(features: np.ndarray, policies: np.ndarray, symmetries: np.ndarray):
-    """Apply a per-row square symmetry to a batch; identical to row-wise ``augment``."""
+def augment_batch(features: np.ndarray, policies: np.ndarray, symmetries: np.ndarray,
+                  ownership: np.ndarray | None = None):
+    """Apply a per-row square symmetry to a batch; identical to row-wise ``augment``.
+
+    ``ownership`` rows (one value per intersection) follow the same symmetry and
+    are returned as a third array when given.
+    """
     features, policies = features.copy(), policies.copy()
+    if ownership is not None:
+        ownership = ownership.copy()
     for symmetry in np.unique(symmetries):
         rows = np.flatnonzero(symmetries == symmetry)
         features[rows], policies[rows] = _augment_rows(features[rows], policies[rows], int(symmetry))
-    return features, policies
+        if ownership is not None:
+            ownership[rows] = _transform_boards(ownership[rows], int(symmetry))
+    return (features, policies) if ownership is None else (features, policies, ownership)
+
+
+def _transform_boards(flat: np.ndarray, symmetry: int) -> np.ndarray:
+    size = int(round(flat.shape[-1] ** 0.5))
+    boards = flat.reshape(len(flat), size, size)
+    if symmetry >= 4:
+        boards = np.flip(boards, axis=-1)
+    return np.rot90(boards, symmetry % 4, axes=(-2, -1)).reshape(len(flat), -1)
 
 
 def _augment_rows(features: np.ndarray, policies: np.ndarray, symmetry: int):
-    size = features.shape[-1]
-    board = policies[:, :-1].reshape(len(policies), size, size)
     if symmetry >= 4:
         features = np.flip(features, axis=-1)
-        board = np.flip(board, axis=-1)
     features = np.rot90(features, symmetry % 4, axes=(-2, -1))
-    board = np.rot90(board, symmetry % 4, axes=(-2, -1))
-    return features, np.concatenate((board.reshape(len(policies), -1), policies[:, -1:]), axis=1)
+    board = _transform_boards(policies[:, :-1], symmetry)
+    return features, np.concatenate((board, policies[:, -1:]), axis=1)

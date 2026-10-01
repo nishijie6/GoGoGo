@@ -8,11 +8,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
 
 from ..fileio import atomic_open, atomic_write_json
 from ..rl_config import RL_CONFIG_VERSION, resolve_rl_training_config
-from .state import FEATURE_VERSION, INPUT_PLANES, augment, augment_batch
+from .state import FEATURE_VERSION, INPUT_PLANES, augment_batch
 
 
 CHECKPOINT_VERSION = 1
@@ -56,6 +55,9 @@ def checkpoint_config(payload: dict):
     evaluation.setdefault("promotion_test", "paired_hoeffding")
     evaluation.setdefault("confirmation_max_game_length_factor",
                           overrides["self_play"].get("max_game_length_factor", 2.5))
+    overrides.setdefault("network", {}).setdefault("auxiliary_heads", False)
+    overrides.setdefault("search", {}).setdefault("full_search_probability", 1.0)
+    overrides.setdefault("optimizer", {}).setdefault("target_sample_reuse", None)
     return resolve_rl_training_config(raw["preset"], overrides)
 
 
@@ -67,60 +69,94 @@ def load_checkpoint(path: Path):
     return payload, config
 
 
-class ReplayBuffer(Dataset):
+class ReplayBuffer:
+    """Training samples ``(features, policy, value, ownership, score, aux_weight)``.
+
+    ``aux_weight`` is 0 when a sample has no trustworthy final board (resigned
+    games, replays saved before auxiliary targets existed) so its ownership and
+    score rows are masked out of the loss.
+    """
+
     def __init__(self, capacity: int, size: int, use_symmetry: bool = True):
         self.capacity, self.size, self.use_symmetry = capacity, size, use_symmetry
-        self.samples: list[tuple[np.ndarray, np.ndarray, float]] = []
+        self.samples: list[tuple] = []
+
+    def _normalize(self, sample) -> tuple:
+        if len(sample) == 3:
+            features, policy, value = sample
+            return (features, policy, float(value),
+                    np.zeros(self.size ** 2, dtype=np.float32), 0.0, 0.0)
+        return tuple(sample)
 
     def extend(self, samples) -> None:
-        self.samples.extend(samples)
+        self.samples.extend(self._normalize(sample) for sample in samples)
         self.samples = self.samples[-self.capacity:]
 
     def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self, index):
-        features, policy, target = self.samples[index]
-        if self.use_symmetry:
-            features, policy = augment(features, policy, int(torch.randint(8, ()).item()))
-        return torch.from_numpy(features), torch.from_numpy(policy), torch.tensor(target, dtype=torch.float32)
-
     def sample(self, batch_size: int):
-        """Draw a batch with replacement in-process; no worker pickling of the pool."""
+        """Draw a batch with replacement in-process; no worker pickling of the pool.
+
+        Returns float32 tensors: features, policies, values, ownership, scores,
+        and auxiliary-target weights.
+        """
         indices = torch.randint(len(self.samples), (batch_size,)).tolist()
         rows = [self.samples[index] for index in indices]
         features = np.stack([row[0] for row in rows])
         policies = np.stack([row[1] for row in rows])
+        ownership = np.stack([row[3] for row in rows])
         if self.use_symmetry:
-            features, policies = augment_batch(
-                features, policies, torch.randint(8, (batch_size,)).numpy())
-        values = np.array([row[2] for row in rows], dtype=np.float32)
-        return (torch.from_numpy(np.ascontiguousarray(features)),
-                torch.from_numpy(np.ascontiguousarray(policies)), torch.from_numpy(values))
+            features, policies, ownership = augment_batch(
+                features, policies, torch.randint(8, (batch_size,)).numpy(), ownership)
+        columns = (features, policies, np.array([row[2] for row in rows], dtype=np.float32),
+                   ownership, np.array([row[4] for row in rows], dtype=np.float32),
+                   np.array([row[5] for row in rows], dtype=np.float32))
+        return tuple(torch.from_numpy(np.ascontiguousarray(column)) for column in columns)
 
     def state(self) -> dict:
+        area = self.size ** 2
         if not self.samples:
             return {"features": torch.empty((0, INPUT_PLANES, self.size, self.size)),
-                    "policies": torch.empty((0, self.size ** 2 + 1)), "values": torch.empty(0)}
+                    "policies": torch.empty((0, area + 1)), "values": torch.empty(0),
+                    "ownership": torch.empty((0, area)), "scores": torch.empty(0),
+                    "aux_weights": torch.empty(0)}
         return {
             "features": torch.from_numpy(np.stack([row[0] for row in self.samples])),
             "policies": torch.from_numpy(np.stack([row[1] for row in self.samples])),
             "values": torch.tensor([row[2] for row in self.samples], dtype=torch.float32),
+            "ownership": torch.from_numpy(np.stack([row[3] for row in self.samples])),
+            "scores": torch.tensor([row[4] for row in self.samples], dtype=torch.float32),
+            "aux_weights": torch.tensor([row[5] for row in self.samples], dtype=torch.float32),
         }
 
     def restore(self, state: dict) -> None:
         features, policies, values = (state[key].numpy() for key in ("features", "policies", "values"))
-        length = len(values)
+        length, area = len(values), self.size ** 2
+        if "ownership" in state:
+            ownership, scores, weights = (state[key].numpy()
+                                          for key in ("ownership", "scores", "aux_weights"))
+        else:
+            # Replays saved before auxiliary targets: keep them, but mask those heads.
+            ownership = np.zeros((length, area), dtype=np.float32)
+            scores = np.zeros(length, dtype=np.float32)
+            weights = np.zeros(length, dtype=np.float32)
+        arrays = (features, policies, values, ownership, scores, weights)
         if (features.shape != (length, INPUT_PLANES, self.size, self.size)
-                or policies.shape != (length, self.size ** 2 + 1) or values.shape != (length,)):
+                or policies.shape != (length, area + 1) or values.shape != (length,)
+                or ownership.shape != (length, area) or scores.shape != (length,)
+                or weights.shape != (length,)):
             raise ValueError("Checkpoint replay shapes are invalid")
-        if any(array.dtype != np.float32 for array in (features, policies, values)):
+        if any(array.dtype != np.float32 for array in arrays):
             raise ValueError("Checkpoint replay must use float32")
-        if not all(np.isfinite(array).all() for array in (features, policies, values)):
+        if not all(np.isfinite(array).all() for array in arrays):
             raise ValueError("Checkpoint replay contains non-finite values")
-        if (policies < 0).any() or not np.allclose(policies.sum(axis=1), 1, atol=1e-5) or (np.abs(values) > 1).any():
+        if ((policies < 0).any() or not np.allclose(policies.sum(axis=1), 1, atol=1e-5)
+                or (np.abs(values) > 1).any() or (np.abs(ownership) > 1).any()
+                or not np.isin(weights, (0.0, 1.0)).all()):
             raise ValueError("Checkpoint replay targets are invalid")
-        self.samples = list(zip(features, policies, values.tolist()))[-self.capacity:]
+        self.samples = list(zip(features, policies, values.tolist(), ownership,
+                                scores.tolist(), weights.tolist()))[-self.capacity:]
 
 
 def write_games(games, config, directory: Path) -> None:

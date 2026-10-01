@@ -68,10 +68,37 @@ def paired_sign_test(games, *, confidence: float = 0.95) -> dict:
             "wins": wins, "losses": losses, "ties": ties, "p_value": p_value}
 
 
+def paired_sprt(games, *, alpha: float, beta: float, pair_win_rate: float) -> dict:
+    """Wald's sequential test on decisive opening pairs (ties carry no evidence).
+
+    H0: the candidate wins half of the decisive pairs; H1: it wins
+    ``pair_win_rate`` of them.  The log-likelihood ratio may be checked after
+    every completed batch; stopping at a bound keeps error rates near
+    ``alpha``/``beta``, and running out of games is an inconclusive rejection.
+    """
+    if not (0 < alpha < 0.5 and 0 < beta < 0.5 and 0.5 < pair_win_rate < 1):
+        raise ValueError("SPRT needs 0 < alpha, beta < 0.5 and 0.5 < pair_win_rate < 1")
+    scores, incomplete = _pair_scores(games)
+    wins = sum(score > 0.5 for score in scores)
+    losses = sum(score < 0.5 for score in scores)
+    llr = (wins * math.log(pair_win_rate / 0.5)
+           + losses * math.log((1 - pair_win_rate) / 0.5))
+    upper = math.log((1 - beta) / alpha)
+    lower = math.log(beta / (1 - alpha))
+    decision = "accept" if llr >= upper else "reject" if llr <= lower else "continue"
+    return {"method": "paired_sprt", "alpha": alpha, "beta": beta,
+            "pair_win_rate": pair_win_rate, "complete_pairs": len(scores),
+            "truncated_pairs": incomplete, "wins": wins, "losses": losses,
+            "ties": len(scores) - wins - losses, "llr": llr,
+            "lower_bound": lower, "upper_bound": upper, "decision": decision}
+
+
 def confirmed_improvement(summary: dict, *, threshold: float,
                           method: str = "paired_hoeffding") -> bool:
     if summary["truncated"] or summary["score_rate"] < threshold:
         return False
+    if method == "paired_sprt":
+        return summary["paired_sprt"]["decision"] == "accept"
     if method == "paired_sign":
         sign = summary["paired_sign"]
         return bool(sign["complete_pairs"] > 0 and sign["wins"] > 0

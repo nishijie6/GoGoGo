@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import replace
+import math
 from pathlib import Path
 import time
 
@@ -17,7 +18,7 @@ from ..rl_config import RLTrainingConfig
 from .control import Progress, RunLock, TrainingControl
 from .eval_pool import evaluate_pool, save_anchor, select_anchors
 from .eval_quality import evaluate_positions
-from .eval_stats import confirmed_improvement, paired_confidence, paired_sign_test
+from .eval_stats import confirmed_improvement, paired_confidence, paired_sign_test, paired_sprt
 from .network import PolicyValueNet, Runtime
 from .selfplay import GameJob, evaluation_summary, run_games
 from .state import FEATURE_VERSION
@@ -48,6 +49,7 @@ class Trainer:
         self.replay = ReplayBuffer(config.optimizer.replay_buffer_capacity, config.game.board_size,
                                    config.optimizer.use_board_symmetry_augmentation)
         self.iteration = self.training_steps = self.best_iteration = 0
+        self.untrained_samples = 0
         if resume is not None:
             if resume.get("kind") != "training":
                 raise ValueError("Resume requires latest.pt or a full checkpoint, not a model export")
@@ -58,6 +60,7 @@ class Trainer:
             self.replay.restore(resume["replay"])
             self.iteration, self.training_steps = resume["iteration"], resume["training_steps"]
             self.best_iteration = resume["best_iteration"]
+            self.untrained_samples = resume.get("untrained_samples", 0)
             self.rng.bit_generator.state = resume["numpy_rng"]
             torch.set_rng_state(resume["torch_rng"])
             if self.runtime.device.type == "cuda" and resume["cuda_rng"]:
@@ -111,6 +114,7 @@ class Trainer:
             **self._base_payload(), "kind": "training", "model": cpu_state(self.model),
             "best_model": cpu_state(self.best), "optimizer": self.optimizer.state_dict(),
             "scaler": self.scaler.state_dict(), "replay": self.replay.state(),
+            "untrained_samples": self.untrained_samples,
             "numpy_rng": deepcopy(self.rng.bit_generator.state), "torch_rng": torch.get_rng_state(),
             "cuda_rng": torch.cuda.get_rng_state_all() if self.runtime.device.type == "cuda" else [],
         }
@@ -126,27 +130,48 @@ class Trainer:
             for old in older:
                 old.unlink()
 
+    def training_step_count(self) -> int:
+        """Fixed steps, or enough to draw each untrained sample ``target_sample_reuse`` times."""
+        optimizer = self.config.optimizer
+        if optimizer.target_sample_reuse is None:
+            return optimizer.training_steps_per_iteration
+        wanted = math.ceil(self.untrained_samples * optimizer.target_sample_reuse / optimizer.batch_size)
+        return max(1, min(optimizer.training_steps_per_iteration, wanted))
+
     def train_updates(self) -> dict:
         config = self.config
-        count = config.optimizer.training_steps_per_iteration
+        count = self.training_step_count()
+        auxiliary = self.model.auxiliary
         self.model.train()
         initial = next(self.model.parameters()).detach().clone()
         started = time.monotonic()
-        totals = np.zeros(3, dtype=np.float64)
+        totals = np.zeros(5, dtype=np.float64)
         updates = 0
         pin = config.hardware.pin_memory and self.runtime.device.type == "cuda"
         for step in range(1, count + 1):
             self.control()
             batch = self.replay.sample(config.optimizer.batch_size)
-            features, policies, values = (
+            features, policies, values, ownership, scores, aux_weights = (
                 (item.pin_memory() if pin else item).to(self.runtime.device, non_blocking=True)
                 for item in batch)
             self.optimizer.zero_grad(set_to_none=True)
             with self.runtime.autocast():
-                predicted_policy, predicted_value = self.training_model(features)
+                outputs = self.training_model(features, auxiliary=auxiliary)
+                predicted_policy, predicted_value = outputs[:2]
                 policy_loss = -(policies * F.log_softmax(predicted_policy.float(), dim=1)).sum(dim=1).mean()
                 value_loss = F.mse_loss(predicted_value.float(), values)
                 loss = policy_loss + value_loss
+                ownership_loss = score_loss = torch.zeros((), device=self.runtime.device)
+                if auxiliary:
+                    # Only played-out games carry ownership and score targets.
+                    weight_sum = aux_weights.sum().clamp(min=1.0)
+                    ownership_loss = (F.binary_cross_entropy_with_logits(
+                        outputs[2].float(), (ownership + 1) / 2, reduction="none",
+                    ).mean(dim=1) * aux_weights).sum() / weight_sum
+                    score_loss = (F.smooth_l1_loss(
+                        outputs[3].float(), scores, reduction="none") * aux_weights).sum() / weight_sum
+                    loss = (loss + config.optimizer.ownership_loss_weight * ownership_loss
+                            + config.optimizer.score_loss_weight * score_loss)
             if not torch.isfinite(loss).item():
                 raise RuntimeError("Non-finite training loss")
             self.scaler.scale(loss).backward()
@@ -162,17 +187,28 @@ class Trainer:
                 continue
             updates += 1
             self.training_steps += 1
-            totals += [loss.item(), policy_loss.item(), value_loss.item()]
+            losses = [loss.item(), policy_loss.item(), value_loss.item(),
+                      ownership_loss.item(), score_loss.item()]
+            totals += losses
             if step % config.runtime.log_every_training_steps == 0 or step == count:
-                self.progress({"event": "training_step", "step": step, "total": count,
-                               "training_steps": self.training_steps,
-                               "loss": loss.item(), "policy_loss": policy_loss.item(),
-                               "value_loss": value_loss.item()})
+                event = {"event": "training_step", "step": step, "total": count,
+                         "training_steps": self.training_steps,
+                         "loss": losses[0], "policy_loss": losses[1], "value_loss": losses[2]}
+                if auxiliary:
+                    event.update(ownership_loss=losses[3], score_loss=losses[4])
+                self.progress(event)
         if torch.equal(initial, next(self.model.parameters()).detach()):
             raise RuntimeError("Training completed without changing model weights")
-        return {"steps": updates, "attempts": count,
-                "loss": totals[0] / updates, "policy_loss": totals[1] / updates,
-                "value_loss": totals[2] / updates, "seconds": time.monotonic() - started,
+        new_samples, self.untrained_samples = self.untrained_samples, 0
+        result = {"steps": updates, "attempts": count,
+                  "loss": totals[0] / updates, "policy_loss": totals[1] / updates,
+                  "value_loss": totals[2] / updates, "seconds": time.monotonic() - started,
+                  "untrained_samples": new_samples,
+                  "sample_reuse": (count * config.optimizer.batch_size / new_samples
+                                   if new_samples else None)}
+        if auxiliary:
+            result.update(ownership_loss=totals[3] / updates, score_loss=totals[4] / updates)
+        return {**result,
                 "weights_updated": True}
 
     def evaluation_jobs(self, games: int | None = None) -> list[GameJob]:
@@ -237,6 +273,33 @@ class Trainer:
                                 opponent_sha256=learner_sha))
         return jobs, evaluators, champions
 
+    def sprt(self, results) -> dict:
+        evaluation = self.config.evaluation
+        return paired_sprt(results, alpha=evaluation.sprt_alpha, beta=evaluation.sprt_beta,
+                           pair_win_rate=evaluation.sprt_pair_win_rate)
+
+    def confirmation_games(self, config: RLTrainingConfig, metadata: dict) -> list:
+        """Play the promotion match; under SPRT stop at the first decisive batch.
+
+        All seeds are drawn up front, so a stopped match is a prefix of the
+        fixed-length one and stays reproducible.
+        """
+        jobs = self.evaluation_jobs()
+        evaluators = {0: self.runtime.evaluator(self.best), 1: self.runtime.evaluator(self.model)}
+        if config.evaluation.promotion_test != "paired_sprt":
+            return run_games(config, jobs, evaluators, training=False, check=self.control,
+                             progress=self.progress, metadata=metadata)
+        results = []
+        step = 2 * config.evaluation.sprt_batch_pairs
+        for start in range(0, len(jobs), step):
+            results += run_games(config, jobs[start:start + step], evaluators, training=False,
+                                 check=self.control, progress=self.progress, metadata=metadata)
+            test = self.sprt(results)
+            # A truncated pair already fails promotion; more games cannot fix it.
+            if test["decision"] != "continue" or test["truncated_pairs"]:
+                break
+        return results
+
     def run_iteration(self) -> dict:
         config, number = self.config, self.iteration + 1
         directory = self.output / "iterations" / f"{number:06d}"
@@ -261,6 +324,7 @@ class Trainer:
         write_games(games, config, directory / "selfplay")
         for game in games:
             self.replay.extend(game.examples)
+            self.untrained_samples += len(game.examples)
         opponent_rows = {}
         for game in games:
             name = game.opponent_name or "candidate_self"
@@ -355,18 +419,15 @@ class Trainer:
                     config, self_play=replace(
                         config.self_play,
                         max_game_length_factor=config.evaluation.confirmation_max_game_length_factor))
-                results = run_games(
-                    confirmation_config, self.evaluation_jobs(),
-                    {0: self.runtime.evaluator(self.best), 1: self.runtime.evaluator(self.model)},
-                    training=False, check=self.control, progress=self.progress,
-                    metadata=match_metadata,
-                )
+                results = self.confirmation_games(confirmation_config, match_metadata)
                 write_games(results, confirmation_config, directory / "evaluation")
                 summary["evaluation"] = {
                     **match_metadata,
                     **evaluation_summary(results),
                     "paired": paired_confidence(results, confidence=config.evaluation.confidence_level),
                     "paired_sign": paired_sign_test(results, confidence=config.evaluation.confidence_level),
+                    "paired_sprt": self.sprt(results),
+                    "planned_games": config.evaluation.games,
                     "promotion_test": config.evaluation.promotion_test,
                     "max_game_length_factor": config.evaluation.confirmation_max_game_length_factor,
                     "simulations_per_move": config.evaluation.simulations_per_move,
