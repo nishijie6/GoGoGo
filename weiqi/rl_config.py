@@ -463,7 +463,18 @@ def _build_config(preset: str, data: Mapping[str, Any]) -> RLTrainingConfig:
 
 
 def _validate_config(config: RLTrainingConfig) -> None:
-    game = config.game
+    # Sections are checked in this order, so the first reported error is stable.
+    _validate_game(config.game)
+    _validate_hardware(config.hardware)
+    _validate_network(config.network)
+    _validate_search(config.search)
+    _validate_self_play(config.self_play)
+    _validate_optimizer(config.optimizer)
+    _validate_evaluation(config.evaluation, config.game.board_size)
+    _validate_runtime(config.runtime)
+
+
+def _validate_game(game: GameTrainingConfig) -> None:
     _require_int("game.board_size", game.board_size, 1)
     if game.board_size not in (9, 13, 19):
         raise _config_error("game.board_size", "目前只支持 9、13 或 19")
@@ -481,7 +492,8 @@ def _validate_config(config: RLTrainingConfig) -> None:
     if game.allow_suicide:
         raise _config_error("game.allow_suicide", "当前规则引擎禁止自杀")
 
-    hardware = config.hardware
+
+def _validate_hardware(hardware: HardwareTrainingConfig) -> None:
     if not isinstance(hardware.device, str) or not re.fullmatch(
         r"(?:auto|cpu|mps|cuda(?::\d+)?)",
         hardware.device,
@@ -510,7 +522,8 @@ def _validate_config(config: RLTrainingConfig) -> None:
     _require_int("hardware.data_loader_workers", hardware.data_loader_workers)
     _require_bool("hardware.pin_memory", hardware.pin_memory)
 
-    network = config.network
+
+def _validate_network(network: NetworkTrainingConfig) -> None:
     for name, value in (
         ("channels", network.channels),
         ("policy_channels", network.policy_channels),
@@ -523,7 +536,8 @@ def _validate_config(config: RLTrainingConfig) -> None:
     _require_int("network.residual_blocks", network.residual_blocks, 1)
     _require_bool("network.auxiliary_heads", network.auxiliary_heads)
 
-    search = config.search
+
+def _validate_search(search: SearchTrainingConfig) -> None:
     _require_int("search.simulations_per_move", search.simulations_per_move, 1)
     _require_int("search.leaf_batch_size", search.leaf_batch_size, 1)
     _require_positive_number("search.c_puct", search.c_puct)
@@ -541,7 +555,8 @@ def _validate_config(config: RLTrainingConfig) -> None:
     # and smoke budgets need not restate the fast budget.
     _require_int("search.fast_simulations_per_move", search.fast_simulations_per_move, 1)
 
-    self_play = config.self_play
+
+def _validate_self_play(self_play: SelfPlayTrainingConfig) -> None:
     _require_int("self_play.workers", self_play.workers, 1)
     _require_int("self_play.games_per_iteration", self_play.games_per_iteration, 1)
     _require_int("self_play.inference_batch_size", self_play.inference_batch_size, 1)
@@ -566,7 +581,8 @@ def _validate_config(config: RLTrainingConfig) -> None:
             )
     _require_int("self_play.resign_min_move", self_play.resign_min_move)
 
-    optimizer = config.optimizer
+
+def _validate_optimizer(optimizer: OptimizerTrainingConfig) -> None:
     _require_int("optimizer.batch_size", optimizer.batch_size, 1)
     _require_int(
         "optimizer.replay_buffer_capacity",
@@ -610,7 +626,8 @@ def _validate_config(config: RLTrainingConfig) -> None:
         if _require_number(f"optimizer.{name}", getattr(optimizer, name)) < 0:
             raise _config_error(f"optimizer.{name}", "不能小于 0")
 
-    evaluation = config.evaluation
+
+def _validate_evaluation(evaluation: EvaluationTrainingConfig, board_size: int) -> None:
     _require_int("evaluation.games", evaluation.games, 2)
     if evaluation.games % 2:
         raise _config_error("evaluation.games", "必须是偶数，便于双方交换黑白")
@@ -655,10 +672,11 @@ def _validate_config(config: RLTrainingConfig) -> None:
             raise _config_error(f"evaluation.{name}", "必须是有效路径字符串")
     if bool(evaluation.position_suite_path) != bool(evaluation.teacher_labels_path):
         raise _config_error("evaluation", "固定局面与 KataGo 标注必须同时设置或同时留空")
-    if game.board_size != 9 and evaluation.position_suite_path:
+    if board_size != 9 and evaluation.position_suite_path:
         raise _config_error("evaluation.position_suite_path", "当前固定局面评测只支持 9×9")
 
-    runtime = config.runtime
+
+def _validate_runtime(runtime: RuntimeTrainingConfig) -> None:
     _require_bool(
         "runtime.pause_while_game_is_active",
         runtime.pause_while_game_is_active,
@@ -682,7 +700,6 @@ def _validate_config(config: RLTrainingConfig) -> None:
     if "\x00" in runtime.output_directory:
         raise _config_error("runtime.output_directory", "不能包含空字符")
     _require_int("runtime.random_seed", runtime.random_seed)
-
 
 def resolve_rl_training_config(
     preset: str = DEFAULT_RL_PRESET,
