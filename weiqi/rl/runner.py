@@ -145,7 +145,11 @@ class Trainer:
         self.model.train()
         initial = next(self.model.parameters()).detach().clone()
         started = time.monotonic()
-        totals = np.zeros(5, dtype=np.float64)
+        # Loss sums stay on the device so a step needs no host round trip just
+        # to log; float64 matches summing the per-step Python floats exactly.
+        device = self.runtime.device
+        totals = torch.zeros(5, dtype=torch.float32 if device.type == "mps" else torch.float64,
+                             device=device)
         updates = 0
         pin = config.hardware.pin_memory and self.runtime.device.type == "cuda"
         for step in range(1, count + 1):
@@ -172,12 +176,17 @@ class Trainer:
                         outputs[3].float(), scores, reduction="none") * aux_weights).sum() / weight_sum
                     loss = (loss + config.optimizer.ownership_loss_weight * ownership_loss
                             + config.optimizer.score_loss_weight * score_loss)
-            if not torch.isfinite(loss).item():
-                raise RuntimeError("Non-finite training loss")
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), config.optimizer.gradient_clip_norm,
-                                           error_if_nonfinite=not self.scaler.is_enabled())
+            norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(),
+                                                  config.optimizer.gradient_clip_norm)
+            # The step's single host sync: never apply a non-finite loss, nor (without
+            # AMP, whose scaler skips overflowing steps itself) a non-finite gradient.
+            finite = torch.isfinite(loss)
+            if not self.scaler.is_enabled():
+                finite = finite & torch.isfinite(norm)
+            if not finite.item():
+                raise RuntimeError("Non-finite training loss or gradient norm")
             previous_scale = self.scaler.get_scale()
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -187,10 +196,11 @@ class Trainer:
                 continue
             updates += 1
             self.training_steps += 1
-            losses = [loss.item(), policy_loss.item(), value_loss.item(),
-                      ownership_loss.item(), score_loss.item()]
-            totals += losses
+            step_losses = torch.stack([loss, policy_loss, value_loss,
+                                       ownership_loss, score_loss]).detach()
+            totals += step_losses
             if step % config.runtime.log_every_training_steps == 0 or step == count:
+                losses = step_losses.tolist()
                 event = {"event": "training_step", "step": step, "total": count,
                          "training_steps": self.training_steps,
                          "loss": losses[0], "policy_loss": losses[1], "value_loss": losses[2]}
@@ -200,6 +210,7 @@ class Trainer:
         if torch.equal(initial, next(self.model.parameters()).detach()):
             raise RuntimeError("Training completed without changing model weights")
         new_samples, self.untrained_samples = self.untrained_samples, 0
+        totals = totals.tolist()
         result = {"steps": updates, "attempts": count,
                   "loss": totals[0] / updates, "policy_loss": totals[1] / updates,
                   "value_loss": totals[2] / updates, "seconds": time.monotonic() - started,
