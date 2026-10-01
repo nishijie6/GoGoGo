@@ -201,6 +201,17 @@ def ensure_evaluation_opening_suite(
     return tuple(suite_root / f"opening-{index:03d}" for index in range(opening_count))
 
 
+@dataclass
+class _MigrationAttempt:
+    """How far one migration run got; decides retry, failure or fail-closed on error."""
+
+    target_preexisting: bool
+    source_stage_index: int
+    target_identity_confirmed: bool = False
+    target_published: bool = False
+    committed: bool = False
+
+
 class CurriculumRuntime:
     """Execute the persistent 9x9 -> 13x13 -> 19x19 curriculum.
 
@@ -811,18 +822,22 @@ class CurriculumRuntime:
         print(f"迁移暂时无法完成，将保留身份后重试：{message}", file=sys.stderr, flush=True)
 
     def _migrate(self, state: CurriculumState) -> None:
+        """Seed the next board size from the latest accepted model, crash-safely.
+
+        A migration has a durable identity (source model, checkpoint hash and
+        target board). The target tree is built in a temporary directory and
+        renamed into place with a manifest carrying that identity, so a run
+        that crashes anywhere can either adopt the exact published tree or
+        retry without touching a directory it cannot prove it owns.
+        """
         if state.active_stage_index >= len(self.config.stages) - 1:
             state.phase = "training"
             self.store.save(state)
             return
         current_runner = self._stage_runner(state)
-        source_model = state.active.latest_model
-        if not source_model:
-            self.controller.migration_failed(state, "迁移前缺少最新模型")
+        source_model = self._protected_source_model(state)
+        if source_model is None:
             return
-        if source_model not in state.protected_models:
-            state.protected_models.append(source_model)
-            self.store.save(state)
         target_stage = self.config.stages[state.active_stage_index + 1]
         target_runner = self._make_runner(target_stage)
         target_root = target_runner.run_root
@@ -837,9 +852,68 @@ class CurriculumRuntime:
                 state, f"找不到最新接纳模型的 SWA 检查点：{source_checkpoint}"
             )
             return
+        source_sha256 = self._migration_source_hash(state, source_checkpoint)
+        if source_sha256 is None:
+            return
+        identity = {
+            "source_model": source_model,
+            "source_checkpoint": str(source_checkpoint.resolve()),
+            "source_sha256": source_sha256,
+            "target_board_size": target_stage.board_size,
+            "seed_model": "gogogo-s0-d0",
+        }
+        if not self._claim_migration_identity(state, identity, target_root):
+            return
 
+        attempt = _MigrationAttempt(target_preexisting=target_root.exists(),
+                                    source_stage_index=state.active_stage_index)
         try:
-            source_sha256 = sha256_file(source_checkpoint)
+            target_lock = (
+                target_runner.lock() if attempt.target_preexisting else contextlib.nullcontext()
+            )
+            with target_lock:
+                if attempt.target_preexisting:
+                    selected_batch, warning = self._adopt_published_target(
+                        state, target_root, target_runner, attempt), None
+                else:
+                    selected_batch, warning = self._publish_migration_target(
+                        state, target_stage, target_root, target_runner,
+                        source_checkpoint, attempt)
+                self.controller.complete_migration(
+                    state,
+                    seed_model="gogogo-s0-d0",
+                    autotune_batch=selected_batch,
+                )
+                attempt.committed = True
+            if warning:
+                state.warnings.append(
+                    {"timestamp": local_timestamp(), "kind": "autotune", "message": warning}
+                )
+                self.store.save(state)
+            print(
+                f"课程已切换到 {target_stage.board_size}x{target_stage.board_size}，训练批次 {selected_batch}",
+                flush=True,
+            )
+        except Exception as error:
+            self._recover_failed_migration(state, error, attempt)
+
+    def _protected_source_model(self, state: CurriculumState) -> Optional[str]:
+        """The latest accepted model, pinned against cleanup; None after recording why not."""
+        source_model = state.active.latest_model
+        if not source_model:
+            self.controller.migration_failed(state, "迁移前缺少最新模型")
+            return None
+        if source_model not in state.protected_models:
+            state.protected_models.append(source_model)
+            self.store.save(state)
+        return source_model
+
+    def _migration_source_hash(
+        self, state: CurriculumState, source_checkpoint: Path
+    ) -> Optional[str]:
+        """Hash the source; an unreadable file postpones rather than fails the migration."""
+        try:
+            return sha256_file(source_checkpoint)
         except OSError as error:
             if state.phase == "migrating" and state.migration:
                 self._record_migration_retry(state, str(error))
@@ -857,15 +931,12 @@ class CurriculumRuntime:
                     file=sys.stderr,
                     flush=True,
                 )
-            return
+            return None
 
-        identity = {
-            "source_model": source_model,
-            "source_checkpoint": str(source_checkpoint.resolve()),
-            "source_sha256": source_sha256,
-            "target_board_size": target_stage.board_size,
-            "seed_model": "gogogo-s0-d0",
-        }
+    def _claim_migration_identity(
+        self, state: CurriculumState, identity: Mapping[str, object], target_root: Path
+    ) -> bool:
+        """Start a new migration or confirm the persisted one is the same transition."""
         if state.phase == "transition_ready":
             state.migration = {
                 "id": uuid.uuid4().hex,
@@ -874,194 +945,188 @@ class CurriculumRuntime:
             }
             self.store.save(state)
             self.controller.begin_migration(state)
-        elif state.phase == "migrating":
-            if not state.migration:
-                # Backward-compatible recovery is safe only before a target
-                # directory has become visible.  A visible directory without
-                # an identity manifest could belong to another transition.
-                if target_root.exists():
-                    self.controller.migration_failed(
-                        state,
-                        f"目标目录缺少迁移身份，拒绝触碰现有目录：{target_root}",
-                    )
-                    return
-                state.migration = {
-                    "id": uuid.uuid4().hex,
-                    **identity,
-                    "started_at": local_timestamp(),
-                }
-                self.store.save(state)
-            elif (
-                not isinstance(state.migration.get("id"), str)
-                or any(state.migration.get(key) != value for key, value in identity.items())
-            ):
-                suffix = ""
-                if target_root.exists():
-                    suffix = f"；未触碰现有目标目录 {target_root}"
-                self.controller.migration_failed(
-                    state, f"迁移源检查点或目标阶段已变化，拒绝继续旧迁移{suffix}"
-                )
-                return
-        else:
+            return True
+        if state.phase != "migrating":
             raise CurriculumStateError(f"当前 phase={state.phase}，不能迁移")
-
-        selected_batch: Optional[int] = None
-        warning: Optional[str] = None
-        target_preexisting = target_root.exists()
-        target_identity_confirmed = False
-        target_published = False
-        migration_committed = False
-        source_stage_index = state.active_stage_index
-        try:
-            target_lock = (
-                target_runner.lock() if target_preexisting else contextlib.nullcontext()
-            )
-            with target_lock:
-                if target_preexisting:
-                    if not target_root.exists():
-                        raise CurriculumMigrationError("目标阶段目录在加锁期间消失")
-                # Recovery for a crash after the atomic directory rename but
-                # before complete_migration() persisted the new active stage.
-                    checkpoint = target_root / "train" / "gogogo" / "checkpoint.ckpt"
-                    model = target_root / "models" / "gogogo-s0-d0" / "model.bin.gz"
-                    selected_batch = self._read_selected_batch(
-                        target_root / "autotune.json"
-                    )
-                    manifest_path = target_root / "migration_manifest.json"
-                    try:
-                        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                    except (FileNotFoundError, json.JSONDecodeError):
-                        manifest = None
-                    manifest_matches = isinstance(manifest, dict) and all(
-                        manifest.get(key) == value
-                        for key, value in state.migration.items()
-                    )
-                    if isinstance(manifest, dict):
-                        manifest_matches = manifest_matches and (
-                            manifest.get("selected_batch_size") == selected_batch
-                        )
-                    if (
-                        not checkpoint.is_file()
-                        or not model.is_file()
-                        or selected_batch is None
-                        or not manifest_matches
-                        or manifest.get("seed_checkpoint_sha256")
-                        != sha256_file(checkpoint)
-                    ):
-                        raise CurriculumMigrationError(
-                            f"已存在目标目录不完整或不属于当前迁移；拒绝触碰 {target_root}"
-                        )
-                    target_identity_confirmed = True
-                    verify_checkpoint_loads(
-                        checkpoint,
-                        boards=(9, 13, 19),
-                        python_source=target_runner.python_source,
-                    )
-                else:
-                    if target_root.exists():
-                        raise CurriculumMigrationError(
-                            f"目标目录在迁移准备期间被其他进程创建：{target_root}"
-                        )
-                    check_result: dict[str, object] = {}
-
-                    def verify(checkpoint: Path, _board: int) -> None:
-                        verify_checkpoint_loads(
-                            checkpoint,
-                            boards=(9, 13, 19),
-                            python_source=target_runner.python_source,
-                        )
-
-                    def smoke(root: Path, checkpoint: Path, _board: int) -> None:
-                        batch, tune_warning = self._migration_checks(
-                            target_stage, root, checkpoint
-                        )
-                        atomic_write_json(
-                            root / "migration_manifest.json",
-                            {
-                                **state.migration,
-                                "selected_batch_size": batch,
-                                "seed_checkpoint_sha256": sha256_file(checkpoint),
-                                "completed_at": local_timestamp(),
-                            },
-                        )
-                        check_result["batch"] = batch
-                        check_result["warning"] = tune_warning
-
-                    prepare_stage_migration(
-                        source_checkpoint=source_checkpoint,
-                        target_stage_root=target_root,
-                        target_board_size=target_stage.board_size,
-                        load_verifier=verify,
-                        smoke_verifier=smoke,
-                        seed_name="gogogo-s0-d0",
-                    )
-                    # From this point the verified tree and its identity
-                    # manifest are atomically visible.  A later state-save
-                    # failure must retain this migration identity so the next
-                    # run can adopt that exact tree instead of orphaning it.
-                    target_published = True
-                    selected_batch = int(check_result["batch"])
-                    warning_value = check_result.get("warning")
-                    warning = str(warning_value) if warning_value else None
-                self.controller.complete_migration(
+        if not state.migration:
+            # Backward-compatible recovery is safe only before a target
+            # directory has become visible.  A visible directory without
+            # an identity manifest could belong to another transition.
+            if target_root.exists():
+                self.controller.migration_failed(
                     state,
-                    seed_model="gogogo-s0-d0",
-                    autotune_batch=selected_batch,
+                    f"目标目录缺少迁移身份，拒绝触碰现有目录：{target_root}",
                 )
-                migration_committed = True
-            if warning:
-                state.warnings.append(
-                    {"timestamp": local_timestamp(), "kind": "autotune", "message": warning}
-                )
-                self.store.save(state)
-            print(
-                f"课程已切换到 {target_stage.board_size}x{target_stage.board_size}，训练批次 {selected_batch}",
-                flush=True,
+                return False
+            state.migration = {
+                "id": uuid.uuid4().hex,
+                **identity,
+                "started_at": local_timestamp(),
+            }
+            self.store.save(state)
+            return True
+        if (
+            not isinstance(state.migration.get("id"), str)
+            or any(state.migration.get(key) != value for key, value in identity.items())
+        ):
+            suffix = ""
+            if target_root.exists():
+                suffix = f"；未触碰现有目标目录 {target_root}"
+            self.controller.migration_failed(
+                state, f"迁移源检查点或目标阶段已变化，拒绝继续旧迁移{suffix}"
             )
-        except Exception as error:
-            # If complete_migration's atomic save returned an error after the
-            # replacement, trust the durable state instead of the mutated
-            # in-memory object.
-            try:
-                persisted = self.store.load()
-                if persisted is not None:
-                    state.__dict__.update(persisted.__dict__)
-                    migration_committed = (
-                        persisted.active_stage_index > source_stage_index
-                    )
-            except (CurriculumStateError, OSError) as reload_error:
-                if target_published or target_preexisting:
-                    # The target is visible but we cannot tell whether the
-                    # atomic state replacement committed.  Any write here
-                    # could regress a successfully committed migration or
-                    # persist a half-mutated object, so fail closed and let a
-                    # fresh process read the durable state.
-                    raise CurriculumStateError(
-                        "迁移目标已发布，但无法确认课程状态提交结果；拒绝继续写状态"
-                    ) from reload_error
-            if migration_committed:
-                state.warnings.append(
-                    {
-                        "timestamp": local_timestamp(),
-                        "kind": "migration_artifact",
-                        "message": f"迁移状态已提交，但后续记录失败：{error}",
-                    }
+            return False
+        return True
+
+    def _adopt_published_target(
+        self,
+        state: CurriculumState,
+        target_root: Path,
+        target_runner: KataGoRLRunner,
+        attempt: "_MigrationAttempt",
+    ) -> int:
+        """Reuse a tree published before a crash; its manifest must prove it is ours."""
+        if not target_root.exists():
+            raise CurriculumMigrationError("目标阶段目录在加锁期间消失")
+        # Recovery for a crash after the atomic directory rename but
+        # before complete_migration() persisted the new active stage.
+        checkpoint = target_root / "train" / "gogogo" / "checkpoint.ckpt"
+        model = target_root / "models" / "gogogo-s0-d0" / "model.bin.gz"
+        selected_batch = self._read_selected_batch(target_root / "autotune.json")
+        manifest_path = target_root / "migration_manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            manifest = None
+        manifest_matches = isinstance(manifest, dict) and all(
+            manifest.get(key) == value
+            for key, value in state.migration.items()
+        )
+        if isinstance(manifest, dict):
+            manifest_matches = manifest_matches and (
+                manifest.get("selected_batch_size") == selected_batch
+            )
+        if (
+            not checkpoint.is_file()
+            or not model.is_file()
+            or selected_batch is None
+            or not manifest_matches
+            or manifest.get("seed_checkpoint_sha256")
+            != sha256_file(checkpoint)
+        ):
+            raise CurriculumMigrationError(
+                f"已存在目标目录不完整或不属于当前迁移；拒绝触碰 {target_root}"
+            )
+        attempt.target_identity_confirmed = True
+        verify_checkpoint_loads(
+            checkpoint,
+            boards=(9, 13, 19),
+            python_source=target_runner.python_source,
+        )
+        return selected_batch
+
+    def _publish_migration_target(
+        self,
+        state: CurriculumState,
+        target_stage: CurriculumStage,
+        target_root: Path,
+        target_runner: KataGoRLRunner,
+        source_checkpoint: Path,
+        attempt: "_MigrationAttempt",
+    ) -> tuple[int, Optional[str]]:
+        """Build, verify and atomically publish the target tree; return (batch, warning)."""
+        if target_root.exists():
+            raise CurriculumMigrationError(
+                f"目标目录在迁移准备期间被其他进程创建：{target_root}"
+            )
+        check_result: dict[str, object] = {}
+
+        def verify(checkpoint: Path, _board: int) -> None:
+            verify_checkpoint_loads(
+                checkpoint,
+                boards=(9, 13, 19),
+                python_source=target_runner.python_source,
+            )
+
+        def smoke(root: Path, checkpoint: Path, _board: int) -> None:
+            batch, tune_warning = self._migration_checks(
+                target_stage, root, checkpoint
+            )
+            atomic_write_json(
+                root / "migration_manifest.json",
+                {
+                    **state.migration,
+                    "selected_batch_size": batch,
+                    "seed_checkpoint_sha256": sha256_file(checkpoint),
+                    "completed_at": local_timestamp(),
+                },
+            )
+            check_result["batch"] = batch
+            check_result["warning"] = tune_warning
+
+        prepare_stage_migration(
+            source_checkpoint=source_checkpoint,
+            target_stage_root=target_root,
+            target_board_size=target_stage.board_size,
+            load_verifier=verify,
+            smoke_verifier=smoke,
+            seed_name="gogogo-s0-d0",
+        )
+        # From this point the verified tree and its identity
+        # manifest are atomically visible.  A later state-save
+        # failure must retain this migration identity so the next
+        # run can adopt that exact tree instead of orphaning it.
+        attempt.target_published = True
+        warning_value = check_result.get("warning")
+        return int(check_result["batch"]), str(warning_value) if warning_value else None
+
+    def _recover_failed_migration(
+        self, state: CurriculumState, error: Exception, attempt: "_MigrationAttempt"
+    ) -> None:
+        """Record a failure without regressing a commit or orphaning a published tree."""
+        # If complete_migration's atomic save returned an error after the
+        # replacement, trust the durable state instead of the mutated
+        # in-memory object.
+        try:
+            persisted = self.store.load()
+            if persisted is not None:
+                state.__dict__.update(persisted.__dict__)
+                attempt.committed = (
+                    persisted.active_stage_index > attempt.source_stage_index
                 )
-                self.store.save(state)
-                print(
-                    f"迁移已提交；后续记录失败：{error}", file=sys.stderr, flush=True
-                )
-            elif target_published or (
-                target_preexisting
-                and (
-                    isinstance(error, (KataGoRLRunnerError, OSError))
-                    or target_identity_confirmed
-                )
-            ):
-                self._record_migration_retry(state, str(error))
-            else:
-                self.controller.migration_failed(state, str(error))
-                print(f"迁移失败，继续旧棋盘：{error}", file=sys.stderr, flush=True)
+        except (CurriculumStateError, OSError) as reload_error:
+            if attempt.target_published or attempt.target_preexisting:
+                # The target is visible but we cannot tell whether the
+                # atomic state replacement committed.  Any write here
+                # could regress a successfully committed migration or
+                # persist a half-mutated object, so fail closed and let a
+                # fresh process read the durable state.
+                raise CurriculumStateError(
+                    "迁移目标已发布，但无法确认课程状态提交结果；拒绝继续写状态"
+                ) from reload_error
+        if attempt.committed:
+            state.warnings.append(
+                {
+                    "timestamp": local_timestamp(),
+                    "kind": "migration_artifact",
+                    "message": f"迁移状态已提交，但后续记录失败：{error}",
+                }
+            )
+            self.store.save(state)
+            print(
+                f"迁移已提交；后续记录失败：{error}", file=sys.stderr, flush=True
+            )
+        elif attempt.target_published or (
+            attempt.target_preexisting
+            and (
+                isinstance(error, (KataGoRLRunnerError, OSError))
+                or attempt.target_identity_confirmed
+            )
+        ):
+            self._record_migration_retry(state, str(error))
+        else:
+            self.controller.migration_failed(state, str(error))
+            print(f"迁移失败，继续旧棋盘：{error}", file=sys.stderr, flush=True)
 
     @staticmethod
     def _stale_temp_paths(run_root: Path, now: float) -> list[Path]:
