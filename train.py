@@ -84,7 +84,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     try:
         from weiqi.rl.control import TrainingStopped
-        from weiqi.rl.eval_positions import file_hash
+        from weiqi.fileio import sha256_file
         from weiqi.rl.runner import benchmark, evaluate, train
         from weiqi.rl.storage import fingerprint, load_checkpoint
         from weiqi.rl_config import DEFAULT_RL_CONFIG_PATH, load_rl_training_config
@@ -120,7 +120,7 @@ def main(argv=None) -> int:
             resume = None
             resume_checksum = None
             if args.resume:
-                resume_checksum = file_hash(args.resume)
+                resume_checksum = sha256_file(args.resume)
                 resume, config = load_checkpoint(args.resume)
                 if args.config:
                     requested = load_rl_training_config(args.config)

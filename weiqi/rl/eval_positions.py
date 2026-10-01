@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from pathlib import Path
 import random
-import tempfile
 
-from ..engine import BLACK, GoGame
+from ..engine import GoGame
+from ..fileio import atomic_write_text
 
 
 SUITE_VERSION = 1
@@ -19,14 +18,6 @@ TEACHER_VERSION = 1
 def canonical_hash(value: object) -> str:
     data = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
-
-
-def file_hash(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _render_json(value: object) -> str:
@@ -53,16 +44,7 @@ def _render_json(value: object) -> str:
 
 
 def atomic_json(value: object, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write(_render_json(value))
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    finally:
-        Path(temporary).unlink(missing_ok=True)
+    atomic_write_text(path, _render_json(value))
 
 
 def replay_position(record: dict, *, size: int, komi: float) -> GoGame:

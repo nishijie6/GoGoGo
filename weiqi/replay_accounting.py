@@ -16,15 +16,14 @@ each of them exactly once.
 from __future__ import annotations
 
 import json
-import os
 import re
-import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Mapping, Optional
 
-from .rl_curriculum import npz_row_count
+from .fileio import atomic_write_json
+from .rl_retention import npz_row_count
 
 
 LEDGER_SCHEMA_VERSION = 1
@@ -290,22 +289,10 @@ class ReplayRowLedger:
             "initialized_at": initialized_at,
             "updated_at": updated_at,
         }
-        self.run_root.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_name(
-            f".{self.path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-        )
         try:
-            with temporary.open("w", encoding="utf-8", newline="\n") as stream:
-                json.dump(document, stream, ensure_ascii=False, indent=2, sort_keys=True)
-                stream.write("\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, self.path)
+            atomic_write_json(self.path, document)
         except OSError as error:
             raise ReplayAccountingError(f"无法原子保存回放行账本：{self.path}") from error
-        finally:
-            if temporary.exists():
-                temporary.unlink()
         return ReplayRowSnapshot(
             path=self.path,
             deleted_rows_offset=offset,

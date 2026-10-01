@@ -12,10 +12,10 @@ import torch
 from torch.nn import functional as F
 
 from ..engine import BLACK, WHITE
+from ..fileio import sha256_file
 from ..rl_config import RLTrainingConfig
 from .control import Progress, RunLock, TrainingControl
 from .eval_pool import evaluate_pool, save_anchor, select_anchors
-from .eval_positions import file_hash
 from .eval_quality import evaluate_positions
 from .eval_stats import confirmed_improvement, paired_confidence, paired_sign_test
 from .network import PolicyValueNet, Runtime
@@ -419,7 +419,7 @@ def train(config, output, iterations, resume=None, *, resume_path=None, resume_c
             latest = output / "latest.pt"
             if (not latest.is_file() or resume_path is None or resume_checksum is None
                     or latest.resolve() != Path(resume_path).resolve()
-                    or file_hash(latest) != resume_checksum):
+                    or sha256_file(latest) != resume_checksum):
                 raise ValueError("Occupied output can only resume its own unchanged latest.pt; choose a new --output for another checkpoint")
         with Progress(output, operation="train") as progress:
             trainer = Trainer(config, output, resume, progress=progress)

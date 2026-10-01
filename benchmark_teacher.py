@@ -11,8 +11,9 @@ from pathlib import Path
 from weiqi.katago import (
     KataGoEngine, KataGoError, KataGoSettings, DEFAULT_ANALYSIS_CONFIG, vertex_to_point,
 )
+from weiqi.fileio import sha256_file
 from weiqi.rl.eval_positions import (
-    TEACHER_VERSION, atomic_json, canonical_hash, file_hash, generate_suite,
+    TEACHER_VERSION, atomic_json, canonical_hash, generate_suite,
     read_suite, read_teacher, replay_position,
 )
 
@@ -73,8 +74,8 @@ def label_suite(suite_path: Path, output: Path, visits: int) -> dict:
     if "reportAnalysisWinratesAs = BLACK" not in config:
         raise ValueError("KataGo scoreLead needs a fixed BLACK perspective")
     expected = {"version": TEACHER_VERSION, "suite_sha256": canonical_hash(suite),
-                "engine_sha256": file_hash(executable), "model_sha256": file_hash(model),
-                "analysis_config_sha256": file_hash(DEFAULT_ANALYSIS_CONFIG),
+                "engine_sha256": sha256_file(executable), "model_sha256": sha256_file(model),
+                "analysis_config_sha256": sha256_file(DEFAULT_ANALYSIS_CONFIG),
                 "visits": visits}
     if output.exists():
         payload = json.loads(output.read_text(encoding="utf-8"))
@@ -133,9 +134,9 @@ def score_candidate_actions(suite_path: Path, teacher_path: Path, quality_path: 
     settings.require_valid()
     executable, model = settings.resolved_executable(), settings.resolved_model()
     assert executable is not None and model is not None
-    if (file_hash(model) != teacher["model_sha256"]
-            or file_hash(executable) != teacher["engine_sha256"]
-            or file_hash(DEFAULT_ANALYSIS_CONFIG) != teacher["analysis_config_sha256"]):
+    if (sha256_file(model) != teacher["model_sha256"]
+            or sha256_file(executable) != teacher["engine_sha256"]
+            or sha256_file(DEFAULT_ANALYSIS_CONFIG) != teacher["analysis_config_sha256"]):
         raise ValueError("KataGo installation differs from the frozen teacher labels")
     specification = {"version": 1, "teacher_sha256": canonical_hash(teacher),
                      "suite_sha256": canonical_hash(suite), "visits": visits}

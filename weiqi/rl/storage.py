@@ -4,15 +4,13 @@ from __future__ import annotations
 
 import hashlib
 from copy import deepcopy
-import json
-import os
 from pathlib import Path
-import tempfile
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from ..fileio import atomic_open, atomic_write_json
 from ..rl_config import RL_CONFIG_VERSION, resolve_rl_training_config
 from .state import FEATURE_VERSION, INPUT_PLANES, augment, augment_batch
 
@@ -21,28 +19,12 @@ CHECKPOINT_VERSION = 1
 
 
 def atomic_torch_save(payload: dict, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            torch.save(payload, stream)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    finally:
-        Path(temporary).unlink(missing_ok=True)
+    with atomic_open(path, "wb") as stream:
+        torch.save(payload, stream)
 
 
 def atomic_json(payload: dict, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(payload, stream, ensure_ascii=False, indent=2, allow_nan=False)
-            stream.write("\n")
-        os.replace(temporary, path)
-    finally:
-        Path(temporary).unlink(missing_ok=True)
+    atomic_write_json(path, payload, sort_keys=False, allow_nan=False)
 
 
 def cpu_state(model) -> dict:

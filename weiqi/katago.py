@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Literal, Optional
 
 from .ai import AIMove, HUMANSL_DIFFICULTIES, KATAGO_DIFFICULTIES
-from .engine import BLACK, WHITE, GoGame, MoveRecord, Point
+from .engine import BLACK, GoGame, MoveRecord, Point
 
 
 GTP_COLUMNS = "ABCDEFGHJKLMNOPQRST"

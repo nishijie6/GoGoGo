@@ -15,22 +15,20 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from weiqi.rl_benchmark import BenchmarkMeasurement, parse_benchmark_output, prepare_benchmark_npz
 from weiqi.rl_curriculum import (
-    BenchmarkMeasurement,
     CurriculumMigrationError,
     CurriculumState,
     CurriculumStateError,
-    DiskStatus,
     StageProgress,
 )
+from weiqi.rl_retention import DiskStatus
 from weiqi.katago_rl import KataGoRLRunnerError
 from weiqi.replay_accounting import ReplayRowLedger
 from weiqi.rl_curriculum_runtime import (
     CommandExecution,
     CurriculumRuntime,
     ensure_evaluation_opening_suite,
-    parse_benchmark_output,
-    prepare_benchmark_npz,
 )
 from weiqi.rl_config import load_rl_training_config
 
@@ -328,18 +326,18 @@ class CurriculumRuntimeStateTests(unittest.TestCase):
         self.runtime.command_runner = successful_pair
         import weiqi.rl_curriculum_runtime as runtime_module
 
-        original = runtime_module._atomic_write_json
+        original = runtime_module.atomic_write_json
 
         def fail_summary(path, value):
             if path.name == "summary.json":
                 raise OSError("summary disk error")
             return original(path, value)
 
-        runtime_module._atomic_write_json = fail_summary
+        runtime_module.atomic_write_json = fail_summary
         try:
             self.runtime._evaluate(state)
         finally:
-            runtime_module._atomic_write_json = original
+            runtime_module.atomic_write_json = original
         recovered = self.runtime.store.load()
         assert recovered is not None
         self.assertEqual(len(recovered.active.evaluations), 1)
@@ -645,14 +643,14 @@ class CurriculumRuntimeStateTests(unittest.TestCase):
 
         import weiqi.rl_curriculum_runtime as runtime_module
 
-        original = runtime_module._sha256_file
-        runtime_module._sha256_file = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        original = runtime_module.sha256_file
+        runtime_module.sha256_file = lambda *_args, **_kwargs: (_ for _ in ()).throw(
             PermissionError("checkpoint temporarily shared")
         )
         try:
             self.runtime._migrate(state)
         finally:
-            runtime_module._sha256_file = original
+            runtime_module.sha256_file = original
         retrying = self.runtime.store.load()
         assert retrying is not None
         self.assertEqual(retrying.phase, "transition_ready")

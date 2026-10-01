@@ -27,7 +27,7 @@ import sys
 import time
 import uuid
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 
@@ -35,8 +35,15 @@ from .katago import katago_subprocess_environment
 from .katago_rl import PROJECT_ROOT, KataGoRLRunner, KataGoRLRunnerError
 from .process_control import managed_popen
 from .replay_accounting import ReplayAccountingError, ReplayRowLedger
-from .rl_curriculum import (
+from .fileio import atomic_write_json, atomic_write_text, local_timestamp, sha256_file
+from .rl_benchmark import (
     BenchmarkMeasurement,
+    build_benchmark_command,
+    choose_autotune_batch,
+    parse_benchmark_output,
+    prepare_benchmark_npz,
+)
+from .rl_curriculum import (
     CurriculumController,
     CurriculumMigrationError,
     CurriculumStage,
@@ -44,67 +51,27 @@ from .rl_curriculum import (
     CurriculumStateError,
     CurriculumStateStore,
     GlobalCurriculumLock,
-    apply_retention_plan,
-    build_benchmark_command,
-    build_match_config,
-    build_retention_plan,
-    choose_autotune_batch,
     compute_health_window,
-    disk_space_status,
     load_curriculum_config,
-    prepare_stage_migration,
-    summarize_match_sgfs,
     validate_training_profiles,
-    verify_checkpoint_loads,
-    render_curriculum_dashboard,
+)
+from .rl_curriculum_dashboard import render_curriculum_dashboard
+from .rl_match import build_match_config, summarize_match_sgfs
+from .rl_migration import prepare_stage_migration, verify_checkpoint_loads
+from .rl_retention import (
+    apply_retention_plan,
+    assert_descendant,
+    build_retention_plan,
+    directory_size,
+    disk_space_status,
 )
 from .rl_metrics import parse_model_name
 
 
-THROUGHPUT_RE = re.compile(
-    r"Throughput:\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s+samples/s", re.IGNORECASE
-)
-PEAK_MEMORY_RE = re.compile(
-    r"Peak GPU memory(?:\s*\([^)]*\))?:\s*([0-9]+(?:\.[0-9]+)?)\s*GiB",
-    re.IGNORECASE,
-)
 STALE_TEMP_SECONDS = 6 * 60 * 60
 DISK_POLL_SECONDS = 60
 MIGRATION_RETRY_SECONDS = 60
 EVALUATION_OPENING_SUITE_VERSION = 1
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
-
-
-def _atomic_write_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    try:
-        with temporary.open("w", encoding="utf-8", newline="\n") as output:
-            output.write(content)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, path)
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            temporary.unlink()
-
-
-def _atomic_write_json(path: Path, value: Mapping[str, object]) -> None:
-    _atomic_write_text(
-        path,
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-    )
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for block in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -115,104 +82,11 @@ class CommandExecution:
     stdout: str
 
 
-def parse_benchmark_output(
-    output: str, *, batch_size: int, returncode: int = 0
-) -> BenchmarkMeasurement:
-    """Parse the stable summary emitted by ``benchmark_fresh_model.py``."""
-
-    folded = output.casefold()
-    oom = "out of memory" in folded or re.search(r"\boom\b", folded) is not None
-    throughput_match = THROUGHPUT_RE.search(output)
-    peak_match = PEAK_MEMORY_RE.search(output)
-    throughput = (
-        float(throughput_match.group(1).replace(",", ""))
-        if throughput_match
-        else 0.0
-    )
-    peak = float(peak_match.group(1)) if peak_match else math.inf
-    success = returncode == 0 and not oom and throughput > 0 and math.isfinite(peak)
-    error: Optional[str] = None
-    if not success:
-        if oom:
-            error = "CUDA out of memory"
-        elif returncode:
-            error = f"benchmark 退出代码 {returncode}"
-        else:
-            error = "benchmark 输出缺少吞吐或峰值显存"
-    return BenchmarkMeasurement(
-        batch_size=batch_size,
-        success=success,
-        throughput=throughput,
-        peak_gpu_gib=peak,
-        oom=oom,
-        error=error,
-    )
-
-
-def prepare_benchmark_npz(source: Path, target: Path, required_rows: int) -> Path:
-    """Tile a target-board NPZ so every autotune candidate gets a full batch."""
-
-    if required_rows < 1:
-        raise ValueError("required_rows 必须为正数")
-    import numpy as np
-
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with np.load(source, allow_pickle=False) as data:
-        if not data.files:
-            raise ValueError(f"训练 NPZ 为空：{source}")
-        row_candidates = [
-            int(data[key].shape[0])
-            for key in data.files
-            if data[key].ndim > 0 and data[key].shape[0] > 0
-        ]
-        if not row_candidates:
-            raise ValueError(f"训练 NPZ 没有样本维度：{source}")
-        source_rows = max(set(row_candidates), key=row_candidates.count)
-        indices = np.arange(required_rows, dtype=np.int64) % source_rows
-        arrays: dict[str, object] = {}
-        for key in data.files:
-            value = data[key]
-            arrays[key] = value[indices] if value.ndim and value.shape[0] == source_rows else value
-        temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp.npz")
-        try:
-            np.savez_compressed(temporary, **arrays)
-            os.replace(temporary, target)
-        finally:
-            with contextlib.suppress(FileNotFoundError):
-                temporary.unlink()
-    return target
-
-
 def _model_sort_key(name: str) -> tuple[int, int, str]:
     parsed = parse_model_name(name)
     if parsed is None:
         return (-1, -1, name)
     return parsed[0], parsed[1], name
-
-
-def _directory_size(path: Path) -> int:
-    if path.is_file():
-        with contextlib.suppress(OSError):
-            return path.stat().st_size
-        return 0
-    total = 0
-    with contextlib.suppress(OSError):
-        for child in path.rglob("*"):
-            if child.is_file():
-                with contextlib.suppress(OSError):
-                    total += child.stat().st_size
-    return total
-
-
-def _assert_exact_descendant(path: Path, root: Path) -> None:
-    resolved = path.resolve()
-    root = root.resolve()
-    if resolved == root:
-        raise ValueError("拒绝删除训练根目录")
-    try:
-        resolved.relative_to(root)
-    except ValueError as error:
-        raise ValueError(f"拒绝删除训练目录外路径：{resolved}") from error
 
 
 def _gtp_coordinate(x: int, y: int, board_size: int) -> str:
@@ -318,7 +192,7 @@ def ensure_evaluation_opening_suite(
             opening = temporary / f"opening-{index:03d}"
             opening.mkdir(parents=True, exist_ok=False)
             (opening / "opening.startposes.txt").write_text(sample, encoding="utf-8")
-        _atomic_write_json(temporary / "manifest.json", manifest)
+        atomic_write_json(temporary / "manifest.json", manifest)
         os.replace(temporary, suite_root)
     except Exception:
         if temporary.exists():
@@ -565,7 +439,7 @@ class CurriculumRuntime:
                 args, cwd=cwd, env=dict(env), log_path=log_path
             )
             execution = self._normalize_command_result(result)
-            _atomic_write_text(log_path, execution.stdout)
+            atomic_write_text(log_path, execution.stdout)
             return execution
 
         output: list[str] = []
@@ -614,28 +488,28 @@ class CurriculumRuntime:
             opening_count=opening_count,
         )
         suite_manifest = openings[0].parent / "manifest.json"
-        _atomic_write_json(
+        atomic_write_json(
             output_dir / "evaluation_manifest.json",
             {
                 "protocol_version": 2,
                 "roles": roles,
                 "candidate_model": candidate_name,
                 "candidate_path": str(candidate),
-                "candidate_sha256": _sha256_file(candidate),
+                "candidate_sha256": sha256_file(candidate),
                 "baseline_model": baseline_name,
                 "baseline_path": str(baseline),
-                "baseline_sha256": _sha256_file(baseline),
+                "baseline_sha256": sha256_file(baseline),
                 "board_size": state.active.board_size,
                 "visits": runner.config.evaluation.simulations_per_move,
                 "komi": 6.5,
                 "games": self.config.evaluation_games,
                 "opening_pairs": opening_count,
                 "opening_suite": str(suite_manifest),
-                "opening_suite_sha256": _sha256_file(suite_manifest),
+                "opening_suite_sha256": sha256_file(suite_manifest),
                 "root_noise": False,
                 "temperature": 0.0,
                 "resignation": False,
-                "created_at": _now(),
+                "created_at": local_timestamp(),
             },
         )
         environment = katago_subprocess_environment()
@@ -656,7 +530,7 @@ class CurriculumRuntime:
                 gpu_index=0,
                 opening_directory=opening,
             )
-            _atomic_write_text(config_path, config_text)
+            atomic_write_text(config_path, config_text)
             execution = self._run_external(
                 [
                     runner.katago_executable,
@@ -691,7 +565,7 @@ class CurriculumRuntime:
             candidate_name="candidate",
             requested_games=self.config.evaluation_games,
         )
-        _atomic_write_json(output_dir / "match-result.json", summary.to_dict())
+        atomic_write_json(output_dir / "match-result.json", summary.to_dict())
         return summary
 
     def _evaluate(self, state: CurriculumState) -> None:
@@ -721,14 +595,14 @@ class CurriculumRuntime:
                 health=health, opponent_results=results,
             )
             committed = True
-            _atomic_write_json(output_dir / "summary.json", state.active.evaluations[-1])
+            atomic_write_json(output_dir / "summary.json", state.active.evaluations[-1])
             if state.active.evaluations[-1].get("champion_promoted"):
                 print(f"滚动冠军已更新：{state.active.champion_model}", flush=True)
             if gate.passed:
                 print(f"课程门槛通过：固定基准胜率 {summary.win_rate:.1%}", flush=True)
             else:
                 state.warnings.append({
-                    "timestamp": _now(), "kind": "quality_gate",
+                    "timestamp": local_timestamp(), "kind": "quality_gate",
                     "message": "；".join(gate.reasons) or "课程门槛未通过",
                 })
                 self.store.save(state)
@@ -736,7 +610,7 @@ class CurriculumRuntime:
         except Exception as error:
             if committed:
                 state.warnings.append({
-                    "timestamp": _now(), "kind": "evaluation_artifact",
+                    "timestamp": local_timestamp(), "kind": "evaluation_artifact",
                     "message": f"评测状态已提交，但辅助文件或输出失败：{error}",
                 })
                 self.store.save(state)
@@ -811,7 +685,7 @@ class CurriculumRuntime:
                 max_gpu_memory_gib=self.config.max_gpu_memory_gib,
                 persist_path=None,
             )
-            _atomic_write_json(
+            atomic_write_json(
                 persist_path,
                 {
                     "selected_batch_size": result.selected_batch_size,
@@ -826,13 +700,13 @@ class CurriculumRuntime:
                         }
                         for measurement in result.measurements
                     ],
-                    "completed_at": _now(),
+                    "completed_at": local_timestamp(),
                 },
             )
             return result.selected_batch_size, None
         except Exception as error:
             warning = f"自动批次测试无合格结果，拒绝迁移：{error}"
-            _atomic_write_json(
+            atomic_write_json(
                 persist_path,
                 {
                     "selected_batch_size": None,
@@ -849,7 +723,7 @@ class CurriculumRuntime:
                         }
                         for batch in stage.autotune_batches
                     ],
-                    "completed_at": _now(),
+                    "completed_at": local_timestamp(),
                 },
             )
             raise CurriculumMigrationError(warning) from error
@@ -931,7 +805,7 @@ class CurriculumRuntime:
     def _record_migration_retry(self, state: CurriculumState, message: str) -> None:
         state.phase = "migrating"
         state.warnings.append(
-            {"timestamp": _now(), "kind": "migration_retry", "message": message}
+            {"timestamp": local_timestamp(), "kind": "migration_retry", "message": message}
         )
         self.store.save(state)
         print(f"迁移暂时无法完成，将保留身份后重试：{message}", file=sys.stderr, flush=True)
@@ -965,14 +839,14 @@ class CurriculumRuntime:
             return
 
         try:
-            source_sha256 = _sha256_file(source_checkpoint)
+            source_sha256 = sha256_file(source_checkpoint)
         except OSError as error:
             if state.phase == "migrating" and state.migration:
                 self._record_migration_retry(state, str(error))
             else:
                 state.warnings.append(
                     {
-                        "timestamp": _now(),
+                        "timestamp": local_timestamp(),
                         "kind": "migration_retry",
                         "message": f"暂时无法读取迁移源检查点：{error}",
                     }
@@ -996,7 +870,7 @@ class CurriculumRuntime:
             state.migration = {
                 "id": uuid.uuid4().hex,
                 **identity,
-                "started_at": _now(),
+                "started_at": local_timestamp(),
             }
             self.store.save(state)
             self.controller.begin_migration(state)
@@ -1014,7 +888,7 @@ class CurriculumRuntime:
                 state.migration = {
                     "id": uuid.uuid4().hex,
                     **identity,
-                    "started_at": _now(),
+                    "started_at": local_timestamp(),
                 }
                 self.store.save(state)
             elif (
@@ -1072,7 +946,7 @@ class CurriculumRuntime:
                         or selected_batch is None
                         or not manifest_matches
                         or manifest.get("seed_checkpoint_sha256")
-                        != _sha256_file(checkpoint)
+                        != sha256_file(checkpoint)
                     ):
                         raise CurriculumMigrationError(
                             f"已存在目标目录不完整或不属于当前迁移；拒绝触碰 {target_root}"
@@ -1101,13 +975,13 @@ class CurriculumRuntime:
                         batch, tune_warning = self._migration_checks(
                             target_stage, root, checkpoint
                         )
-                        _atomic_write_json(
+                        atomic_write_json(
                             root / "migration_manifest.json",
                             {
                                 **state.migration,
                                 "selected_batch_size": batch,
-                                "seed_checkpoint_sha256": _sha256_file(checkpoint),
-                                "completed_at": _now(),
+                                "seed_checkpoint_sha256": sha256_file(checkpoint),
+                                "completed_at": local_timestamp(),
                             },
                         )
                         check_result["batch"] = batch
@@ -1137,7 +1011,7 @@ class CurriculumRuntime:
                 migration_committed = True
             if warning:
                 state.warnings.append(
-                    {"timestamp": _now(), "kind": "autotune", "message": warning}
+                    {"timestamp": local_timestamp(), "kind": "autotune", "message": warning}
                 )
                 self.store.save(state)
             print(
@@ -1168,7 +1042,7 @@ class CurriculumRuntime:
             if migration_committed:
                 state.warnings.append(
                     {
-                        "timestamp": _now(),
+                        "timestamp": local_timestamp(),
                         "kind": "migration_artifact",
                         "message": f"迁移状态已提交，但后续记录失败：{error}",
                     }
@@ -1242,8 +1116,8 @@ class CurriculumRuntime:
         unique_dirs = list(dict.fromkeys(directory_targets))
         unique_files = list(dict.fromkeys(file_targets))
         for path in (*unique_dirs, *unique_files):
-            _assert_exact_descendant(path, run_root)
-        deleted_bytes = sum(_directory_size(path) for path in (*unique_dirs, *unique_files))
+            assert_descendant(path, run_root)
+        deleted_bytes = sum(directory_size(path) for path in (*unique_dirs, *unique_files))
         # Apply the core plan first (which repeats exact-target validation),
         # then the runtime-only longterm/tmp rules.
         apply_retention_plan(plan, run_root)
@@ -1282,9 +1156,9 @@ class CurriculumRuntime:
                 continue
             with contextlib.suppress(OSError):
                 if now - path.stat().st_mtime >= STALE_TEMP_SECONDS:
-                    _assert_exact_descendant(path, parent)
+                    assert_descendant(path, parent)
                     targets.append(path)
-        deleted_bytes = sum(_directory_size(path) for path in targets)
+        deleted_bytes = sum(directory_size(path) for path in targets)
         for path in targets:
             shutil.rmtree(path)
         return {
@@ -1309,7 +1183,7 @@ class CurriculumRuntime:
                 except KataGoRLRunnerError as error:
                     state.warnings.append(
                         {
-                            "timestamp": _now(),
+                            "timestamp": local_timestamp(),
                             "kind": "retention_lock",
                             "message": str(error),
                         }
@@ -1320,7 +1194,7 @@ class CurriculumRuntime:
                     totals[key] += report[key]
         state.disk["last_cleanup"] = {
             **totals,
-            "completed_at": _now(),
+            "completed_at": local_timestamp(),
         }
         self.store.save(state)
         return totals
@@ -1352,7 +1226,7 @@ class CurriculumRuntime:
                     self._migrate(state)
         except Exception as error:
             state.warnings.append(
-                {"timestamp": _now(), "kind": "training", "message": str(error)}
+                {"timestamp": local_timestamp(), "kind": "training", "message": str(error)}
             )
             self.store.save(state)
             raise
@@ -1366,7 +1240,7 @@ class CurriculumRuntime:
         document = render_curriculum_dashboard(
             state, self.config, latest_health=health, last_training_at=last_training,
         )
-        _atomic_write_text(self.dashboard_path, document)
+        atomic_write_text(self.dashboard_path, document)
 
     def run(self, iterations: int = 0, smoke: bool = False) -> dict[str, object]:
         """Run continuously, or for ``iterations`` completed training cycles."""
@@ -1461,6 +1335,4 @@ class CurriculumRuntime:
 __all__ = [
     "CommandExecution",
     "CurriculumRuntime",
-    "parse_benchmark_output",
-    "prepare_benchmark_npz",
 ]

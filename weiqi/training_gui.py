@@ -7,7 +7,7 @@ from collections.abc import Callable
 from tkinter import ttk
 from typing import Optional
 
-from .engine import BLACK, EMPTY, WHITE, BoardHash, Point, color_name
+from .engine import BLACK, EMPTY, Point, color_name
 from .training import (
     JOSEKI_CATEGORY,
     JOSEKI_NOTICE,

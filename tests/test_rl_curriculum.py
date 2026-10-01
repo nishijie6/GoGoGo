@@ -10,8 +10,13 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from weiqi.rl_curriculum import (
+from weiqi.rl_benchmark import (
     BenchmarkMeasurement,
+    choose_autotune_batch,
+    parse_benchmark_output,
+    prepare_benchmark_npz,
+)
+from weiqi.rl_curriculum import (
     CurriculumConfigError,
     CurriculumController,
     CurriculumLockError,
@@ -20,27 +25,16 @@ from weiqi.rl_curriculum import (
     CurriculumStateError,
     GlobalCurriculumLock,
     HealthSummary,
-    MatchSummary,
-    apply_retention_plan,
-    build_benchmark_input,
-    build_match_config,
-    build_retention_plan,
-    choose_autotune_batch,
     compute_health_window,
-    create_clean_swa_checkpoint,
     evaluate_quality_gate,
     load_curriculum_config,
     next_evaluation_boundary,
-    prepare_stage_migration,
-    parse_benchmark_output,
-    render_curriculum_dashboard,
-    select_replay_window,
-    select_retained_directories,
-    summarize_match_sgfs,
     validate_training_profiles,
-    wilson_interval,
-    write_curriculum_dashboard,
 )
+from weiqi.rl_curriculum_dashboard import render_curriculum_dashboard, write_curriculum_dashboard
+from weiqi.rl_match import MatchSummary, build_match_config, summarize_match_sgfs, wilson_interval
+from weiqi.rl_migration import create_clean_swa_checkpoint, prepare_stage_migration
+from weiqi.rl_retention import apply_retention_plan, build_retention_plan, select_replay_window, select_retained_directories
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -573,7 +567,7 @@ class RetentionAndAutotuneTests(unittest.TestCase):
                 binaryInputNCHW=np.arange(2 * 3).reshape(2, 3),
                 globalInputNC=np.arange(2 * 2).reshape(2, 2),
             )
-            build_benchmark_input(source, target, minimum_rows=5)
+            prepare_benchmark_npz(source, target, 5)
             with np.load(target) as data:
                 self.assertEqual(data["binaryInputNCHW"].shape[0], 5)
                 self.assertEqual(data["globalInputNC"].shape[0], 5)

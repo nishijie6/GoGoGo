@@ -13,7 +13,7 @@ import uuid
 
 import numpy as np
 
-from ..engine import BLACK, WHITE
+from ..engine import BLACK
 from ..rl_config import RLTrainingConfig
 from .search import choose_action, search
 from .state import Position
