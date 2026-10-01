@@ -59,10 +59,10 @@ class AnalysisLifecycleTests(unittest.TestCase):
         app._invalidate_ai = Mock()
         app._refresh = Mock()
 
-        with patch("weiqi.gui.KataGoSettings.load", return_value=settings):
-            with patch("weiqi.gui.KataGoEngine", return_value=engine):
+        with patch("weiqi.gui_windows.KataGoSettings.load", return_value=settings):
+            with patch("weiqi.gui_windows.KataGoEngine", return_value=engine):
                 with patch(
-                    "weiqi.gui.AnalysisWorkbenchWindow",
+                    "weiqi.gui_windows.AnalysisWorkbenchWindow",
                     return_value=window,
                 ) as window_type:
                     opened = app.show_analysis()
@@ -101,13 +101,13 @@ class AnalysisLifecycleTests(unittest.TestCase):
         engine.settings = selected_settings
         app.katago_engine = engine
 
-        with patch("weiqi.gui.KataGoSettings.load", return_value=saved_settings):
+        with patch("weiqi.gui_windows.KataGoSettings.load", return_value=saved_settings):
             with patch(
-                "weiqi.gui.settings_for_training_opponent",
+                "weiqi.gui_windows.settings_for_training_opponent",
                 return_value=selected_settings,
             ) as select_model:
-                with patch("weiqi.gui.KataGoEngine") as engine_type:
-                    with patch("weiqi.gui.AnalysisWorkbenchWindow", return_value=Mock(is_alive=True)):
+                with patch("weiqi.gui_windows.KataGoEngine") as engine_type:
+                    with patch("weiqi.gui_windows.AnalysisWorkbenchWindow", return_value=Mock(is_alive=True)):
                         self.assertTrue(app.show_analysis())
 
         select_model.assert_called_once_with(
@@ -135,10 +135,10 @@ class AnalysisLifecycleTests(unittest.TestCase):
         engine.settings = selected_settings
 
         with patch(
-            "weiqi.gui.settings_for_training_opponent",
+            "weiqi.gui_windows.settings_for_training_opponent",
             return_value=selected_settings,
         ) as select_model:
-            with patch("weiqi.gui.KataGoEngine", return_value=engine):
+            with patch("weiqi.gui_windows.KataGoEngine", return_value=engine):
                 saved_settings = Mock()
                 app._katago_settings_saved(saved_settings)
 

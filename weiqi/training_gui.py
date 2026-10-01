@@ -8,6 +8,7 @@ from tkinter import ttk
 from typing import Optional
 
 from .engine import BLACK, EMPTY, Point, color_name
+from .gui_constants import COLUMN_NAMES
 from .training import (
     JOSEKI_CATEGORY,
     JOSEKI_NOTICE,
@@ -20,7 +21,6 @@ from .training import (
 )
 
 
-COLUMN_NAMES = "ABCDEFGHJKLMNOPQRST"
 
 
 class ReasoningTrainer:

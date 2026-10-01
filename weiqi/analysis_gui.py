@@ -16,9 +16,9 @@ from typing import Any, Optional
 from tkinter import ttk
 
 from .engine import BLACK, EMPTY, WHITE, GoGame, Point
+from .gui_constants import COLUMN_NAMES
 
 
-COLUMN_NAMES = "ABCDEFGHJKLMNOPQRST"
 _BOARD_COLOR = "#d9a85f"
 _PANEL_COLOR = "#172019"
 _PANEL_DARK = "#101713"
