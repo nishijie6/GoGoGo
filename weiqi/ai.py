@@ -83,6 +83,21 @@ class _Candidate:
     area_gain: Optional[float]
 
 
+@dataclass(frozen=True)
+class _ScoringContext:
+    """Position facts shared by every candidate point in one ``choose_move`` call."""
+
+    color: int
+    enemy: int
+    phase: float
+    urgent_liberties: set[Point]
+    opening_points: set[Point]
+    empty_regions: dict[Point, tuple[int, frozenset[int]]]
+    # Set only after the opponent passed: a scratch game for area scoring.
+    scoring_game: Optional[GoGame]
+    baseline_margin: float
+
+
 class GoAI:
     """A lightweight opponent based on tactical and positional heuristics.
 
@@ -131,101 +146,24 @@ class GoAI:
         )
         scoring_game = GoGame(game.size, game.komi) if opponent_has_passed else None
 
+        context = _ScoringContext(
+            color=color,
+            enemy=enemy,
+            phase=phase,
+            urgent_liberties=urgent_liberties,
+            opening_points=opening_points,
+            empty_regions=empty_regions,
+            scoring_game=scoring_game,
+            baseline_margin=baseline_margin,
+        )
         candidates: list[_Candidate] = []
         for row in range(game.size):
             for col in range(game.size):
                 if game.board[row][col] != EMPTY:
                     continue
-                analysis = game.analyze_move(row, col, color)
-                if not analysis.legal or analysis.board is None:
-                    continue
-
-                score = self._random.uniform(
-                    -self.profile.noise,
-                    self.profile.noise,
-                )
-                reasons: list[str] = []
-
-                if analysis.captured:
-                    score += 24.0 * analysis.captured
-                    reasons.append(f"提掉 {analysis.captured} 子")
-
-                if (row, col) in urgent_liberties:
-                    score += 18.0
-                    reasons.append("解救己方棋块")
-
-                adjacent_values = [
-                    game.board[nr][nc] for nr, nc in game.neighbors(row, col)
-                ]
-                friendly_neighbors = adjacent_values.count(color)
-                enemy_neighbors = adjacent_values.count(enemy)
-                empty_neighbors = adjacent_values.count(EMPTY)
-                score += friendly_neighbors * 1.2 + enemy_neighbors * 2.2
-
-                if analysis.liberties == 1 and analysis.captured == 0:
-                    score -= 22.0
-                elif analysis.liberties == 2:
-                    score -= 2.0
-                else:
-                    score += min(analysis.liberties, 5) * 0.45
-
-                atari_count = self._groups_put_in_atari(
-                    game, analysis, row, col, enemy
-                )
-                if atari_count:
-                    score += atari_count * 6.0
-                    reasons.append("制造打吃")
-
-                region_size, region_borders = empty_regions[(row, col)]
-                obvious_dead_invasion = (
-                    region_borders == frozenset({enemy})
-                    and region_size <= 6
-                    and analysis.captured == 0
-                    and atari_count == 0
-                )
-                if obvious_dead_invasion:
-                    score -= 40.0
-
-                # Opening play should spread out and prefer established star points.
-                center = (game.size - 1) / 2
-                distance_from_center = math.hypot(row - center, col - center)
-                if phase < 0.28:
-                    score -= distance_from_center * 0.12
-                    if (row, col) in opening_points:
-                        score += 4.5
-                        reasons.append("占据要点")
-                    if self._nearest_stone_distance(game, row, col) <= 1:
-                        score -= 2.0
-
-                # Filling a completely friendly neighborhood is usually wasteful.
-                if adjacent_values and empty_neighbors == 0 and enemy_neighbors == 0:
-                    score -= 10.0
-
-                # A small edge penalty in the opening, relaxed later in the game.
-                edge_distance = min(row, col, game.size - 1 - row, game.size - 1 - col)
-                if phase < 0.4 and edge_distance == 0:
-                    score -= 3.0
-
-                area_gain: Optional[float] = None
-                if scoring_game is not None:
-                    scoring_game.board = [list(board_row) for board_row in analysis.board]
-                    resulting_margin = self._score_margin(
-                        scoring_game.calculate_score(), color
-                    )
-                    area_gain = resulting_margin - baseline_margin
-                    if obvious_dead_invasion:
-                        # Static area scoring treats every newly placed stone as
-                        # alive.  A lone, non-tactical invasion of a tiny enemy
-                        # eye space cannot form two eyes, so do not mistake the
-                        # apparent territory reduction for a real gain.
-                        area_gain = min(area_gain, 0.0)
-                    # Once the opponent passes, prefer moves that still gain
-                    # points and recognize filling one's own territory as zero.
-                    score += area_gain * 12.0
-
-                candidates.append(
-                    _Candidate(score, (row, col), analysis, reasons, area_gain)
-                )
+                candidate = self._score_point(game, row, col, context)
+                if candidate is not None:
+                    candidates.append(candidate)
 
         if not candidates:
             return AIMove(None, "没有合法落点")
@@ -257,6 +195,111 @@ class GoAI:
         if not selected.reasons:
             selected.reasons.append("兼顾棋形与气")
         return AIMove(selected.point, "、".join(selected.reasons[:2]))
+
+    def _score_point(
+        self,
+        game: GoGame,
+        row: int,
+        col: int,
+        context: _ScoringContext,
+    ) -> Optional[_Candidate]:
+        """Heuristic score of one empty point, or None when it is illegal."""
+
+        color, enemy, phase = context.color, context.enemy, context.phase
+        urgent_liberties = context.urgent_liberties
+        opening_points = context.opening_points
+        empty_regions = context.empty_regions
+        scoring_game = context.scoring_game
+        baseline_margin = context.baseline_margin
+
+        analysis = game.analyze_move(row, col, color)
+        if not analysis.legal or analysis.board is None:
+            return None
+
+        score = self._random.uniform(
+            -self.profile.noise,
+            self.profile.noise,
+        )
+        reasons: list[str] = []
+
+        if analysis.captured:
+            score += 24.0 * analysis.captured
+            reasons.append(f"提掉 {analysis.captured} 子")
+
+        if (row, col) in urgent_liberties:
+            score += 18.0
+            reasons.append("解救己方棋块")
+
+        adjacent_values = [
+            game.board[nr][nc] for nr, nc in game.neighbors(row, col)
+        ]
+        friendly_neighbors = adjacent_values.count(color)
+        enemy_neighbors = adjacent_values.count(enemy)
+        empty_neighbors = adjacent_values.count(EMPTY)
+        score += friendly_neighbors * 1.2 + enemy_neighbors * 2.2
+
+        if analysis.liberties == 1 and analysis.captured == 0:
+            score -= 22.0
+        elif analysis.liberties == 2:
+            score -= 2.0
+        else:
+            score += min(analysis.liberties, 5) * 0.45
+
+        atari_count = self._groups_put_in_atari(
+            game, analysis, row, col, enemy
+        )
+        if atari_count:
+            score += atari_count * 6.0
+            reasons.append("制造打吃")
+
+        region_size, region_borders = empty_regions[(row, col)]
+        obvious_dead_invasion = (
+            region_borders == frozenset({enemy})
+            and region_size <= 6
+            and analysis.captured == 0
+            and atari_count == 0
+        )
+        if obvious_dead_invasion:
+            score -= 40.0
+
+        # Opening play should spread out and prefer established star points.
+        center = (game.size - 1) / 2
+        distance_from_center = math.hypot(row - center, col - center)
+        if phase < 0.28:
+            score -= distance_from_center * 0.12
+            if (row, col) in opening_points:
+                score += 4.5
+                reasons.append("占据要点")
+            if self._nearest_stone_distance(game, row, col) <= 1:
+                score -= 2.0
+
+        # Filling a completely friendly neighborhood is usually wasteful.
+        if adjacent_values and empty_neighbors == 0 and enemy_neighbors == 0:
+            score -= 10.0
+
+        # A small edge penalty in the opening, relaxed later in the game.
+        edge_distance = min(row, col, game.size - 1 - row, game.size - 1 - col)
+        if phase < 0.4 and edge_distance == 0:
+            score -= 3.0
+
+        area_gain: Optional[float] = None
+        if scoring_game is not None:
+            scoring_game.board = [list(board_row) for board_row in analysis.board]
+            resulting_margin = self._score_margin(
+                scoring_game.calculate_score(), color
+            )
+            area_gain = resulting_margin - baseline_margin
+            if obvious_dead_invasion:
+                # Static area scoring treats every newly placed stone as
+                # alive.  A lone, non-tactical invasion of a tiny enemy
+                # eye space cannot form two eyes, so do not mistake the
+                # apparent territory reduction for a real gain.
+                area_gain = min(area_gain, 0.0)
+            # Once the opponent passes, prefer moves that still gain
+            # points and recognize filling one's own territory as zero.
+            score += area_gain * 12.0
+
+        return _Candidate(score, (row, col), analysis, reasons, area_gain)
 
     @staticmethod
     def _difficulty_profile(label: str) -> DifficultyProfile:
