@@ -216,8 +216,8 @@ class KataGoSettingsAndDecisionTests(unittest.TestCase):
             for path in (legacy_executable, legacy_model, legacy_human):
                 path.write_bytes(b"test")
 
-            with patch("weiqi.katago.KATAGO_FOLDER", standard):
-                with patch("weiqi.katago.LEGACY_KATAGO_FOLDER", legacy):
+            with patch("weiqi.katago_settings.KATAGO_FOLDER", standard):
+                with patch("weiqi.katago_settings.LEGACY_KATAGO_FOLDER", legacy):
                     discovered = KataGoSettings._discover_local_files()
                     self.assertEqual(discovered.executable, str(legacy_executable))
                     self.assertEqual(discovered.model, str(legacy_model))
@@ -623,8 +623,8 @@ class KataGoSettingsAndDecisionTests(unittest.TestCase):
             for path in (executable, model, human):
                 path.write_bytes(b"test")
 
-            with patch("weiqi.katago.KATAGO_FOLDER", standard):
-                with patch("weiqi.katago.LEGACY_KATAGO_FOLDER", legacy):
+            with patch("weiqi.katago_settings.KATAGO_FOLDER", standard):
+                with patch("weiqi.katago_settings.LEGACY_KATAGO_FOLDER", legacy):
                     discovered = KataGoSettings._discover_local_files()
 
             self.assertEqual(discovered.executable, str(executable))
