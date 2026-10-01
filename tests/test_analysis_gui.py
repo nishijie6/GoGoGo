@@ -11,13 +11,8 @@ from types import SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import Mock
 
-from weiqi.analysis_gui import (
-    AnalysisWorkbenchWindow,
-    _format_lead,
-    _format_probability,
-    _ownership_color,
-    _point_from,
-)
+from weiqi.analysis_gui import AnalysisWorkbenchWindow
+from weiqi.analysis_style import format_lead, format_probability, ownership_color, point_from
 from weiqi.engine import GoGame
 
 
@@ -113,13 +108,13 @@ class _PassAnalyzer:
 
 class AnalysisGuiHelperTests(unittest.TestCase):
     def test_display_helpers_use_consistent_black_perspective(self) -> None:
-        self.assertEqual(_format_probability(0.571), "57.1%")
-        self.assertEqual(_format_lead(2.25), "黑+2.2")
-        self.assertEqual(_format_lead(-1.75), "白+1.8")
-        self.assertIsNotNone(_ownership_color(0.5))
-        self.assertIsNotNone(_ownership_color(-0.5))
-        self.assertIsNone(_ownership_color(0.0))
-        self.assertEqual(_point_from((3, 4)), (3, 4))
+        self.assertEqual(format_probability(0.571), "57.1%")
+        self.assertEqual(format_lead(2.25), "黑+2.2")
+        self.assertEqual(format_lead(-1.75), "白+1.8")
+        self.assertIsNotNone(ownership_color(0.5))
+        self.assertIsNotNone(ownership_color(-0.5))
+        self.assertIsNone(ownership_color(0.0))
+        self.assertEqual(point_from((3, 4)), (3, 4))
 
     def test_history_hit_testing_honors_the_lead_curve_y_coordinate(self) -> None:
         window = AnalysisWorkbenchWindow.__new__(AnalysisWorkbenchWindow)
