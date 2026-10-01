@@ -25,6 +25,36 @@ class SearchTests(unittest.TestCase):
         logits[-1] = 100.0
         return logits, 0.0
 
+    @staticmethod
+    def seeded_evaluator(features):
+        generator = np.random.default_rng(int(abs(features.sum() * 1000)) % 9973)
+        return generator.normal(size=features.shape[-1] ** 2 + 1), float(generator.uniform(-0.9, 0.9))
+
+    def batch_evaluator(self, batch):
+        rows = [self.seeded_evaluator(features) for features in batch]
+        return np.array([row[0] for row in rows]), np.array([row[1] for row in rows])
+
+    def test_single_leaf_batches_match_the_sequential_search(self):
+        position = Position.new(9, 6.5)
+        expected = search(position, self.seeded_evaluator, self.config.search,
+                          np.random.default_rng(4), simulations=32, add_noise=True)
+        actual = search(position, self.seeded_evaluator, self.config.search,
+                        np.random.default_rng(4), simulations=32, add_noise=True,
+                        evaluate_batch=self.batch_evaluator)
+        np.testing.assert_array_equal(actual[0], expected[0])
+        self.assertEqual(actual[1], expected[1])
+
+    def test_batched_leaves_use_every_simulation_and_leave_no_virtual_loss(self):
+        from dataclasses import replace
+        config = replace(self.config.search, leaf_batch_size=8)
+        for simulations in (1, 7, 33):
+            policy, value = search(Position.new(9, 6.5), self.seeded_evaluator, config,
+                                   np.random.default_rng(1), simulations=simulations,
+                                   evaluate_batch=self.batch_evaluator)
+            self.assertAlmostEqual(float(policy.sum()), 1.0, places=5)
+            self.assertLessEqual(abs(value), 1.0)
+            self.assertAlmostEqual(float((policy * simulations).sum()), simulations, places=3)
+
     def test_terminal_win_and_loss_are_backed_up_in_root_perspective(self):
         # White can end an empty board and win on komi.
         white = Position.new(9, 6.5).play(81)

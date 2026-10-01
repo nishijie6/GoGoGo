@@ -58,7 +58,7 @@ class GameResult:
         return record
 
 
-def play_game(config, job, evaluate, *, training: bool) -> GameResult:
+def play_game(config, job, evaluate, *, training: bool, evaluate_batch=None) -> GameResult:
     rng = np.random.default_rng(job.seed)
     state = Position.new(config.game.board_size, config.game.komi)
     started = time.monotonic()
@@ -78,6 +78,8 @@ def play_game(config, job, evaluate, *, training: bool) -> GameResult:
         else:
             model_id = int(color == job.candidate_color)
         evaluator = lambda features: evaluate(model_id, features)
+        batch_evaluator = (None if evaluate_batch is None
+                           else lambda features: evaluate_batch(model_id, features))
         simulations = (
             config.search.simulations_per_move if training
             else config.evaluation.simulations_per_move
@@ -85,6 +87,7 @@ def play_game(config, job, evaluate, *, training: bool) -> GameResult:
         policy, value = search(
             state, evaluator, config.search, rng,
             simulations=simulations, add_noise=training,
+            evaluate_batch=batch_evaluator,
         )
         threshold = config.self_play.resign_threshold if training else None
         if threshold is not None and len(moves) >= config.self_play.resign_min_move and value < threshold:
@@ -120,7 +123,7 @@ def play_game(config, job, evaluate, *, training: bool) -> GameResult:
 def _worker(config, jobs, training, actor, conn, completed, stop):
     """Spawn target: imports NumPy and the rules, but never creates a CUDA context."""
     try:
-        def evaluate(model_id, features):
+        def evaluate_batch(model_id, features):
             if stop.is_set():
                 raise InterruptedError("Training stopped")
             try:
@@ -133,11 +136,16 @@ def _worker(config, jobs, training, actor, conn, completed, stop):
                 pass
             raise InterruptedError("Training stopped")
 
+        def evaluate(model_id, features):
+            policies, values = evaluate_batch(model_id, features[None, ...])
+            return policies[0], float(values[0])
+
         for job in jobs:
             if stop.is_set():
                 break
             completed.put(("game_started", {"index": job.index, "actor": actor}))
-            result = play_game(config, job, evaluate, training=training)
+            result = play_game(config, job, evaluate, training=training,
+                               evaluate_batch=evaluate_batch)
             completed.put(("game", result))
         completed.put(("done", actor))
     except BaseException:
@@ -231,7 +239,7 @@ def run_games(
                         del connections[connection]  # actor finished or died
                         continue
                     batch.append((connections[connection], model_id, features))
-                if len(batch) >= config.self_play.inference_batch_size:
+                if sum(len(item[2]) for item in batch) >= config.self_play.inference_batch_size:
                     break
                 # Requests already sitting in other pipes join this batch for free.
                 waiting = [c for c in connections if connections[c] not in
@@ -241,11 +249,15 @@ def run_games(
                 continue
             for model_id in {request[1] for request in batch}:
                 subset = [request for request in batch if request[1] == model_id]
-                policies, values = evaluators[model_id](np.stack([item[2] for item in subset]))
-                for item, policy, value in zip(subset, policies, values):
-                    pipes[item[0]][0].send((policy, float(value)))
+                policies, values = evaluators[model_id](
+                    np.concatenate([item[2] for item in subset]))
+                start = 0
+                for item in subset:
+                    stop_row = start + len(item[2])
+                    pipes[item[0]][0].send((policies[start:stop_row], values[start:stop_row]))
+                    start = stop_row
                 batches += 1
-                positions += len(subset)
+                positions += start
             if time.monotonic() - last_progress >= 10:
                 progress({"event": "search_progress", "completed": len(results),
                           "batch_id": batch_id,

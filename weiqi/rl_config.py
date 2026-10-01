@@ -74,6 +74,8 @@ class SearchTrainingConfig:
     dirichlet_epsilon: float
     root_temperature: float
     temperature_moves: int
+    # Leaves evaluated per network call; 1 reproduces the sequential search.
+    leaf_batch_size: int = 1
 
 
 @dataclass(frozen=True)
@@ -197,6 +199,7 @@ _BALANCED_PRESET: Dict[str, Any] = {
         "dirichlet_epsilon": 0.25,
         "root_temperature": 1.0,
         "temperature_moves": 20,
+        "leaf_batch_size": 1,
     },
     "self_play": {
         "workers": 2,
@@ -282,6 +285,7 @@ _HIGH_PERFORMANCE_PRESET: Dict[str, Any] = {
         "dirichlet_epsilon": 0.25,
         "root_temperature": 1.0,
         "temperature_moves": 30,
+        "leaf_batch_size": 1,
     },
     "self_play": {
         "workers": 8,
@@ -483,6 +487,7 @@ def _validate_config(config: RLTrainingConfig) -> None:
 
     search = config.search
     _require_int("search.simulations_per_move", search.simulations_per_move, 1)
+    _require_int("search.leaf_batch_size", search.leaf_batch_size, 1)
     _require_positive_number("search.c_puct", search.c_puct)
     _require_positive_number("search.dirichlet_alpha", search.dirichlet_alpha)
     _require_probability("search.dirichlet_epsilon", search.dirichlet_epsilon)
