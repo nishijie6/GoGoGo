@@ -31,7 +31,8 @@ from .rl_curriculum import (
     CurriculumStateError,
 )
 from .rl_config import RLConfigError, RLTrainingConfig, load_rl_training_config
-from .rl_metrics import RLMetricStore, parse_selfplay_output
+from .rl_metric_store import RLMetricStore
+from .rl_metrics import parse_selfplay_output
 from .replay_accounting import ReplayAccountingError, ReplayRowLedger
 
 

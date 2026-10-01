@@ -9,12 +9,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from weiqi.rl_metric_store import RLMetricStore
+from weiqi.rl_metrics_dashboard import render_dashboard
 from weiqi.rl_metrics import (
-    RLMetricStore,
     parse_model_name,
     parse_selfplay_output,
     parse_sgfs,
-    render_dashboard,
     rolling_health_metrics,
 )
 
@@ -160,7 +160,7 @@ class RLMetricStoreTests(unittest.TestCase):
             store = RLMetricStore(run_root)
 
             with patch(
-                "weiqi.rl_metrics.checkpoint_metrics",
+                "weiqi.rl_metric_store.checkpoint_metrics",
                 return_value={
                     "trained_samples": 4096,
                     "data_rows": 2048,
