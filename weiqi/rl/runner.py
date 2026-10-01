@@ -301,9 +301,31 @@ class Trainer:
         return results
 
     def run_iteration(self) -> dict:
+        """Self-play, then (once the replay is warm) learning and evaluation, then checkpoint."""
         config, number = self.config, self.iteration + 1
         directory = self.output / "iterations" / f"{number:06d}"
         started = time.monotonic()
+        summary = self._selfplay_phase(number, directory, started)
+        if len(self.replay) >= config.optimizer.minimum_replay_size:
+            self.progress.phase = "training"
+            summary["training"] = self.train_updates()
+            summary["position_quality"] = self._position_quality(directory)
+            summary["opponent_pool"] = self._opponent_pool(number, directory)
+            match_metadata, summary["screening"] = self._screening(directory)
+            summary["evaluation"], summary["promoted"] = self._promotion(
+                number, directory, match_metadata, summary["screening"])
+        else:
+            summary["training"] = {"steps": 0, "reason": "replay_warmup",
+                                   "required_samples": config.optimizer.minimum_replay_size}
+            summary["promoted"] = False
+        return self._commit_iteration(number, directory, summary, started)
+
+    @staticmethod
+    def _next_due(number: int, every: int) -> int:
+        return number + (every - number % every)
+
+    def _selfplay_phase(self, number: int, directory: Path, started: float) -> dict:
+        config = self.config
         self.progress.phase = "selfplay"
         self.progress({"event": "iteration_started", "iteration": number})
         jobs, evaluators, champions = self.selfplay_jobs(number)
@@ -335,7 +357,7 @@ class Trainer:
             row["games"] += 1
             row["finished"] += int(game.reason != "length_limit")
             row["samples"] += len(game.examples)
-        summary = {
+        return {
             "iteration": number, "selfplay_games": len(games),
             "selfplay_finished": sum(game.reason != "length_limit" for game in games),
             "selfplay_truncated": sum(game.reason == "length_limit" for game in games),
@@ -343,114 +365,118 @@ class Trainer:
             "selfplay_seconds": time.monotonic() - started,
             "selfplay_opponents": list(opponent_rows.values()),
         }
-        if len(self.replay) >= config.optimizer.minimum_replay_size:
-            self.progress.phase = "training"
-            summary["training"] = self.train_updates()
-            self.progress.phase = "position_diagnostics"
-            suite_name = config.evaluation.position_suite_path
-            teacher_name = config.evaluation.teacher_labels_path
-            if suite_name:
-                root = Path(__file__).resolve().parents[2]
-                suite_path, teacher_path = (root / suite_name, root / teacher_name)
-                if suite_path.is_file() and teacher_path.is_file():
-                    quality = evaluate_positions(
-                        self.model, self.runtime, config, suite_path, teacher_path,
-                        simulations=config.evaluation.position_simulations_per_move,
-                        check=self.control, progress=self.progress,
-                    )
-                    atomic_json(quality, directory / "position_quality.json")
-                    summary["position_quality"] = {
-                        "status": "measured", "suite_sha256": quality["suite_sha256"],
-                        "teacher_labels_sha256": quality["teacher_labels_sha256"],
-                        "teacher_model_sha256": quality["teacher_model_sha256"],
-                        "teacher_engine_sha256": quality["teacher_engine_sha256"],
-                        "teacher_config_sha256": quality["teacher_config_sha256"],
-                        "teacher_visits": quality["teacher_visits"],
-                        "candidate_visits": quality["candidate_visits"],
-                        "groups": quality["groups"],
-                    }
-                else:
-                    summary["position_quality"] = {"status": "unavailable",
-                                                   "reason": "fixed positions or KataGo labels are missing"}
-            else:
-                summary["position_quality"] = {"status": "not_configured"}
-            if number % config.evaluation.pool_every_iterations == 0:
-                self.progress.phase = "opponent_pool"
-                anchors = select_anchors(self.anchors, config,
-                                         candidate_sha256=fingerprint(cpu_state(self.model)))
-                report = evaluate_pool(
-                    self.model, self.runtime, config, anchors, directory / "pool",
-                    games=config.evaluation.pool_games,
-                    simulations=config.evaluation.pool_simulations_per_move,
-                    check=self.control, progress=self.progress,
-                )
-                summary["opponent_pool"] = {"status": "measured", **report}
-            else:
-                summary["opponent_pool"] = {"status": "scheduled",
-                                            "next_due_iteration": number + (
-                                                config.evaluation.pool_every_iterations -
-                                                number % config.evaluation.pool_every_iterations)}
-            self.progress.phase = "screening"
-            match_metadata = {"candidate_sha256": fingerprint(cpu_state(self.model)),
-                              "opponent_name": f"accepted_{self.best_iteration:06d}",
-                              "opponent_sha256": fingerprint(cpu_state(self.best)),
-                              "best_iteration": self.best_iteration}
-            screen_config = replace(config, evaluation=replace(
-                config.evaluation, games=config.evaluation.screen_games,
-                simulations_per_move=config.evaluation.screen_simulations_per_move))
-            screening = run_games(
-                screen_config, self.evaluation_jobs(config.evaluation.screen_games),
-                {0: self.runtime.evaluator(self.best), 1: self.runtime.evaluator(self.model)},
-                training=False, check=self.control, progress=self.progress,
-                metadata=match_metadata)
-            write_games(screening, screen_config, directory / "screening")
-            summary["screening"] = {
-                **match_metadata,
-                **evaluation_summary(screening),
-                "paired": paired_confidence(screening, confidence=config.evaluation.confidence_level),
-                "simulations_per_move": config.evaluation.screen_simulations_per_move,
-            }
-            due = number % config.evaluation.full_every_iterations == 0
-            eligible = (summary["screening"]["truncated"] == 0 and
-                        summary["screening"]["score_rate"] >= config.evaluation.screen_min_score_rate)
-            if due and eligible:
-                self.progress.phase = "evaluation"
-                confirmation_config = replace(
-                    config, self_play=replace(
-                        config.self_play,
-                        max_game_length_factor=config.evaluation.confirmation_max_game_length_factor))
-                results = self.confirmation_games(confirmation_config, match_metadata)
-                write_games(results, confirmation_config, directory / "evaluation")
-                summary["evaluation"] = {
-                    **match_metadata,
-                    **evaluation_summary(results),
-                    "paired": paired_confidence(results, confidence=config.evaluation.confidence_level),
-                    "paired_sign": paired_sign_test(results, confidence=config.evaluation.confidence_level),
-                    "paired_sprt": self.sprt(results),
-                    "planned_games": config.evaluation.games,
-                    "promotion_test": config.evaluation.promotion_test,
-                    "max_game_length_factor": config.evaluation.confirmation_max_game_length_factor,
-                    "simulations_per_move": config.evaluation.simulations_per_move,
-                }
-                promoted = confirmed_improvement(summary["evaluation"],
-                                                 threshold=config.evaluation.promotion_win_rate,
-                                                 method=config.evaluation.promotion_test)
-                summary["promoted"] = promoted
-                if promoted:
-                    self.best.load_state_dict(self.model.state_dict())
-                    self.best_iteration = number
-            else:
-                summary["evaluation"] = {
-                    "status": "screen_rejected" if due else "scheduled",
-                    "next_due_iteration": number + (
-                        config.evaluation.full_every_iterations -
-                        number % config.evaluation.full_every_iterations),
-                }
-                summary["promoted"] = False
-        else:
-            summary["training"] = {"steps": 0, "reason": "replay_warmup",
-                                   "required_samples": config.optimizer.minimum_replay_size}
-            summary["promoted"] = False
+
+    def _position_quality(self, directory: Path) -> dict:
+        """Score the candidate on the frozen KataGo-labelled positions, when configured."""
+        config = self.config
+        self.progress.phase = "position_diagnostics"
+        suite_name = config.evaluation.position_suite_path
+        teacher_name = config.evaluation.teacher_labels_path
+        if not suite_name:
+            return {"status": "not_configured"}
+        root = Path(__file__).resolve().parents[2]
+        suite_path, teacher_path = (root / suite_name, root / teacher_name)
+        if not (suite_path.is_file() and teacher_path.is_file()):
+            return {"status": "unavailable",
+                    "reason": "fixed positions or KataGo labels are missing"}
+        quality = evaluate_positions(
+            self.model, self.runtime, config, suite_path, teacher_path,
+            simulations=config.evaluation.position_simulations_per_move,
+            check=self.control, progress=self.progress,
+        )
+        atomic_json(quality, directory / "position_quality.json")
+        return {
+            "status": "measured", "suite_sha256": quality["suite_sha256"],
+            "teacher_labels_sha256": quality["teacher_labels_sha256"],
+            "teacher_model_sha256": quality["teacher_model_sha256"],
+            "teacher_engine_sha256": quality["teacher_engine_sha256"],
+            "teacher_config_sha256": quality["teacher_config_sha256"],
+            "teacher_visits": quality["teacher_visits"],
+            "candidate_visits": quality["candidate_visits"],
+            "groups": quality["groups"],
+        }
+
+    def _opponent_pool(self, number: int, directory: Path) -> dict:
+        """Matches against frozen references on every pool_every_iterations-th iteration."""
+        config = self.config
+        every = config.evaluation.pool_every_iterations
+        if number % every:
+            return {"status": "scheduled", "next_due_iteration": self._next_due(number, every)}
+        self.progress.phase = "opponent_pool"
+        anchors = select_anchors(self.anchors, config,
+                                 candidate_sha256=fingerprint(cpu_state(self.model)))
+        report = evaluate_pool(
+            self.model, self.runtime, config, anchors, directory / "pool",
+            games=config.evaluation.pool_games,
+            simulations=config.evaluation.pool_simulations_per_move,
+            check=self.control, progress=self.progress,
+        )
+        return {"status": "measured", **report}
+
+    def _screening(self, directory: Path) -> tuple[dict, dict]:
+        """Cheap candidate-vs-accepted match; returns (match metadata, summary)."""
+        config = self.config
+        self.progress.phase = "screening"
+        match_metadata = {"candidate_sha256": fingerprint(cpu_state(self.model)),
+                          "opponent_name": f"accepted_{self.best_iteration:06d}",
+                          "opponent_sha256": fingerprint(cpu_state(self.best)),
+                          "best_iteration": self.best_iteration}
+        screen_config = replace(config, evaluation=replace(
+            config.evaluation, games=config.evaluation.screen_games,
+            simulations_per_move=config.evaluation.screen_simulations_per_move))
+        screening = run_games(
+            screen_config, self.evaluation_jobs(config.evaluation.screen_games),
+            {0: self.runtime.evaluator(self.best), 1: self.runtime.evaluator(self.model)},
+            training=False, check=self.control, progress=self.progress,
+            metadata=match_metadata)
+        write_games(screening, screen_config, directory / "screening")
+        return match_metadata, {
+            **match_metadata,
+            **evaluation_summary(screening),
+            "paired": paired_confidence(screening, confidence=config.evaluation.confidence_level),
+            "simulations_per_move": config.evaluation.screen_simulations_per_move,
+        }
+
+    def _promotion(self, number: int, directory: Path, match_metadata: dict,
+                   screening: dict) -> tuple[dict, bool]:
+        """Run the due confirmation match after a passing screen; promote on success."""
+        config = self.config
+        every = config.evaluation.full_every_iterations
+        due = number % every == 0
+        eligible = (screening["truncated"] == 0 and
+                    screening["score_rate"] >= config.evaluation.screen_min_score_rate)
+        if not (due and eligible):
+            return {"status": "screen_rejected" if due else "scheduled",
+                    "next_due_iteration": self._next_due(number, every)}, False
+        self.progress.phase = "evaluation"
+        confirmation_config = replace(
+            config, self_play=replace(
+                config.self_play,
+                max_game_length_factor=config.evaluation.confirmation_max_game_length_factor))
+        results = self.confirmation_games(confirmation_config, match_metadata)
+        write_games(results, confirmation_config, directory / "evaluation")
+        evaluation = {
+            **match_metadata,
+            **evaluation_summary(results),
+            "paired": paired_confidence(results, confidence=config.evaluation.confidence_level),
+            "paired_sign": paired_sign_test(results, confidence=config.evaluation.confidence_level),
+            "paired_sprt": self.sprt(results),
+            "planned_games": config.evaluation.games,
+            "promotion_test": config.evaluation.promotion_test,
+            "max_game_length_factor": config.evaluation.confirmation_max_game_length_factor,
+            "simulations_per_move": config.evaluation.simulations_per_move,
+        }
+        promoted = confirmed_improvement(evaluation,
+                                         threshold=config.evaluation.promotion_win_rate,
+                                         method=config.evaluation.promotion_test)
+        if promoted:
+            self.best.load_state_dict(self.model.state_dict())
+            self.best_iteration = number
+        return evaluation, promoted
+
+    def _commit_iteration(self, number: int, directory: Path, summary: dict,
+                          started: float) -> dict:
+        config = self.config
         self.iteration = number
         summary.update({"training_steps": self.training_steps, "best_iteration": self.best_iteration,
                         "model_sha256": fingerprint(cpu_state(self.model)),
@@ -468,7 +494,6 @@ class Trainer:
         atomic_json(summary, self.output / "summary.json")
         self.progress({"event": "iteration_completed", **summary})
         return summary
-
 
 def train(config, output, iterations, resume=None, *, resume_path=None, resume_checksum=None):
     with RunLock(output):
