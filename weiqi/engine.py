@@ -32,6 +32,16 @@ def _zobrist_keys(size: int) -> tuple[tuple[int, int, int], ...]:
 
 
 @lru_cache(maxsize=None)
+def _flat_neighbor_table(size: int) -> tuple[tuple[int, ...], ...]:
+    """Neighbors of each flat point ``row * size + col``, as flat points."""
+
+    return tuple(
+        tuple(r * size + c for r, c in neighbors)
+        for neighbors in _neighbor_table(size)
+    )
+
+
+@lru_cache(maxsize=None)
 def _neighbor_table(size: int) -> tuple[tuple[Point, ...], ...]:
     table = []
     for row in range(size):
@@ -399,72 +409,86 @@ class GoGame:
     def legal_moves(self, color: Optional[int] = None) -> Iterator[Point]:
         """Yield every legal board move for ``color`` (passes are not included)."""
 
+        size = self.size
+        for point in self.legal_points(color):
+            yield divmod(point, size)
+
+    def legal_points(self, color: Optional[int] = None) -> list[int]:
+        """Flat indices ``row * size + col`` of every legal board move, row-major.
+
+        Every group is labelled once; a candidate is then legal if it touches
+        an empty point, a friendly group with another liberty, or an enemy group
+        in atari, and its resulting position passes the superko check.
+        """
+
         move_color = self.current_player if color is None else color
         if move_color not in (BLACK, WHITE) or self.game_over:
-            return
-        size, board = self.size, self.board
+            return []
+        size = self.size
+        area = size * size
         enemy = WHITE if move_color == BLACK else BLACK
         keys = _zobrist_keys(size)
+        neighbors = _flat_neighbor_table(size)
+        stones_at = [stone for board_row in self.board for stone in board_row]
 
-        # Label every group once, instead of flooding from each candidate point.
-        group_of: dict[Point, int] = {}
-        group_stones: list[list[Point]] = []
-        group_liberties: list[set[Point]] = []
+        group_of = [-1] * area
+        group_stones: list[list[int]] = []
+        liberty_counts: list[int] = []
         current_hash = 0
-        for row in range(size):
-            for col in range(size):
-                color_here = board[row][col]
-                if color_here == EMPTY:
-                    continue
-                current_hash ^= keys[row * size + col][color_here]
-                if (row, col) in group_of:
-                    continue
-                index = len(group_stones)
-                stones: list[Point] = []
-                liberties: set[Point] = set()
-                group_of[(row, col)] = index
-                pending = [(row, col)]
-                while pending:
-                    point = pending.pop()
-                    stones.append(point)
-                    for neighbor in self.neighbors(*point):
-                        value = board[neighbor[0]][neighbor[1]]
-                        if value == EMPTY:
-                            liberties.add(neighbor)
-                        elif value == color_here and neighbor not in group_of:
-                            group_of[neighbor] = index
-                            pending.append(neighbor)
-                group_stones.append(stones)
-                group_liberties.append(liberties)
+        for point in range(area):
+            color_here = stones_at[point]
+            if color_here == EMPTY:
+                continue
+            current_hash ^= keys[point][color_here]
+            if group_of[point] >= 0:
+                continue
+            index = len(group_stones)
+            stones: list[int] = []
+            liberties: set[int] = set()
+            group_of[point] = index
+            pending = [point]
+            while pending:
+                stone = pending.pop()
+                stones.append(stone)
+                for neighbor in neighbors[stone]:
+                    value = stones_at[neighbor]
+                    if value == EMPTY:
+                        liberties.add(neighbor)
+                    elif value == color_here and group_of[neighbor] < 0:
+                        group_of[neighbor] = index
+                        pending.append(neighbor)
+            group_stones.append(stones)
+            liberty_counts.append(len(liberties))
 
         zobrist_history = self._zobrist_history
-        for row in range(size):
-            for col in range(size):
-                if board[row][col] != EMPTY:
-                    continue
-                has_liberty = False
-                captured: set[int] = set()
-                for neighbor in self.neighbors(row, col):
-                    value = board[neighbor[0]][neighbor[1]]
-                    if value == EMPTY:
+        legal: list[int] = []
+        for point in range(area):
+            if stones_at[point] != EMPTY:
+                continue
+            has_liberty = False
+            captured: set[int] = set()
+            for neighbor in neighbors[point]:
+                value = stones_at[neighbor]
+                if value == EMPTY:
+                    has_liberty = True
+                elif value == move_color:
+                    if liberty_counts[group_of[neighbor]] > 1:
                         has_liberty = True
-                    elif value == move_color:
-                        if len(group_liberties[group_of[neighbor]]) > 1:
-                            has_liberty = True
-                    elif len(group_liberties[group_of[neighbor]]) == 1:
-                        captured.add(group_of[neighbor])
-                if not (has_liberty or captured):
-                    continue  # suicide
-                next_hash = current_hash ^ keys[row * size + col][move_color]
-                for index in captured:
-                    for stone_row, stone_col in group_stones[index]:
-                        next_hash ^= keys[stone_row * size + stone_col][enemy]
-                # A miss proves the position is new; a hit is confirmed exactly.
-                if next_hash in zobrist_history and not self.analyze_move(
-                    row, col, move_color
-                ).legal:
-                    continue
-                yield row, col
+                elif liberty_counts[group_of[neighbor]] == 1:
+                    captured.add(group_of[neighbor])
+            if not (has_liberty or captured):
+                continue  # suicide
+            next_hash = current_hash ^ keys[point][move_color]
+            for index in captured:
+                for stone in group_stones[index]:
+                    next_hash ^= keys[stone][enemy]
+            # A miss proves the position is new; a hit is confirmed exactly.
+            if next_hash in zobrist_history and not self.analyze_move(
+                point // size, point % size, move_color
+            ).legal:
+                continue
+            legal.append(point)
+        return legal
 
     def area_ownership(self) -> list[list[int]]:
         """Owner of every point under area scoring: BLACK, WHITE, or EMPTY (neutral).

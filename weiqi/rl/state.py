@@ -7,7 +7,7 @@ from functools import cached_property
 
 import numpy as np
 
-from ..engine import BLACK, WHITE, BoardHash, GoGame
+from ..engine import BLACK, WHITE, GoGame
 
 
 FEATURE_VERSION = 1
@@ -17,19 +17,19 @@ INPUT_PLANES = 20
 @dataclass(frozen=True)
 class Position:
     game: GoGame
-    history: tuple[BoardHash, ...]
+    # This board and up to seven before it, newest first, as int8 arrays.
+    history: tuple[np.ndarray, ...]
 
     @classmethod
     def new(cls, size: int, komi: float) -> "Position":
         game = GoGame(size, komi, record_undo=False)
-        return cls(game, (game.board_hash(),))
+        return cls(game, (np.array(game.board, dtype=np.int8),))
 
     @cached_property
     def legal(self) -> np.ndarray:
         mask = np.zeros(self.game.size ** 2 + 1, dtype=np.bool_)
         if not self.game.game_over:
-            for row, col in self.game.legal_moves():
-                mask[row * self.game.size + col] = True
+            mask[self.game.legal_points()] = True
             mask[-1] = True
         return mask
 
@@ -43,7 +43,7 @@ class Position:
             result = game.play(*divmod(action, game.size))
             if not result.legal:
                 raise ValueError(result.reason)
-        return Position(game, (game.board_hash(),) + self.history[:7])
+        return Position(game, (np.array(game.board, dtype=np.int8),) + self.history[:7])
 
     def features(self) -> np.ndarray:
         """Eight boards relative to the player to move, plus rule context.
@@ -55,7 +55,7 @@ class Position:
         own = self.game.current_player
         other = WHITE if own == BLACK else BLACK
         result = np.zeros((INPUT_PLANES, size, size), dtype=np.float32)
-        boards = np.array(self.history, dtype=np.int8)
+        boards = np.stack(self.history)
         count = len(boards)
         result[0:2 * count:2] = boards == own
         result[1:2 * count:2] = boards == other
