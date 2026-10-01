@@ -301,6 +301,7 @@ weiqi_gui/
 │   ├── analysis_gui.py   # 候选/PV、ownership、曲线和变化树窗口
 │   ├── analysis_layout.py、analysis_board.py、analysis_panels.py、analysis_style.py # 分析窗口的布局、棋盘、侧栏与配色
 │   ├── katago.py        # KataGo JSON 协议、职业段位和进程管理
+│   ├── katago_settings.py、katago_protocol.py、katago_moves.py # KataGo 设置与段位档位、协议转换、按档位选着
 │   ├── katago_gui.py    # KataGo 文件配置窗口
 │   ├── winrate.py       # 实时胜率与领先目数估算
 │   ├── rl_config.py     # 强化学习默认/高性能预设、覆盖和校验
