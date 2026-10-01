@@ -126,15 +126,15 @@ class RunnerLifecycleTests(unittest.TestCase):
             self.assertIn("device unavailable", final["error"])
 
     def test_evaluation_and_benchmark_runtime_failure_is_recorded(self):
-        from weiqi.rl.runner import benchmark, evaluate
+        from weiqi.rl.assessment import benchmark, evaluate
 
         config = SimpleNamespace(runtime=SimpleNamespace(pause_while_game_is_active=False))
         for operation in ("evaluate", "benchmark"):
             with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory, \
                     redirect_stdout(io.StringIO()):
                 root = Path(directory)
-                with patch("weiqi.rl.runner.load_checkpoint", return_value=({}, config)), \
-                        patch("weiqi.rl.runner.Runtime", side_effect=RuntimeError("device unavailable")):
+                with patch("weiqi.rl.assessment.load_checkpoint", return_value=({}, config)), \
+                        patch("weiqi.rl.assessment.Runtime", side_effect=RuntimeError("device unavailable")):
                     with self.assertRaisesRegex(RuntimeError, "device unavailable"):
                         if operation == "evaluate":
                             evaluate(Path("unused.pt"), None, root)

@@ -88,7 +88,8 @@ def main(argv=None) -> int:
     try:
         from weiqi.rl.control import TrainingStopped
         from weiqi.fileio import sha256_file
-        from weiqi.rl.runner import benchmark, evaluate, train
+        from weiqi.rl.assessment import benchmark, evaluate
+        from weiqi.rl.runner import train
         from weiqi.rl.storage import fingerprint, load_checkpoint
         from weiqi.rl_config import DEFAULT_RL_CONFIG_PATH, load_rl_training_config
     except ImportError as error:
