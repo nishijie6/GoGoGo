@@ -297,7 +297,9 @@ weiqi_gui/
 │   ├── engine.py        # 围棋规则与计分
 │   ├── ai.py            # 本地启发式电脑对手
 │   ├── analysis_workbench.py # AI 分析、历史与多分支推演的独立状态模块
+│   ├── analysis_model.py、analysis_parsing.py # 分析工作台的数据类型与 KataGo 结果解析
 │   ├── analysis_gui.py   # 候选/PV、ownership、曲线和变化树窗口
+│   ├── analysis_layout.py、analysis_board.py、analysis_panels.py、analysis_style.py # 分析窗口的布局、棋盘、侧栏与配色
 │   ├── katago.py        # KataGo JSON 协议、职业段位和进程管理
 │   ├── katago_gui.py    # KataGo 文件配置窗口
 │   ├── winrate.py       # 实时胜率与领先目数估算
@@ -313,7 +315,9 @@ weiqi_gui/
 │   ├── rules.py         # 程序内中文围棋规则内容
 │   ├── training.py      # 定式/死活课程数据与局部次序回放
 │   ├── training_gui.py  # 交互式推理训练窗口
-│   └── gui.py           # Tkinter 界面
+│   ├── training_layout.py、training_board.py # 推理训练窗口的布局与棋盘
+│   ├── gui_layout.py、gui_board.py、gui_windows.py、gui_status.py、gui_constants.py # 主窗口的布局、棋盘、附属窗口与状态栏
+│   └── gui.py           # Tkinter 主窗口与对局控制
 ├── config/
 │   ├── katago_analysis.cfg # 低内存、单局面 KataGo 分析配置
 │   ├── rl_training.json # 普通电脑默认强化学习配置
