@@ -14,7 +14,7 @@ import torch
 from torch.utils.data import Dataset
 
 from ..rl_config import RL_CONFIG_VERSION, resolve_rl_training_config
-from .state import FEATURE_VERSION, INPUT_PLANES, augment
+from .state import FEATURE_VERSION, INPUT_PLANES, augment, augment_batch
 
 
 CHECKPOINT_VERSION = 1
@@ -102,6 +102,19 @@ class ReplayBuffer(Dataset):
         if self.use_symmetry:
             features, policy = augment(features, policy, int(torch.randint(8, ()).item()))
         return torch.from_numpy(features), torch.from_numpy(policy), torch.tensor(target, dtype=torch.float32)
+
+    def sample(self, batch_size: int):
+        """Draw a batch with replacement in-process; no worker pickling of the pool."""
+        indices = torch.randint(len(self.samples), (batch_size,)).tolist()
+        rows = [self.samples[index] for index in indices]
+        features = np.stack([row[0] for row in rows])
+        policies = np.stack([row[1] for row in rows])
+        if self.use_symmetry:
+            features, policies = augment_batch(
+                features, policies, torch.randint(8, (batch_size,)).numpy())
+        values = np.array([row[2] for row in rows], dtype=np.float32)
+        return (torch.from_numpy(np.ascontiguousarray(features)),
+                torch.from_numpy(np.ascontiguousarray(policies)), torch.from_numpy(values))
 
     def state(self) -> dict:
         if not self.samples:

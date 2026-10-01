@@ -10,7 +10,6 @@ import time
 import numpy as np
 import torch
 from torch.nn import functional as F
-from torch.utils.data import DataLoader, RandomSampler
 
 from ..engine import BLACK, WHITE
 from ..rl_config import RLTrainingConfig
@@ -130,21 +129,18 @@ class Trainer:
     def train_updates(self) -> dict:
         config = self.config
         count = config.optimizer.training_steps_per_iteration
-        sampler = RandomSampler(self.replay, replacement=True, num_samples=count * config.optimizer.batch_size)
-        loader = DataLoader(
-            self.replay, batch_size=config.optimizer.batch_size, sampler=sampler,
-            num_workers=config.hardware.data_loader_workers,
-            pin_memory=config.hardware.pin_memory and self.runtime.device.type == "cuda",
-        )
         self.model.train()
         initial = next(self.model.parameters()).detach().clone()
         started = time.monotonic()
         totals = np.zeros(3, dtype=np.float64)
         updates = 0
-        for step, (features, policies, values) in enumerate(loader, 1):
+        pin = config.hardware.pin_memory and self.runtime.device.type == "cuda"
+        for step in range(1, count + 1):
             self.control()
-            features, policies, values = (item.to(self.runtime.device, non_blocking=True)
-                                         for item in (features, policies, values))
+            batch = self.replay.sample(config.optimizer.batch_size)
+            features, policies, values = (
+                (item.pin_memory() if pin else item).to(self.runtime.device, non_blocking=True)
+                for item in batch)
             self.optimizer.zero_grad(set_to_none=True)
             with self.runtime.autocast():
                 predicted_policy, predicted_value = self.training_model(features)

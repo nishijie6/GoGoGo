@@ -84,3 +84,23 @@ def augment(features: np.ndarray, policy: np.ndarray, symmetry: int):
     board_policy = np.rot90(board_policy, symmetry % 4)
     policy = np.concatenate((board_policy.ravel(), policy[-1:]))
     return np.ascontiguousarray(features), np.ascontiguousarray(policy)
+
+
+def augment_batch(features: np.ndarray, policies: np.ndarray, symmetries: np.ndarray):
+    """Apply a per-row square symmetry to a batch; identical to row-wise ``augment``."""
+    features, policies = features.copy(), policies.copy()
+    for symmetry in np.unique(symmetries):
+        rows = np.flatnonzero(symmetries == symmetry)
+        features[rows], policies[rows] = _augment_rows(features[rows], policies[rows], int(symmetry))
+    return features, policies
+
+
+def _augment_rows(features: np.ndarray, policies: np.ndarray, symmetry: int):
+    size = features.shape[-1]
+    board = policies[:, :-1].reshape(len(policies), size, size)
+    if symmetry >= 4:
+        features = np.flip(features, axis=-1)
+        board = np.flip(board, axis=-1)
+    features = np.rot90(features, symmetry % 4, axes=(-2, -1))
+    board = np.rot90(board, symmetry % 4, axes=(-2, -1))
+    return features, np.concatenate((board.reshape(len(policies), -1), policies[:, -1:]), axis=1)

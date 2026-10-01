@@ -8,7 +8,7 @@ if AVAILABLE:
     import numpy as np
     from weiqi.rl.search import search
     from weiqi.rl.selfplay import GameJob, evaluation_summary, play_game
-    from weiqi.rl.state import Position, augment
+    from weiqi.rl.state import Position, augment, augment_batch
 
 from weiqi.engine import BLACK, WHITE, GoGame
 from weiqi.rl_config import resolve_rl_training_config
@@ -54,6 +54,30 @@ class SearchTests(unittest.TestCase):
             self.assertAlmostEqual(float(policy.sum()), 1.0, places=5)
             self.assertLessEqual(abs(value), 1.0)
             self.assertAlmostEqual(float((policy * simulations).sum()), simulations, places=3)
+
+    def test_batch_augmentation_matches_row_wise_augmentation(self):
+        generator = np.random.default_rng(0)
+        features = generator.random((32, 20, 9, 9)).astype(np.float32)
+        policies = generator.random((32, 82)).astype(np.float32)
+        symmetries = np.arange(32) % 8
+        batch_features, batch_policies = augment_batch(features, policies, symmetries)
+        for row, symmetry in enumerate(symmetries):
+            expected = augment(features[row], policies[row], int(symmetry))
+            np.testing.assert_array_equal(batch_features[row], expected[0])
+            np.testing.assert_array_equal(batch_policies[row], expected[1])
+
+    def test_replay_sampling_returns_float32_batches_without_a_dataloader(self):
+        from weiqi.rl.storage import ReplayBuffer
+        generator = np.random.default_rng(1)
+        replay = ReplayBuffer(100, 9, True)
+        policy = np.full(82, 1 / 82, dtype=np.float32)
+        replay.extend([(generator.random((20, 9, 9)).astype(np.float32), policy, 1.0)
+                       for _ in range(10)])
+        features, policies, values = replay.sample(16)
+        self.assertEqual(tuple(features.shape), (16, 20, 9, 9))
+        self.assertEqual(tuple(policies.shape), (16, 82))
+        self.assertEqual(tuple(values.shape), (16,))
+        self.assertAlmostEqual(float(policies.sum(dim=1).min()), 1.0, places=5)
 
     def test_terminal_win_and_loss_are_backed_up_in_root_perspective(self):
         # White can end an empty board and win on komi.
