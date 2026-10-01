@@ -55,10 +55,10 @@ class Position:
         own = self.game.current_player
         other = WHITE if own == BLACK else BLACK
         result = np.zeros((INPUT_PLANES, size, size), dtype=np.float32)
-        for index, board in enumerate(self.history):
-            array = np.asarray(board)
-            result[index * 2] = array == own
-            result[index * 2 + 1] = array == other
+        boards = np.array(self.history, dtype=np.int8)
+        count = len(boards)
+        result[0:2 * count:2] = boards == own
+        result[1:2 * count:2] = boards == other
         result[16].fill(own == BLACK)
         result[17].fill(self.game.komi / 20 * (1 if own == WHITE else -1))
         result[18].fill(min(self.game.consecutive_passes, 1))

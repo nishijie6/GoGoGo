@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import multiprocessing as mp
+from multiprocessing.connection import wait
 from queue import Empty
 import time
 import traceback
@@ -116,19 +117,20 @@ def play_game(config, job, evaluate, *, training: bool) -> GameResult:
     )
 
 
-def _worker(config, jobs, training, actor, requests, responses, completed, stop):
+def _worker(config, jobs, training, actor, conn, completed, stop):
     """Spawn target: imports NumPy and the rules, but never creates a CUDA context."""
     try:
         def evaluate(model_id, features):
             if stop.is_set():
                 raise InterruptedError("Training stopped")
-            requests.put((actor, model_id, features))
-            while not stop.is_set():
-                try:
-                    result = responses.get(timeout=0.25)
-                    return result
-                except Empty:
-                    pass
+            try:
+                conn.send((model_id, features))
+                while not stop.is_set():
+                    # Returns the moment the reply arrives; the timeout only bounds stop latency.
+                    if conn.poll(0.25):
+                        return conn.recv()
+            except (EOFError, OSError):
+                pass
             raise InterruptedError("Training stopped")
 
         for job in jobs:
@@ -169,21 +171,26 @@ def run_games(
               "jobs": list(job_metadata.values())})
     context = mp.get_context("spawn")
     workers = min(config.self_play.workers, len(jobs))
-    requests, completed = context.Queue(), context.Queue()
-    responses = [context.Queue() for _ in range(workers)]
+    completed = context.Queue()
+    # One duplex pipe per actor: a blocking Queue.get(timeout) costs ~16 ms per
+    # round trip on Windows, while a pipe plus connection.wait is ~0.1 ms.
+    pipes = [context.Pipe() for _ in range(workers)]
     stop = context.Event()
     processes, results, done = [], [], set()
+    connections = {}
     last_progress = time.monotonic()
     batches, positions = 0, 0
     try:
         for actor in range(workers):
             process = context.Process(
                 target=_worker,
-                args=(config, jobs[actor::workers], training, actor, requests,
-                      responses[actor], completed, stop),
+                args=(config, jobs[actor::workers], training, actor, pipes[actor][1],
+                      completed, stop),
                 name=f"go-selfplay-{actor}",
             )
             process.start()
+            pipes[actor][1].close()
+            connections[pipes[actor][0]] = actor
             processes.append(process)
         while len(done) < workers:
             check()
@@ -214,24 +221,29 @@ def run_games(
                     raise RuntimeError(f"Self-play worker {actor} exited with {process.exitcode}")
             if len(done) == workers:
                 break
-            try:
-                batch = [requests.get(timeout=0.02)]
-            except Empty:
+            batch = []
+            ready = wait(list(connections), timeout=0.02)
+            while ready:
+                for connection in ready:
+                    try:
+                        model_id, features = connection.recv()
+                    except (EOFError, OSError):
+                        del connections[connection]  # actor finished or died
+                        continue
+                    batch.append((connections[connection], model_id, features))
+                if len(batch) >= config.self_play.inference_batch_size:
+                    break
+                # Requests already sitting in other pipes join this batch for free.
+                waiting = [c for c in connections if connections[c] not in
+                           {item[0] for item in batch}]
+                ready = wait(waiting, timeout=0) if waiting else []
+            if not batch:
                 continue
-            deadline = time.monotonic() + 0.002
-            while len(batch) < config.self_play.inference_batch_size:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                try:
-                    batch.append(requests.get(timeout=remaining))
-                except Empty:
-                    break
             for model_id in {request[1] for request in batch}:
                 subset = [request for request in batch if request[1] == model_id]
                 policies, values = evaluators[model_id](np.stack([item[2] for item in subset]))
                 for item, policy, value in zip(subset, policies, values):
-                    responses[item[0]].put((policy, float(value)))
+                    pipes[item[0]][0].send((policy, float(value)))
                 batches += 1
                 positions += len(subset)
             if time.monotonic() - last_progress >= 10:
@@ -250,9 +262,10 @@ def run_games(
             if process.is_alive():
                 process.terminate()
                 process.join(timeout=2)
-        for queue in [requests, completed, *responses]:
-            queue.cancel_join_thread()
-            queue.close()
+        for connection, _ in pipes:
+            connection.close()
+        completed.cancel_join_thread()
+        completed.close()
 
 
 def game_outcome(game: GameResult, *, training: bool, opponent_name: str) -> str:
