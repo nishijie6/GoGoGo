@@ -89,9 +89,9 @@
         <div class="middle-grid">
           <section class="panel trend-panel" id="trend" aria-labelledby="trend-title">
             <div class="panel-header"><div><span class="section-kicker">PERFORMANCE</span><h2 id="trend-title">评估胜率趋势</h2></div><span class="soft-tag" id="history-count">0 轮记录</span></div>
-            <div class="chart-legend"><span><i class="legend-dot eval-dot"></i>晋级评估</span><span><i class="legend-dot screening-dot"></i>早期筛选</span><span class="chart-legend-note">胜场 / 总对局</span></div>
-            <div class="chart-area" id="chart-area"><svg id="trend-chart" viewBox="0 0 760 256" role="img" aria-labelledby="chart-title chart-description"><title id="chart-title">候选模型评估胜率趋势</title><desc id="chart-description">尚无评估数据</desc></svg><div class="chart-empty" id="chart-empty"><span aria-hidden="true">⌁</span><strong>评估完成后，这里会绘出趋势</strong><p>自我对弈不会产生候选模型胜率。</p></div></div>
-            <div class="chart-note"><span aria-hidden="true">ⓘ</span><span>每轮对手可能变化，胜率不能直接作为棋力增长曲线；缺失数据保留空档。</span></div>
+            <div class="chart-legend" id="trend-legend"><span><i class="legend-dot eval-dot"></i>晋级评估</span><span><i class="legend-dot screening-dot"></i>早期筛选</span><span class="chart-legend-note">胜场 / 总对局</span></div>
+            <div class="diagnostic-grid legacy-trend" id="legacy-trend" hidden></div><div class="chart-area" id="chart-area"><svg id="trend-chart" viewBox="0 0 760 256" role="img" aria-labelledby="chart-title chart-description"><title id="chart-title">候选模型评估胜率趋势</title><desc id="chart-description">尚无评估数据</desc></svg><div class="chart-empty" id="chart-empty"><span aria-hidden="true">⌁</span><strong>评估完成后，这里会绘出趋势</strong><p>自我对弈不会产生候选模型胜率。</p></div></div>
+            <div class="chart-note"><span aria-hidden="true">ⓘ</span><span id="trend-note">每轮对手可能变化，胜率不能直接作为棋力增长曲线；缺失数据保留空档。</span></div>
           </section>
 
           <section class="panel detail-panel" aria-labelledby="detail-title">

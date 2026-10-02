@@ -32,6 +32,7 @@
   let opponentsSignature = "";
   let eventsSignature = "";
   let chartSignature = "";
+  let legacyTrendCount = 0;
   let integrationSignature = "";
   let baselineGroups = new Map();
 
@@ -458,6 +459,7 @@
     $("curriculum-detail").hidden = !c?.board_size;
     text("curriculum-detail", c ? `课程棋盘 ${c.board_size} × ${c.board_size} · 已训练 ${count(c.samples)} 样本 · 下次评测 ${count(c.next_evaluation_sample)} 样本 · 连续通过 ${count(c.passes)} 次 · 冠军 ${c.champion || "未记录"} · 磁盘剩余 ${finite(c.disk_free_gib) ? c.disk_free_gib.toFixed(1) : "—"} GiB` : "");
     text("diagnostic-note", `最多显示最近 300 轮。${legacy ? "损失为旧版检查点移动平均，吞吐为训练样本 / 参数训练耗时。" : "吞吐为新增样本 / 自我对弈耗时。"}损失下降不等同于棋力提升。`);
+    legacyTrendCount = legacy ? renderLegacyTrend(snapshot.evaluations) : 0;
     const oldValue = $("baseline-select").value;
     baselineGroups = new Map();
     for (const row of list(snapshot.evaluations)) {
@@ -477,6 +479,29 @@
     $("baseline-select").disabled = !baselineGroups.size;
     if (baselineGroups.has(oldValue)) $("baseline-select").value = oldValue;
     renderBaseline();
+  }
+  function renderLegacyTrend(evaluations) {
+    const stages = new Map();
+    for (const row of list(evaluations)) {
+      if (!finite(row.samples)) continue;
+      const key = row.stage || "未记录阶段";
+      if (!stages.has(key)) stages.set(key, []);
+      const value = row.interval?.mean_score ?? row.score_rate ?? row.win_rate;
+      stages.get(key).push({ ...row, [row.role === "pool" ? "pool" : "champion"]: rate(value) });
+    }
+    const latest = (rows) => Math.max(...rows.map((row) => Date.parse(row.timestamp) || 0));
+    const cards = Array.from(stages).sort((a, b) => latest(b[1]) - latest(a[1])).map(([stage, rows]) => {
+      rows.sort((a, b) => a.samples - b.samples);
+      const fields = [["champion", "挑战滚动冠军", "#2d7b65"], ["pool", "对固定基准", "#c3a36b"]].filter(([key]) => rows.some((row) => row[key] != null));
+      const card = element("article", "diagnostic-card");
+      card.append(element("h3", "", `${stage} 阶段 · ${rows.length} 次评测`), compactChart(rows, fields, { probability: true, connect: false, intervals: true, xKey: "samples", xLabel: "阶段训练样本" }));
+      const legend = element("div", "diagnostic-legend");
+      for (const [, label, color] of fields) { const item = element("span", "", label); item.style.color = color; legend.append(item); }
+      card.append(legend);
+      return card;
+    });
+    $("legacy-trend").replaceChildren(...cards);
+    return cards.length;
   }
   function renderBaseline() {
     const rows = baselineGroups.get($("baseline-select").value) || [];
@@ -526,14 +551,18 @@
     renderIntegrated(snapshot);
     const legacy = snapshot.source === "legacy";
     $("dashboard").classList.toggle("legacy-dashboard", legacy);
-    $("trend").hidden = legacy;
+    $("legacy-trend").hidden = !legacy || !legacyTrendCount;
+    $("chart-area").hidden = legacy && legacyTrendCount > 0;
+    $("trend-legend").hidden = legacy;
     $("opponents").hidden = legacy;
     $("events").hidden = legacy;
     document.querySelector('a[href="#opponents"]').hidden = legacy;
     document.querySelector('a[href="#events"]').hidden = legacy;
-    document.querySelector('a[href="#trend"], a[data-trend-link]').setAttribute("data-trend-link", "true");
-    document.querySelector('a[data-trend-link]').setAttribute("href", legacy ? "#baselines" : "#trend");
+    text("trend-note", legacy
+      ? "每个点是一次独立评测；滚动冠军每次晋级后更换，对手不同，所以点不连线。竖线为统计区间，横轴为该棋盘阶段的累计训练样本。"
+      : "每轮对手可能变化，胜率不能直接作为棋力增长曲线；缺失数据保留空档。");
     if (legacy) {
+      text("history-count", `${count(list(snapshot.evaluations).filter((row) => finite(row.samples)).length)} 次评测`);
       const batch = snapshot.recent_evaluation;
       text("phase-label", "旧版训练历史");
       text("rate-title", "最近评测胜率");
