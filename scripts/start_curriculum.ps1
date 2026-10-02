@@ -40,31 +40,60 @@ $stdoutLog = Join-Path $logDirectory "curriculum-$launchTimestamp.stdout.log"
 $stderrLog = Join-Path $logDirectory "curriculum-$launchTimestamp.stderr.log"
 $lifecycleLog = Join-Path $logDirectory "launcher.log"
 
-$launchMessage = "{0:o} starting curriculum (pid={1}, config={2})" -f `
-    (Get-Date), $PID, $resolvedCurriculumConfig
-Add-Content -LiteralPath $lifecycleLog -Value $launchMessage -Encoding UTF8
-
-$exitCode = 1
-Push-Location $resolvedProjectRoot
-try {
-    $env:PYTHONUNBUFFERED = "1"
-    & $resolvedPythonPath -u $entryPoint curriculum `
-        --curriculum-config $resolvedCurriculumConfig `
-        1>> $stdoutLog 2>> $stderrLog
-
-    if ($null -ne $LASTEXITCODE) {
-        $exitCode = [int]$LASTEXITCODE
+# The lifecycle log is advisory: a failed write (e.g. the file is briefly open
+# elsewhere) is retried, then skipped, and never stops or fails the run.
+function Write-LauncherLog([string]$Message) {
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        try {
+            Add-Content -LiteralPath $lifecycleLog -Value $Message -Encoding UTF8 -ErrorAction Stop
+            return
+        }
+        catch {
+            Start-Sleep -Milliseconds 200
+        }
     }
 }
-catch {
-    $errorMessage = "{0:o} launcher failure: {1}" -f (Get-Date), $_.Exception.Message
-    Add-Content -LiteralPath $lifecycleLog -Value $errorMessage -Encoding UTF8
-    $exitCode = 1
-}
-finally {
-    Pop-Location
+
+function Format-Argument([string]$Value) {
+    return '"' + $Value.Replace('"', '\"') + '"'
 }
 
-$exitMessage = "{0:o} curriculum exited with code {1}" -f (Get-Date), $exitCode
-Add-Content -LiteralPath $lifecycleLog -Value $exitMessage -Encoding UTF8
+Write-LauncherLog ("{0:o} starting curriculum (pid={1}, config={2})" -f `
+    (Get-Date), $PID, $resolvedCurriculumConfig)
+
+# Let the OS write the child's stdout and stderr straight to the log files.
+# With PowerShell redirection (`1>> 2>>`) under Windows PowerShell 5.1, any
+# line on stderr -- even a recoverable notice -- becomes a terminating error
+# here, and a transient lock on the log file aborts the launcher; both used to
+# end the training run. PYTHONUTF8 keeps the logs UTF-8 under every host.
+$env:PYTHONUNBUFFERED = "1"
+$env:PYTHONUTF8 = "1"
+$arguments = @(
+    "-u",
+    (Format-Argument $entryPoint),
+    "curriculum",
+    "--curriculum-config",
+    (Format-Argument $resolvedCurriculumConfig)
+) -join " "
+
+$exitCode = 1
+try {
+    $process = Start-Process -FilePath $resolvedPythonPath `
+        -ArgumentList $arguments `
+        -WorkingDirectory $resolvedProjectRoot `
+        -RedirectStandardOutput $stdoutLog `
+        -RedirectStandardError $stderrLog `
+        -NoNewWindow -PassThru
+    # Reading Handle before waiting makes ExitCode available afterwards.
+    $null = $process.Handle
+    Write-LauncherLog ("{0:o} curriculum process started (pid={1})" -f (Get-Date), $process.Id)
+    $process.WaitForExit()
+    $exitCode = [int]$process.ExitCode
+}
+catch {
+    Write-LauncherLog ("{0:o} launcher failure: {1}" -f (Get-Date), $_.Exception.Message)
+    $exitCode = 1
+}
+
+Write-LauncherLog ("{0:o} curriculum exited with code {1}" -f (Get-Date), $exitCode)
 exit $exitCode
