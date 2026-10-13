@@ -6,10 +6,63 @@ import argparse
 from dataclasses import replace
 import json
 from pathlib import Path
+import shlex
 import sys
 
 
 ROOT = Path(__file__).resolve().parent
+HANDOFF_COMMANDS = {
+    "handoff-export", "handoff-verify", "handoff-import", "handoff-check", "handoff-cancel",
+}
+
+
+def _resume_command(report: dict) -> str | None:
+    checkpoint = report.get("resume_checkpoint")
+    if not checkpoint:
+        return None
+    command = [sys.executable, str(ROOT / "train.py"), "train", "--resume", str(checkpoint),
+               "--iterations", "1"]
+    if report.get("hardware_profile"):
+        command.extend(["--hardware-overrides", str(report["hardware_profile"])])
+    if sys.platform == "win32":
+        return "& " + " ".join("'" + value.replace("'", "''") + "'" for value in command)
+    return shlex.join(command)
+
+
+def _run_handoff(args: argparse.Namespace) -> int:
+    # Keep verify/import and byte-only checks usable without PyTorch or CUDA.
+    from weiqi.rl_handoff import (
+        HandoffError, cancel_handoff, check_import, export_handoff, import_handoff, verify_handoff,
+    )
+    try:
+        if args.action == "handoff-export":
+            report = export_handoff(ROOT, args.bundle, native_run=args.run_dir)
+        elif args.action == "handoff-verify":
+            report = verify_handoff(args.bundle, expected_trainer="native")
+        elif args.action == "handoff-import":
+            report = dict(import_handoff(
+                ROOT, args.bundle, args.destination,
+                allow_version_mismatch=args.allow_version_mismatch,
+                hardware_profile=args.hardware_profile, expected_trainer="native",
+            ))
+            resume = _resume_command(report)
+            if resume:
+                report["resume_command"] = resume
+        elif args.action == "handoff-check":
+            report = check_import(args.destination, load_checkpoint=args.load_checkpoint,
+                                  expected_trainer="native")
+        else:
+            report = cancel_handoff(ROOT, native_run=args.run_dir)
+        print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+    except (HandoffError, ValueError, RuntimeError, OSError, KeyError) as error:
+        print(f"Training handoff error: {error}", file=sys.stderr)
+        return 1
+    except ImportError as error:
+        print(f"Training dependencies unavailable: {error}\n"
+              "Export and --load-checkpoint need PyTorch; use the training environment.",
+              file=sys.stderr)
+        return 2
+    return 0
 
 
 def with_evaluation_overrides(config, path: Path):
@@ -55,7 +108,7 @@ def with_training_policy(config, path: Path):
                         if key not in ("schema_version", "preset")})
 
 
-def main(argv=None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="9x9 Go self-play training and evaluation")
     actions = parser.add_subparsers(dest="action", required=True)
     train_parser = actions.add_parser("train", help="Run a bounded number of additional training iterations")
@@ -67,6 +120,8 @@ def main(argv=None) -> int:
                               help="JSON overrides for evaluation budgets only, including on resume")
     train_parser.add_argument("--policy-overrides", type=Path,
                               help="Safe opponent and promotion policy overrides, including on resume")
+    train_parser.add_argument("--hardware-overrides", type=Path,
+                              help="Validated device, precision, workers and batch overrides for this machine")
     evaluate_parser = actions.add_parser("evaluate", help="Play color-swapped paired games")
     evaluate_parser.add_argument("checkpoint", type=Path)
     evaluate_parser.add_argument("--opponent", type=Path, help="Other model; default is uniform-policy MCTS")
@@ -84,7 +139,30 @@ def main(argv=None) -> int:
     benchmark_parser.add_argument("--position-visits", type=int)
     inspect_parser = actions.add_parser("inspect", help="Inspect a checkpoint without starting games")
     inspect_parser.add_argument("checkpoint", type=Path)
+    export_parser = actions.add_parser("handoff-export", help="Seal an existing ordinary training run for relay")
+    export_parser.add_argument("--run-dir", type=Path, required=True)
+    export_parser.add_argument("--bundle", type=Path, required=True)
+    verify_parser = actions.add_parser("handoff-verify", help="Verify an ordinary trainer relay bundle")
+    verify_parser.add_argument("--bundle", type=Path, required=True)
+    import_parser = actions.add_parser("handoff-import", help="Import into a new local directory without starting training")
+    import_parser.add_argument("--bundle", type=Path, required=True)
+    import_parser.add_argument("--destination", type=Path, required=True)
+    import_parser.add_argument("--hardware-profile", type=Path)
+    import_parser.add_argument("--allow-version-mismatch", action="store_true")
+    check_parser = actions.add_parser("handoff-check", help="Check an imported ordinary training run")
+    check_parser.add_argument("--destination", type=Path, required=True)
+    check_parser.add_argument("--load-checkpoint", action="store_true",
+                              help="Use PyTorch on CPU to validate full restore state")
+    cancel_parser = actions.add_parser("handoff-cancel", help="Allow the original run to resume after a cancelled relay")
+    cancel_parser.add_argument("--run-dir", type=Path, required=True)
+    return parser
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
+    if args.action in HANDOFF_COMMANDS:
+        return _run_handoff(args)
     try:
         from weiqi.rl.control import TrainingStopped
         from weiqi.fileio import sha256_file
@@ -139,6 +217,9 @@ def main(argv=None) -> int:
                 config = with_evaluation_overrides(config, args.evaluation_overrides)
             if args.policy_overrides:
                 config = with_training_policy(config, args.policy_overrides)
+            if args.hardware_overrides:
+                from weiqi.rl_native_handoff import apply_native_hardware
+                config = apply_native_hardware(config, args.hardware_overrides)
             output = args.output or (args.resume.resolve().parent if args.resume else ROOT / config.runtime.output_directory)
             output = output.resolve()
             config = replace(config, runtime=replace(config.runtime, output_directory=str(output)))

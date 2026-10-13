@@ -4,6 +4,13 @@ __pycache__/
 dist/
 build/
 training_runs/
+handoff_bundles/
+*.gogogo-handoff.zip
+# Training checkpoints and exported networks stay local, even outside training_runs/.
+*.ckpt
+*.pt
+*.pth
+*.onnx
 katago-analysis.log
 gtp_logs/
 vendor/katago/

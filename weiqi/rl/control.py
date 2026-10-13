@@ -10,6 +10,7 @@ import uuid
 
 from ..fileio import FileLockHeld, acquire_file_lock, release_file_lock
 from ..rl_activity import game_is_active
+from ..rl_handoff_guard import ensure_training_available
 
 
 class TrainingStopped(Exception):
@@ -27,6 +28,11 @@ class RunLock:
             self.stream = acquire_file_lock(self.path)
         except FileLockHeld as error:
             raise ValueError(f"Another trainer owns {self.path.parent}") from error
+        try:
+            ensure_training_available(self.path.parent)
+        except BaseException:
+            release_file_lock(self.stream)
+            raise
         return self
 
     def __exit__(self, *_):

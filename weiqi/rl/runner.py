@@ -28,6 +28,25 @@ from .storage import (
 )
 
 
+def _restore_cuda_rng(resume: dict, target_device) -> None:
+    """Restore available CUDA RNGs, mapping the active device across hosts."""
+    states = resume["cuda_rng"]
+    if not states:
+        return
+    count = torch.cuda.device_count()
+    for index, state in enumerate(states[:count]):
+        torch.cuda.set_rng_state(state, device=index)
+    source_name = resume.get("config", {}).get("hardware", {}).get("device", "auto")
+    source_index = 0
+    if isinstance(source_name, str) and source_name.startswith("cuda:"):
+        source_index = int(source_name.split(":", 1)[1])
+    target_index = target_device.index
+    if target_index is None:
+        target_index = torch.cuda.current_device()
+    if 0 <= source_index < len(states) and target_index < count and source_index != target_index:
+        torch.cuda.set_rng_state(states[source_index], device=target_index)
+
+
 class Trainer:
     def __init__(self, config: RLTrainingConfig, output: Path, resume: dict | None = None,
                  *, progress: Progress | None = None):
@@ -56,7 +75,10 @@ class Trainer:
             self.model.load_state_dict(resume["model"])
             self.best.load_state_dict(resume["best_model"])
             self.optimizer.load_state_dict(resume["optimizer"])
-            self.scaler.load_state_dict(resume["scaler"])
+            # FP32/CPU saves have no scaler state. A newly enabled AMP scaler
+            # starts fresh while model, optimizer, replay and counters resume.
+            if resume["scaler"]:
+                self.scaler.load_state_dict(resume["scaler"])
             self.replay.restore(resume["replay"])
             self.iteration, self.training_steps = resume["iteration"], resume["training_steps"]
             self.best_iteration = resume["best_iteration"]
@@ -64,7 +86,7 @@ class Trainer:
             self.rng.bit_generator.state = resume["numpy_rng"]
             torch.set_rng_state(resume["torch_rng"])
             if self.runtime.device.type == "cuda" and resume["cuda_rng"]:
-                torch.cuda.set_rng_state_all(resume["cuda_rng"])
+                _restore_cuda_rng(resume, self.runtime.device)
         self.training_model = torch.compile(self.model) if config.hardware.compile_model else self.model
         self.anchors = output / "anchors"
         save_anchor(self.anchors, self.best, config, kind="accepted", iteration=self.best_iteration)

@@ -25,6 +25,7 @@ from .fileio import FileLockHeld, acquire_file_lock, release_file_lock
 from .katago import katago_subprocess_environment
 from .process_control import stream_command
 from .rl_config import RLTrainingConfig, load_rl_training_config
+from .rl_handoff_guard import HandoffLockedError, ensure_training_available
 from .rl_metric_store import RLMetricStore
 from .rl_metrics import parse_selfplay_output
 from .replay_accounting import ReplayAccountingError, ReplayRowLedger
@@ -701,6 +702,10 @@ class KataGoRLRunner:
                 f"训练目录已被另一个进程占用：{lock_path}"
             ) from error
         try:
+            try:
+                ensure_training_available(self.run_root)
+            except HandoffLockedError as error:
+                raise KataGoRLRunnerError(str(error)) from error
             yield
         finally:
             release_file_lock(handle)

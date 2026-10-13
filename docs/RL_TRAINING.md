@@ -44,6 +44,37 @@ WSL2 `Ubuntu-24.04` 的 `/home/dev/.venvs/nanogpt/bin/python`。
 指定新目录。已有运行必须使用 `--resume`，以免误覆盖。训练过程按指定轮数结束，
 不会自动建立长期后台任务。
 
+## 多电脑接力续训
+
+普通版和 KataGo 版分别使用 `train.py` 和 `train_rl.py` 的接力命令，包内记录
+训练版本并拒绝混用。普通版接力保留完整 `latest.pt` 中的模型、最佳模型、
+优化器、回放和随机数状态，以及候选、历史模型、棋谱和记录；已有模型不提交
+Git，也不自动上传。两台电脑仍使用各自的本地 SSD 和 GPU。
+
+A 停止训练并等待全部对弈进程退出后，在现有训练环境中执行：
+
+```powershell
+.\训练围棋.ps1 handoff-export --run-dir training_runs/balanced --bundle handoff_bundles/native-0001.gogogo-handoff.zip
+.\训练围棋.ps1 handoff-verify --bundle handoff_bundles/native-0001.gogogo-handoff.zip
+```
+
+导出成功会冻结 A 的源目录以防误续训。B 复制接力包，再导入尚不存在的目录：
+
+```powershell
+.\训练围棋.ps1 handoff-import --bundle handoff_bundles/native-0001.gogogo-handoff.zip --destination training_runs/native-relay-0001
+.\训练围棋.ps1 handoff-check --destination training_runs/native-relay-0001 --load-checkpoint
+.\训练围棋.ps1 train --resume training_runs/native-relay-0001/run/latest.pt --iterations 1
+```
+
+导入的 `run/latest.pt` 与原检查点字节一致，源机的 `STOP`、`PAUSE` 和锁文件不
+转移；CPU 检查恢复状态后，还需真实完成一次训练更新验证新电脑。报告输出
+`resume_command`；若导入时指定 `--hardware-profile local_hardware.json`，
+续训命令会加入 `--hardware-overrides <导入目录>/config/hardware.json`，只
+调整设备、精度、并发和批次，保持网络结构、规则和学习率。
+
+完整步骤、硬件配置格式、返回 A 和 `handoff-cancel` 的适用条件见
+[多电脑接力指南](TRAINING_HANDOFF.md)。同一次训练只允许一台电脑运行。
+
 ## 多核并行配置
 
 默认配置面向普通机器：2 个对弈进程，每次网络调用合并 4 个搜索叶节点
