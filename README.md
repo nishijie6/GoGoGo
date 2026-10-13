@@ -25,6 +25,8 @@ KataGo 引擎提供。
 - 可选强化学习命令行：9×9 自我对弈、MCTS、策略/价值网络训练、换色评测、
   固定局面与历史模型评测、棋谱导出和完整断点续训；训练对手包含冻结冠军与历史候选，
   正常对局期间自动暂停训练
+- 多电脑接力训练：普通版和 KataGo 版均支持导出、校验和导入完整续训包，
+  换电脑后使用本机硬件继续训练；模型和接力包由 Git 忽略
 - 实时训练监控网页：逐局胜率、当前对手与冠军版本、训练阶段、历史曲线和评测结果；
   Windows 运行 `py monitor_training.py`，打开 <http://127.0.0.1:8766>
 - 棋谱列表、坐标、星位、上一手标记和落子预览
@@ -167,6 +169,11 @@ SHA-256，并放入已被 Git 忽略的 `katago/` 目录；之后程序会自动
 具体操作见 [轮流冠军训练指南](docs/RL_TRAINING.md) 和
 [KataGo 续训指南](docs/KATAGO_TRAINING.md)。
 
+两种后端均支持 `handoff-export`、`handoff-verify`、`handoff-import`、
+`handoff-check` 和 `handoff-cancel`。接力包区分普通版与 KataGo，拒绝混用；
+导入只准备新目录，不会自动开始训练。完整交接、硬件配置和撤销操作见
+[多电脑接力指南](docs/TRAINING_HANDOFF.md)。
+
 监控统一使用 `py monitor_training.py`，访问 <http://127.0.0.1:8766>。
 轮流冠军训练支持逐局进度；KataGo 兼容视图读取课程状态和已完成的整轮评测，
 不把旧记录的页面刷新当成训练心跳。
@@ -287,10 +294,11 @@ python -m unittest discover -s tests -v
 ```text
 weiqi_gui/
 ├── main.py              # 启动入口
-├── train.py             # 强化学习训练、续训、独立评测与检查点检查
+├── train.py             # 普通版强化学习训练、续训、评测与接力命令
+├── train_rl.py          # KataGo 单棋盘、课程训练与接力命令
 ├── benchmark_teacher.py # Windows KataGo 固定局面标注和按需目差评估
 ├── report_evaluation.py # 不依赖 PyTorch 的评测趋势报告
-├── 训练围棋.ps1          # 使用本机 WSL PyTorch 环境的训练入口
+├── 训练围棋.ps1          # 优先使用项目 .venv，兼容既有 WSL 环境的普通版入口
 ├── requirements-training.txt # 可选训练依赖
 ├── 安装KataGo.ps1       # Windows 官方引擎与模型安装脚本
 ├── weiqi/
@@ -307,6 +315,7 @@ weiqi_gui/
 │   ├── rl_config.py     # 强化学习默认/高性能预设、覆盖和校验
 │   ├── rl/              # 特征、策略/价值网络、MCTS、双进程采样与训练闭环
 │   ├── katago_rl.py、katago_rl_cli.py # KataGo 官方自我对弈训练循环与 train_rl.py 命令行
+│   ├── rl_handoff.py、rl_handoff_guard.py、rl_native_handoff.py # 接力包、暂停保护与普通版检查点验收
 │   ├── rl_curriculum*.py # 9→13→19 课程：配置、状态、评测、迁移、清理与运行层
 │   ├── rl_metrics*.py、rl_metric_store.py # KataGo 训练指标、历史记录与仪表盘
 │   ├── rl_match.py、rl_retention.py、rl_benchmark.py、rl_migration.py # 课程用的对局统计、清理、批次调优与迁移

@@ -1,5 +1,36 @@
 # KataGo 训练与课程续训
 
+## 多电脑轮流接力
+
+`train_rl.py` 支持导出、校验和导入 KataGo 接力包；训练仍在当前电脑的本地
+硬盘和 GPU 上运行。接力包包含完整续训检查点、训练数据、模型、课程状态和
+配置，并记录文件 SHA-256 及代码版本。导入只准备新目录，不会自动启动训练。
+导出成功后原训练目录会进入接力暂停状态，防止旧计划任务重新接管同一份训练。
+
+先禁用原电脑的自动训练任务并停止训练，再执行：
+
+```powershell
+py train_rl.py handoff-export --bundle handoff_bundles\handoff-0001.gogogo-handoff.zip
+py train_rl.py handoff-verify --bundle handoff_bundles\handoff-0001.gogogo-handoff.zip
+```
+
+把接力包复制到另一台电脑后，导入到尚不存在的新目录，并核对完整检查点：
+
+```powershell
+py train_rl.py handoff-import `
+  --bundle handoff_bundles\handoff-0001.gogogo-handoff.zip `
+  --destination training_runs\relay-0001
+py train_rl.py handoff-check --destination training_runs\relay-0001 --load-checkpoint
+```
+
+使用导入结果中的 `resume_command` 在新电脑继续训练。第一次跨电脑恢复还应
+确认实际训练日志中的累计训练计数延续，并确认成功完成一次更新。检查点读取
+验证不会运行 GPU 训练，不能代替该验收。
+
+完整交接步骤、不同显卡配置、单棋盘模式和撤销接力见
+[多电脑 KataGo 接力训练](TRAINING_HANDOFF.md)。模型与接力包保持在本地；
+这些命令没有 Git 提交、推送或云端上传动作。
+
 ## 本机配置与启动
 
 本工作区已接入 KataGo 官方的单机训练流程：自我对弈生成数据、洗牌回放窗口、

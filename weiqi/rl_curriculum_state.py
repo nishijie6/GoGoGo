@@ -9,6 +9,7 @@ from typing import Any, Mapping, Optional
 
 from .fileio import FileLockHeld, acquire_file_lock, atomic_write_json, local_timestamp, release_file_lock
 from .rl_curriculum_config import EXPECTED_BOARDS
+from .rl_handoff_guard import HandoffLockedError, ensure_training_available
 
 
 STATE_SCHEMA_VERSION = 1
@@ -214,6 +215,11 @@ class GlobalCurriculumLock:
             self._file = acquire_file_lock(self.path)
         except FileLockHeld as error:
             raise CurriculumLockError(f"课程训练已在运行：{self.path}") from error
+        try:
+            ensure_training_available(self.path.parent)
+        except HandoffLockedError as error:
+            self.__exit__()
+            raise CurriculumLockError(str(error)) from error
         return self
 
     def __exit__(self, *_: object) -> None:
