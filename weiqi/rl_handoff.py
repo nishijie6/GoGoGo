@@ -95,16 +95,26 @@ def _git_revision(root: Path) -> str | None:
 
 
 def _code_metadata(project_root: Path) -> dict:
-    digest = hashlib.sha256()
     paths = sorted((project_root / "weiqi").rglob("*.py"))
     paths += [project_root / "train.py", project_root / "train_rl.py", project_root / "requirements-training.txt"]
+    # Keep the version-1 source hash unchanged. New archives additionally
+    # protect the fixed evaluation assets; machine-specific profiles are
+    # restored from the archive and deliberately excluded from this signature.
+    assets = [project_root / "config" / "rl_eval_positions_9x9.json",
+              project_root / "config" / "rl_eval_teacher_9x9.json"]
+    return {"revision": _git_revision(project_root), "source_sha256": _content_sha256(project_root, paths),
+            "behavior_assets_sha256": _content_sha256(project_root, assets),
+            "katago_revision": _git_revision(project_root / "katago" / "source")}
+
+
+def _content_sha256(project_root: Path, paths: list[Path]) -> str:
+    digest = hashlib.sha256()
     for path in paths:
         if path.is_file():
             digest.update(path.relative_to(project_root).as_posix().encode("utf-8") + b"\0")
             # Git autocrlf must not make the same source incompatible across OSes.
             digest.update(path.read_bytes().replace(b"\r\n", b"\n") + b"\0")
-    return {"revision": _git_revision(project_root), "source_sha256": digest.hexdigest(),
-            "katago_revision": _git_revision(project_root / "katago" / "source")}
+    return digest.hexdigest()
 
 
 def _profile_document(path: Path) -> dict:
@@ -414,6 +424,9 @@ def _manifest(archive: zipfile.ZipFile) -> dict:
         raise HandoffError("接力包缺少代码版本信息")
     if not re.fullmatch(r"[a-f0-9]{64}", str(value["code"].get("source_sha256", ""))):
         raise HandoffError("接力包源码内容校验值无效")
+    if "behavior_assets_sha256" in value["code"] and not re.fullmatch(
+            r"[a-f0-9]{64}", str(value["code"]["behavior_assets_sha256"])):
+        raise HandoffError("接力包固定评测文件内容校验值无效")
     return value
 
 
@@ -693,13 +706,21 @@ def import_handoff(project_root: Path, bundle: Path, destination: Path, *,
         with zipfile.ZipFile(bundle) as archive:
             manifest = _verify_archive(archive, expected_trainer)
             current = _code_metadata(project_root)
-            mismatches = [key for key in ("revision", "source_sha256", "katago_revision")
+            # Publishing a snapshot changes HEAD even if no training code
+            # changes. Content, rather than the enclosing Git commit, defines
+            # compatibility; declared KataGo revisions still require equality.
+            mismatches = [key for key in ("source_sha256", "behavior_assets_sha256", "katago_revision")
                           if manifest["code"].get(key) is not None and current.get(key) != manifest["code"][key]]
+            code_revision_differs = (manifest["code"].get("revision") is not None
+                                     and current.get("revision") != manifest["code"]["revision"])
+            code_content_matched = not any(key in mismatches for key in ("source_sha256", "behavior_assets_sha256"))
             if mismatches:
                 message = "代码或 KataGo 版本与接力包不一致：" + ", ".join(mismatches)
                 if not allow_version_mismatch:
                     raise HandoffError(message + "；请同步版本，必要时显式使用 --allow-version-mismatch")
                 warnings.append(message)
+            if code_revision_differs and code_content_matched:
+                warnings.append("Git 提交不同，但训练源码及已声明的固定评测文件内容校验一致")
             total = sum(record["size"] for record in manifest["files"])
             destination.parent.mkdir(parents=True, exist_ok=True)
             if shutil.disk_usage(destination.parent).free < total + 16 * 1024 * 1024:
@@ -720,6 +741,7 @@ def import_handoff(project_root: Path, bundle: Path, destination: Path, *,
                    "kind": manifest["kind"], "trainer": manifest["trainer"], "imported_at": local_timestamp(),
                    "destination": str(destination), "project_root": str(project_root),
                    "manifest": manifest, "resume": report, "warnings": warnings,
+                   "code_revision_differs": code_revision_differs, "code_content_matched": code_content_matched,
                    "hardware_overrides": overrides, "files": _installed_inventory(temp)}
         atomic_write_json(temp / RECEIPT, receipt)
         if destination.exists():
@@ -739,7 +761,8 @@ def import_handoff(project_root: Path, bundle: Path, destination: Path, *,
         finally:
             release_file_lock(lock)
         return {"root": str(destination), "bundle_id": manifest["bundle_id"], "trainer": manifest["trainer"],
-                "files": len(manifest["files"]), "bytes": total, "warnings": warnings, **report}
+                "files": len(manifest["files"]), "bytes": total, "warnings": warnings,
+                "code_revision_differs": code_revision_differs, "code_content_matched": code_content_matched, **report}
     except (OSError, zipfile.BadZipFile, RuntimeError, NotImplementedError) as error:
         raise HandoffError(f"导入接力包失败：{error}") from error
     finally:

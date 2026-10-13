@@ -5,10 +5,42 @@
 手动启动续训。Git 用于同步程序，网盘、NAS 或移动硬盘可以用于搬运接力包。
 程序不会上传模型、提交或推送 Git，也不会租用云 GPU。它只读取 Git 版本和忽略规则来校验接力包。
 
-已有模型和数据不用移动到 Git。`training_runs/`、`handoff_bundles/`、
+本地训练模型和数据默认不用移动到 Git。`training_runs/`、`handoff_bundles/`、
 `*.gogogo-handoff.zip`、`*.ckpt`、`*.pt`、`*.pth`、`*.onnx` 和
-`*.bin.gz` 均在项目的忽略规则内。忽略规则对已被 Git 跟踪的文件无效；不要用
-`git add -f` 强制添加训练成果。
+`*.bin.gz` 均在项目的忽略规则内。仓库仅对
+`model_snapshots/native/ordinary-stage-20261013.gogogo-handoff.zip` 设置发布例外，
+通过 Git LFS 保存这一份指定的普通版阶段快照。KataGo 成果、日常导出的接力包和
+导入后的训练目录仍被忽略。忽略规则对已被 Git 跟踪的文件无效；不要用
+`git add -f` 批量添加训练目录。
+
+## 从 GitHub 获取普通版阶段成果
+
+仓库发布的普通版快照来自 `balanced_20260920/latest.pt`，保存第 8 轮、
+700 次更新、11,182 条回放样本。它保留完整续训状态和运行目录，
+`best_iteration` 仍为 0，尚无经过正式晋级评测的训练冠军。
+它属于 `native` 后端，应通过 `train.py` 或 `训练围棋.ps1` 导入。
+
+新电脑先安装 Git LFS，然后在项目目录下载真实接力包：
+
+```powershell
+git lfs install
+git pull
+git lfs pull
+
+.\训练围棋.ps1 handoff-import `
+  --bundle model_snapshots/native/ordinary-stage-20261013.gogogo-handoff.zip `
+  --destination training_runs/native_from_github
+
+.\训练围棋.ps1 handoff-check `
+  --destination training_runs/native_from_github `
+  --load-checkpoint
+```
+
+`training_runs/native_from_github` 必须尚不存在。只获取 Git LFS 指针文件而没有
+完成 `git lfs pull` 时，文件不是可导入的 ZIP。读取完整检查点需要对应训练环境的
+PyTorch；配置依赖后再执行检查和报告中的 `resume_command`。
+训练仍使用新电脑自己的硬件，不会在 GitHub 上执行。
+详见[普通版阶段快照说明](../model_snapshots/native/README.md)。
 
 ## 准备下一台电脑
 
@@ -123,7 +155,7 @@ B 完成后，以导入目录下的 `run/` 再导出新编号：
 撤销只移除接力暂停标记，不会撤回别处的接力包，也不会删除源目录已有的
 `STOP` 或 `PAUSE`；原电脑续训前按训练指南处理这些控制文件。正常返回 A
 应导入最新包到另一个新目录，避免又从旧模型分叉。接力包和导入目录始终
-作为本地训练备份，项目 Git 忽略规则会保护它们。
+作为本地训练备份，项目 Git 忽略规则会保护它们；前述指定的普通版发布快照是独立副本。
 
 ## KataGo：A 电脑导出
 
@@ -204,7 +236,8 @@ py train_rl.py handoff-check --destination training_runs\relay-0001 --load-check
 新电脑的 CUDA 环境可用。完成首次接管时还需要执行报告中的启动命令，观察日志
 中的训练计数是否接续，并确认至少一次实际更新成功。A 电脑保持停止。
 
-默认导入会拒绝不匹配的代码版本或源码内容。优先同步到相同版本后重试。
+默认导入会核对训练源码摘要；源码内容不同会被拒绝。Git 提交不同但训练源码摘要
+一致时可以导入，例如发布文档或模型快照形成的新提交。优先同步到相同版本后重试。
 确实需要在不同版本间迁移时，可显式增加 `--allow-version-mismatch`；结果会
 保留兼容性警告，后续检查和实际续训验收仍须通过。该参数只允许版本差异，不会
 跳过接力包的哈希校验或允许覆盖现有目录。

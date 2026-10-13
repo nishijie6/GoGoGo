@@ -26,7 +26,8 @@ KataGo 引擎提供。
   固定局面与历史模型评测、棋谱导出和完整断点续训；训练对手包含冻结冠军与历史候选，
   正常对局期间自动暂停训练
 - 多电脑接力训练：普通版和 KataGo 版均支持导出、校验和导入完整续训包，
-  换电脑后使用本机硬件继续训练；模型和接力包由 Git 忽略
+  换电脑后使用本机硬件继续训练；本地训练产物默认由 Git 忽略，另提供一份通过
+  Git LFS 发布的普通版阶段快照
 - 实时训练监控网页：逐局胜率、当前对手与冠军版本、训练阶段、历史曲线和评测结果；
   Windows 运行 `py monitor_training.py`，打开 <http://127.0.0.1:8766>
 - 棋谱列表、坐标、星位、上一手标记和落子预览
@@ -173,6 +174,14 @@ SHA-256，并放入已被 Git 忽略的 `katago/` 目录；之后程序会自动
 `handoff-check` 和 `handoff-cancel`。接力包区分普通版与 KataGo，拒绝混用；
 导入只准备新目录，不会自动开始训练。完整交接、硬件配置和撤销操作见
 [多电脑接力指南](docs/TRAINING_HANDOFF.md)。
+
+仓库通过 Git LFS 保存一份普通版阶段成果
+[`ordinary-stage-20261013.gogogo-handoff.zip`](model_snapshots/native/README.md)。
+它来自 `balanced_20260920/latest.pt`，保留第 8 轮、700 次更新和 11,182 条
+回放样本，以及优化器、随机数状态和历史记录，可导入新目录继续本地训练。
+这份成果尚未通过正式晋级评测，不能称为已证明棋力最强的模型。
+新电脑安装 Git LFS 后执行 `git lfs install`、`git pull` 和 `git lfs pull`，
+再按[下载与导入说明](model_snapshots/native/README.md)恢复；KataGo 成果仍保存在本地。
 
 监控统一使用 `py monitor_training.py`，访问 <http://127.0.0.1:8766>。
 轮流冠军训练支持逐局进度；KataGo 兼容视图读取课程状态和已完成的整轮评测，
