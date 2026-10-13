@@ -468,11 +468,62 @@ class HandoffTests(unittest.TestCase):
     def test_different_training_code_requires_explicit_import_override(self) -> None:
         self.export()
         write_bytes(self.target / "weiqi" / "trainer_identity.py", b"VERSION = 2\n")
-        with self.assertRaises(HandoffError):
+        with self.assertRaisesRegex(HandoffError, "source_sha256"):
             self.import_bundle()
         self.assertFalse(self.destination.exists())
         self.import_bundle(allow_version_mismatch=True)
         self.assertTrue((self.destination / "curriculum" / "state.json").is_file())
+
+    def test_matching_source_allows_artifact_only_git_commit_without_override(self) -> None:
+        revisions = {self.source: "a" * 40, self.target: "b" * 40}
+        with patch.object(rl_handoff, "_git_revision", side_effect=lambda root: revisions.get(root)):
+            self.export()
+            report = self.import_bundle()
+        self.assertTrue(report["code_revision_differs"])
+        self.assertTrue(report["code_content_matched"])
+        self.assertTrue(any("内容校验一致" in warning for warning in report["warnings"]))
+        receipt = json.loads((self.destination / "handoff_receipt.json").read_text(encoding="utf-8"))
+        self.assertTrue(receipt["code_revision_differs"])
+        self.assertTrue(receipt["code_content_matched"])
+        self.assertIsInstance(check_import(self.destination), dict)
+
+    def test_matching_source_does_not_allow_different_declared_katago_revision(self) -> None:
+        revisions = {self.source: "a" * 40, self.target: "b" * 40,
+                     self.source / "katago" / "source": "c" * 40,
+                     self.target / "katago" / "source": "d" * 40}
+        with patch.object(rl_handoff, "_git_revision", side_effect=lambda root: revisions.get(root)):
+            self.export()
+            with self.assertRaisesRegex(HandoffError, "katago_revision"):
+                self.import_bundle()
+            self.assertFalse(self.destination.exists())
+            report = self.import_bundle(allow_version_mismatch=True)
+        self.assertTrue(any("katago_revision" in warning for warning in report["warnings"]))
+
+    def test_changed_frozen_evaluation_assets_require_explicit_import_override(self) -> None:
+        for filename in ("rl_eval_positions_9x9.json", "rl_eval_teacher_9x9.json"):
+            write_bytes(self.source / "config" / filename, b'{"fixture": 1}\n')
+            write_bytes(self.target / "config" / filename, b'{"fixture": 1}\n')
+        self.export()
+        for filename in ("rl_eval_positions_9x9.json", "rl_eval_teacher_9x9.json"):
+            with self.subTest(asset=filename):
+                path = self.target / "config" / filename
+                path.write_bytes(b'{"fixture": 2}\n')
+                with self.assertRaisesRegex(HandoffError, "behavior_assets_sha256"):
+                    self.import_bundle()
+                self.assertFalse(self.destination.exists())
+                path.write_bytes(b'{"fixture": 1}\n')
+        self.assertTrue(self.import_bundle()["code_content_matched"])
+
+    def test_legacy_version_one_package_without_asset_hash_remains_importable(self) -> None:
+        self.export()
+        with zipfile.ZipFile(self.bundle) as archive:
+            code = json.loads(archive.read("manifest.json"))["code"]
+        code.pop("behavior_assets_sha256", None)
+        legacy = self.altered_manifest(self.root / "legacy.zip", {"code": code})
+        report = import_handoff(self.target, legacy, self.destination)
+        self.assertTrue(report["code_content_matched"])
+        self.assertFalse(report["code_revision_differs"])
+        self.assertIsInstance(check_import(self.destination), dict)
 
     def test_hardware_override_changes_batch_and_resets_stale_autotune(self) -> None:
         self.export()
