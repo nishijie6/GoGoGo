@@ -699,6 +699,47 @@ class OpponentPoolTests(unittest.TestCase):
         self.assertEqual(self.state.active.champion_model, "champion")
         self.assertEqual(self.state.active.consecutive_passes, 1)
 
+    def test_second_fixed_anchor_can_block_stage_without_blocking_champion(self):
+        self.state.active.consecutive_passes = 1
+        loss = replace(passing_match(), candidate_wins=90, baseline_wins=110,
+                       win_rate=.45, wilson_lower=.38)
+        results = {"champion": passing_match(), "anchor": passing_match(), "history": loss}
+        gate = self.controller.record_evaluation(
+            self.state, candidate_model="new", match=results["anchor"],
+            health=passing_health(), opponent_results=results)
+        self.assertFalse(gate.passed)
+        self.assertEqual(self.state.active.consecutive_passes, 0)
+        self.assertEqual(self.state.phase, "training")
+        self.assertEqual(self.state.active.champion_model, "new")
+        self.assertTrue(any("history" in reason for reason in gate.reasons))
+        self.assertEqual([item["passed"] for item in self.state.active.evaluations[-1]["fixed_gates"]],
+                         [True, False])
+
+    def test_all_fixed_anchors_must_pass_two_consecutive_evaluations(self):
+        loss = replace(passing_match(), win_rate=.4, wilson_lower=.33)
+        results = {"champion": loss, "anchor": passing_match(), "history": passing_match()}
+        for _ in range(2):
+            gate = self.controller.record_evaluation(
+                self.state, candidate_model="new", match=results["anchor"],
+                health=passing_health(), opponent_results=results)
+            self.assertTrue(gate.passed)
+        self.assertEqual(self.state.phase, "transition_ready")
+        self.assertEqual(self.state.active.champion_model, "champion")
+        self.assertEqual(self.state.active.evaluations[-1]["stage_gate_version"], 2)
+
+    def test_secondary_anchor_confidence_is_checked_and_missing_results_rejected(self):
+        results = {name: passing_match() for name in ("champion", "anchor", "history")}
+        results["history"] = replace(passing_match(), wilson_lower=.5)
+        gate = self.controller.record_evaluation(
+            self.state, candidate_model="new", match=results["anchor"],
+            health=passing_health(), opponent_results=results)
+        self.assertFalse(gate.passed)
+        before = self.state.to_dict()
+        with self.assertRaises(CurriculumStateError):
+            self.controller.record_evaluation(
+                self.state, candidate_model="new", match=passing_match(), health=passing_health())
+        self.assertEqual(self.state.to_dict(), before)
+
     def test_deduplicates_shared_roles_and_skips_self(self):
         self.state.active.champion_model = "anchor"
         self.state.active.fixed_baseline_models = ["anchor", "new"]

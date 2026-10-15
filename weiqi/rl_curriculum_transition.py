@@ -62,8 +62,11 @@ class TransitionSteps:
             data_file=data_file,
             board_size=runner.config.game.board_size,
             batch_size=batch_size,
-            gpu_index=0,
+            gpu_index=(self.hardware_profile.gpu_index if self.hardware_profile else 0),
             model_kind=runner.model_kind,
+            precision=runner.config.hardware.precision,
+            allow_tf32=runner.config.hardware.allow_tf32,
+            compile_model=runner.config.hardware.compile_model,
         )
         environment = runner._environment()
         execution = self._run_external(
@@ -84,15 +87,32 @@ class TransitionSteps:
     ) -> tuple[int, Optional[str]]:
         if not stage.autotune_batches:
             return runner.config.optimizer.batch_size, None
+        profile = self.hardware_profile
+        if profile is not None and profile.tier == "cpu":
+            # The official benchmark is CUDA-only. The migration still performs
+            # actual one-batch CPU training below before publishing the target.
+            batch = runner.config.optimizer.batch_size
+            atomic_write_json(runner.run_root / "autotune.json", {
+                "selected_batch_size": batch, "mode": "cpu-conservative",
+                "hardware": profile.to_dict(), "measurements": [],
+                "completed_at": local_timestamp(),
+            })
+            return batch, None
+        candidates = stage.autotune_batches
+        memory_limit = self.config.max_gpu_memory_gib
+        if profile is not None:
+            limit = profile.training_batch_limit(stage.board_size)
+            candidates = tuple(sorted({min(value, limit) for value in candidates}))
+            memory_limit = min(memory_limit, profile.memory_gib * runner.config.hardware.gpu_memory_fraction)
         tune_root = runner.run_root / "autotune"
         data_file = prepare_benchmark_npz(
             source_npz,
             tune_root / "benchmark.npz",
-            max(stage.autotune_batches),
+            max(candidates),
         )
         persist_path = runner.run_root / "autotune.json"
         measurements: dict[int, BenchmarkMeasurement] = {}
-        for batch in stage.autotune_batches:
+        for batch in candidates:
             try:
                 measurements[batch] = self._benchmark_measurement(
                     runner, data_file, batch, tune_root
@@ -110,9 +130,9 @@ class TransitionSteps:
                 )
         try:
             result = choose_autotune_batch(
-                stage.autotune_batches,
+                candidates,
                 lambda batch: measurements[batch],
-                max_gpu_memory_gib=self.config.max_gpu_memory_gib,
+                max_gpu_memory_gib=memory_limit,
                 persist_path=None,
             )
             atomic_write_json(
@@ -151,7 +171,7 @@ class TransitionSteps:
                                 else None
                             ),
                         }
-                        for batch in stage.autotune_batches
+                        for batch in candidates
                     ],
                     "completed_at": local_timestamp(),
                 },
@@ -241,7 +261,7 @@ class TransitionSteps:
         print(f"迁移暂时无法完成，将保留身份后重试：{message}", file=sys.stderr, flush=True)
 
     def _migrate(self, state: CurriculumState) -> None:
-        """Seed the next board size from the latest accepted model, crash-safely.
+        """Seed the next board size from the rolling champion, crash-safely.
 
         A migration has a durable identity (source model, checkpoint hash and
         target board). The target tree is built in a temporary directory and
@@ -268,7 +288,7 @@ class TransitionSteps:
         )
         if not source_checkpoint.is_file():
             self.controller.migration_failed(
-                state, f"找不到最新接纳模型的 SWA 检查点：{source_checkpoint}"
+                state, f"找不到迁移源模型的 SWA 检查点：{source_checkpoint}"
             )
             return
         source_sha256 = self._migration_source_hash(state, source_checkpoint)
@@ -317,10 +337,14 @@ class TransitionSteps:
             self._recover_failed_migration(state, error, attempt)
 
     def _protected_source_model(self, state: CurriculumState) -> Optional[str]:
-        """The latest accepted model, pinned against cleanup; None after recording why not."""
-        source_model = state.active.latest_model
+        """Pin the champion; recover an already claimed migration without changing identity."""
+        source_model = (
+            state.migration.get("source_model")
+            if state.phase == "migrating" and state.migration
+            else state.active.champion_model
+        )
         if not source_model:
-            self.controller.migration_failed(state, "迁移前缺少最新模型")
+            self.controller.migration_failed(state, "迁移前缺少滚动冠军，拒绝用最新候选替代")
             return None
         if source_model not in state.protected_models:
             state.protected_models.append(source_model)

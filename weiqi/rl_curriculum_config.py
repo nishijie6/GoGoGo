@@ -109,6 +109,9 @@ class CurriculumConfig:
     max_gpu_memory_gib: float
     stages: tuple[CurriculumStage, ...]
     health: HealthThresholds = HealthThresholds()
+    evaluation_parallel_pairs: int = 1
+    evaluation_midstage_interval_samples: Optional[int] = None
+    evaluation_near_gate_samples: int = 1_000_000
 
     def state_root(self, project_root: Path) -> Path:
         path = Path(self.state_directory)
@@ -158,7 +161,11 @@ def load_curriculum_config(path: Path) -> CurriculumConfig:
         raise CurriculumConfigError(f"课程配置不是有效 JSON：{error}") from error
     if not isinstance(raw, dict):
         raise CurriculumConfigError("课程配置根节点必须是对象")
-    _require_exact_keys(raw, path="课程配置", required=_ROOT_FIELDS)
+    _require_exact_keys(
+        raw, path="课程配置", required=_ROOT_FIELDS,
+        optional={"evaluation_parallel_pairs", "evaluation_midstage_interval_samples",
+                  "evaluation_near_gate_samples"},
+    )
     if (
         isinstance(raw["schema_version"], bool)
         or not isinstance(raw["schema_version"], int)
@@ -175,6 +182,17 @@ def load_curriculum_config(path: Path) -> CurriculumConfig:
 
     interval = _positive_int(
         raw["evaluation_interval_samples"], "evaluation_interval_samples"
+    )
+    parallel_pairs = _positive_int(raw.get("evaluation_parallel_pairs", 1), "evaluation_parallel_pairs")
+    if parallel_pairs > 16:
+        raise CurriculumConfigError("evaluation_parallel_pairs 不能大于 16")
+    midstage_interval = raw.get("evaluation_midstage_interval_samples")
+    if midstage_interval is not None:
+        midstage_interval = _positive_int(midstage_interval, "evaluation_midstage_interval_samples")
+        if midstage_interval < interval or midstage_interval % interval:
+            raise CurriculumConfigError("evaluation_midstage_interval_samples 必须是评测间隔的正整数倍")
+    near_gate_samples = _positive_int(
+        raw.get("evaluation_near_gate_samples", 1_000_000), "evaluation_near_gate_samples"
     )
     games = _positive_int(raw["evaluation_games"], "evaluation_games")
     if games % 2:
@@ -285,6 +303,9 @@ def load_curriculum_config(path: Path) -> CurriculumConfig:
         disk_pause_gib=pause_gib,
         max_gpu_memory_gib=max_gpu_gib,
         stages=tuple(stages),
+        evaluation_parallel_pairs=parallel_pairs,
+        evaluation_midstage_interval_samples=midstage_interval,
+        evaluation_near_gate_samples=near_gate_samples,
     )
 
 

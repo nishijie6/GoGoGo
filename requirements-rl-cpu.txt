@@ -1,0 +1,8 @@
+# Use in a separate CPU environment; keep the current CUDA environment intact.
+# Official Windows CPU wheels are available for Python 3.10 through 3.14.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+torch==2.13.0+cpu
+numpy==2.5.2
+packaging==26.3
+psutil==7.2.2

@@ -4,7 +4,9 @@
 param(
     [string]$ProjectRoot = "",
     [string]$PythonPath = "",
-    [string]$CurriculumConfig = ""
+    [string]$CurriculumConfig = "",
+    [ValidateSet("auto", "cpu", "low", "high", "configured")]
+    [string]$Hardware = "auto"
 )
 
 Set-StrictMode -Version Latest
@@ -73,7 +75,9 @@ $arguments = @(
     (Format-Argument $entryPoint),
     "curriculum",
     "--curriculum-config",
-    (Format-Argument $resolvedCurriculumConfig)
+    (Format-Argument $resolvedCurriculumConfig),
+    "--hardware",
+    $Hardware
 ) -join " "
 
 $exitCode = 1

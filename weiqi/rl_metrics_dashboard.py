@@ -211,9 +211,10 @@ def render_dashboard(
     )
     throughput_chart = _line_chart(
         records,
-        title="每轮数据产出",
-        description="相邻已接纳模型之间新增的自对弈训练行。",
-        series=(("data_rows_delta", "新增数据行", "#5b8def"),),
+        title="新增训练数据产出速度",
+        description="新增自对弈数据行/小时；实际进度包含两次模型导出之间的评测等待。累计训练处理量包含样本复用。",
+        series=(("new_data_rows_per_hour", "训练循环", "#5b8def"),
+                ("wall_new_data_rows_per_hour", "含评测等待", "#22b8a7")),
         zero_baseline=True,
     )
     health_chart = _line_chart(
@@ -257,6 +258,8 @@ def render_dashboard(
         ("已接纳模型", _format_number(latest.get("accepted_models"))),
         ("累计训练样本", _format_number(latest.get("trained_samples"))),
         ("自对弈数据行", _format_number(latest.get("data_rows"))),
+        ("新增数据行/小时（含等待）", _format_number(latest.get("wall_new_data_rows_per_hour"))),
+        ("训练处理量 / 新增数据", _format_number(latest.get("sample_reuse_ratio"), 2)),
         ("总损失 EMA", _format_number(latest.get("loss"), 3)),
         ("策略命中率", (
             f'{float(latest["policy_accuracy"]) * 100:.1f}%'

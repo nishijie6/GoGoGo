@@ -98,14 +98,14 @@ class KataGoRLConfigurationTests(unittest.TestCase):
                     config.search.temperature_moves,
                     temperature_halflife,
                 )
-                self.assertEqual(config.self_play.games_per_iteration, 128)
+                self.assertEqual(config.self_play.games_per_iteration, 512 if board_size == 13 else 128)
                 self.assertIsNone(config.self_play.resign_threshold)
                 self.assertEqual(config.runtime.output_directory, output_directory)
 
                 self.assertEqual(overrides["dataBoardLen"], board_size)
                 self.assertEqual(overrides["bSizes"], board_size)
                 self.assertEqual(overrides["maxVisits"], visits)
-                self.assertEqual(overrides["numGameThreads"], 128)
+                self.assertEqual(overrides["numGameThreads"], 256 if board_size == 13 else 128)
                 self.assertEqual(overrides["nnMaxBatchSize"], 128)
                 self.assertAlmostEqual(
                     overrides["rootDirichletNoiseTotalConcentration"],
