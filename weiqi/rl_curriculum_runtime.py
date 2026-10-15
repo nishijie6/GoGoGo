@@ -28,6 +28,7 @@ from typing import Callable, Mapping, Optional, Sequence
 
 from .fileio import atomic_write_text, local_timestamp
 from .katago_rl import PROJECT_ROOT, KataGoRLRunner
+from .katago_hardware import HardwareProfile
 from .process_control import stream_command
 from .rl_curriculum import (
     CurriculumController,
@@ -86,12 +87,14 @@ class CurriculumRuntime(EvaluationSteps, TransitionSteps, CleanupSteps):
         command_runner: Optional[Callable[..., object]] = None,
         sleep: Callable[[float], None] = time.sleep,
         disk_probe: Callable[..., object] = disk_space_status,
+        hardware_profile: Optional[HardwareProfile] = None,
     ) -> None:
         self.project_root = project_root.resolve()
         self.config_path = (
             config_path if config_path.is_absolute() else self.project_root / config_path
         ).resolve()
         self.config = load_curriculum_config(self.config_path)
+        self.hardware_profile = hardware_profile
         validate_training_profiles(self.config, self.project_root)
         self.state_root = self.config.state_root(self.project_root)
         self.store = CurriculumStateStore(self.state_root)
@@ -105,10 +108,14 @@ class CurriculumRuntime(EvaluationSteps, TransitionSteps, CleanupSteps):
     def _make_runner(
         self, stage: CurriculumStage, *, run_root_override: Optional[Path] = None
     ) -> KataGoRLRunner:
+        options = {}
+        if self.hardware_profile is not None:
+            options["hardware_profile"] = self.hardware_profile
         return self.runner_factory(
             config_path=stage.config_path(self.project_root),
             project_root=self.project_root,
             run_root_override=run_root_override,
+            **options,
         )
 
     def _stage_runner(self, state: CurriculumState) -> KataGoRLRunner:
@@ -164,18 +171,25 @@ class CurriculumRuntime(EvaluationSteps, TransitionSteps, CleanupSteps):
         )
 
     def _ensure_opponent_pools(self, state: CurriculumState) -> None:
-        """Initialize each pool once, and protect its models before cleanup."""
+        """Append explicitly configured anchors and protect them before cleanup."""
         candidate_state = copy.deepcopy(state)
         active = candidate_state.active
         definition = self.config.stages[state.active_stage_index]
         runner = self._stage_runner(state)
-        fixed = active.fixed_baseline_models or list(definition.fixed_baseline_models) or [active.baseline_model]
+        fixed = list(dict.fromkeys(
+            (active.fixed_baseline_models or list(definition.fixed_baseline_models) or [active.baseline_model])
+            + list(definition.fixed_baseline_models)
+        ))
         champion = active.champion_model or definition.initial_champion_model or active.latest_model
         for name in [*fixed, champion]:
             self._model_path(runner, name)
-        changed = not active.fixed_baseline_models or not active.champion_model
+        pool_changed = active.fixed_baseline_models != fixed or active.baseline_model != fixed[0]
+        old_gate_passes = active.consecutive_passes > 0 and (
+            not active.evaluations or active.evaluations[-1].get("stage_gate_version") != 2
+        )
+        changed = pool_changed or not active.champion_model or old_gate_passes
         if changed:
-            if active.baseline_model != fixed[0]:
+            if pool_changed or old_gate_passes:
                 active.consecutive_passes = 0
                 if candidate_state.phase == "transition_ready":
                     candidate_state.phase = "training"
@@ -263,6 +277,7 @@ class CurriculumRuntime(EvaluationSteps, TransitionSteps, CleanupSteps):
             window_cycles=self.config.health_window_cycles,
             games_per_cycle=128,
             thresholds=self.config.health,
+            minimum_games=self.config.health_window_cycles * 128,
         )
 
     def _refresh_progress(
@@ -317,6 +332,8 @@ class CurriculumRuntime(EvaluationSteps, TransitionSteps, CleanupSteps):
     def _cycle(self, state: CurriculumState, *, smoke: bool) -> None:
         runner = self._stage_runner(state)
         batch = state.active.autotune_batch
+        if batch is not None and self.hardware_profile is not None:
+            batch = runner.training_batch_size(batch)
         try:
             with runner.lock():
                 runner.cycle(

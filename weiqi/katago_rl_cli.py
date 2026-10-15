@@ -17,6 +17,7 @@ from .katago_rl import (
     KataGoRLRunnerError,
 )
 from .rl_config import RLConfigError
+from .katago_hardware import detect_hardware
 from .rl_curriculum import (
     CurriculumConfigError,
     CurriculumLockError,
@@ -53,6 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="cycle",
         choices=(
             "doctor",
+            "hardware",
             "status",
             "selfplay",
             "shuffle",
@@ -69,6 +71,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_RTX_PROFILE)
+    parser.add_argument(
+        "--hardware", choices=("auto", "cpu", "low", "high", "configured"), default="auto",
+        help="启动时检测硬件，或手动选择 CPU/低端 CUDA/高端 CUDA；configured 沿用原配置",
+    )
     parser.add_argument(
         "--curriculum-config",
         type=Path,
@@ -200,8 +206,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             return
         if args.iterations < 0:
             raise KataGoRLRunnerError("--iterations 不能小于 0")
+        profile = None
+        read_only = {"status", "dashboard", "curriculum-status", "curriculum-dashboard"}
+        if args.command == "hardware" or (args.hardware != "configured" and args.command not in read_only):
+            profile = detect_hardware("auto" if args.hardware == "configured" else args.hardware)
+            print(json.dumps({"hardware": profile.to_dict()}, ensure_ascii=False, indent=2), flush=True)
+        if args.command == "hardware":
+            return
         if args.command in {"curriculum", "curriculum-status", "curriculum-dashboard", "curriculum-evaluate"}:
-            curriculum = CurriculumRuntime(args.curriculum_config)
+            curriculum = CurriculumRuntime(args.curriculum_config, hardware_profile=profile)
             if args.command == "curriculum-status":
                 curriculum.status()
             elif args.command == "curriculum-dashboard":
@@ -211,7 +224,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             else:
                 curriculum.run(iterations=args.iterations, smoke=args.smoke)
             return
-        runner = KataGoRLRunner(args.config)
+        runner = KataGoRLRunner(args.config, hardware_profile=profile)
         if args.command == "doctor":
             runner.doctor()
             return
@@ -264,6 +277,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         CurriculumStateError,
         HandoffError,
         OSError,
+        ValueError,
     ) as error:
         print(f"强化学习失败：{error}", file=sys.stderr)
         raise SystemExit(1) from error

@@ -96,7 +96,7 @@ def render_opponent_pools(stage):
     <p>挑战结果达到胜率门槛且 Wilson 下界超过门槛才更换冠军；点的对手可能不同，不能连接成绝对棋力曲线。</p>
     {_chart(champion_rows, '冠军挑战胜率与 Wilson 区间', connect=False)}</article>
     <article class="panel"><h2>固定历史基准 · 长期进步</h2>
-    <p>各基准独立统计。课程升级使用首个固定基准：<span class="pool-name">{escape(fixed_names[0])}</span>。</p>
+    <p>各基准独立统计。课程升级要求全部固定基准分别达标，并满足样本量、健康检查和连续达标要求；迁移使用滚动冠军。</p>
     {''.join(groups)}</article></section>
     <article class="panel" style="margin-top:16px"><h2>最近对战成绩</h2>
     <p>每项标明真实对手；Elo 为相对此对手的差值，不能跨对手直接比较。旧评测保留原基准身份。</p>

@@ -426,6 +426,7 @@ class CurriculumRuntimeStateTests(unittest.TestCase):
                     entry_model="gogogo-s1-d1",
                     baseline_model="gogogo-s1-d1",
                     latest_model="gogogo-s11000000-d9",
+                    champion_model="gogogo-s11000000-d9",
                     next_evaluation_sample=11_500_000,
                     consecutive_passes=2,
                 )
@@ -533,6 +534,7 @@ class CurriculumRuntimeStateTests(unittest.TestCase):
                     entry_model="gogogo-s1-d1",
                     baseline_model="gogogo-s1-d1",
                     latest_model="gogogo-s11000000-d9",
+                    champion_model="gogogo-s11000000-d9",
                     next_evaluation_sample=11_500_000,
                     consecutive_passes=2,
                 )
@@ -632,6 +634,7 @@ class CurriculumRuntimeStateTests(unittest.TestCase):
                     entry_model="gogogo-s1-d1",
                     baseline_model="gogogo-s1-d1",
                     latest_model="gogogo-s11000000-d9",
+                    champion_model="gogogo-s11000000-d9",
                     next_evaluation_sample=11_500_000,
                     consecutive_passes=2,
                 )
@@ -680,6 +683,7 @@ class CurriculumRuntimeStateTests(unittest.TestCase):
         )
         state = runtime._adopt_existing_9x9()
         state.phase = "transition_ready"
+        state.active.champion_model = "gogogo-s11000000-d9"
         runtime.store.save(state)
         runtime._migrate(state)
         recovered = runtime.store.load()
@@ -783,6 +787,61 @@ class CurriculumRuntimeStateTests(unittest.TestCase):
         with self.assertRaises(CurriculumStateError):
             self.runtime._ensure_opponent_pools(state)
         self.assertEqual(state.to_dict(), before)
+
+    def test_configured_anchor_is_appended_protected_and_resets_passes(self):
+        run_root = self.root / "9x9"
+        for name in ("gogogo-s1-d1", "gogogo-s2-d2", "gogogo-s3-d3"):
+            _make_model(run_root, name)
+        state = self.runtime._adopt_existing_9x9()
+        state.active.champion_model = "gogogo-s3-d3"
+        state.active.fixed_baseline_models = ["gogogo-s1-d1"]
+        state.active.consecutive_passes = 2
+        state.phase = "transition_ready"
+        definition = replace(self.runtime.config.stages[0],
+                             fixed_baseline_models=("gogogo-s1-d1", "gogogo-s2-d2"))
+        self.runtime.config = replace(self.runtime.config,
+                                      stages=(definition, *self.runtime.config.stages[1:]))
+        self.runtime._ensure_opponent_pools(state)
+        self.assertEqual(state.active.fixed_baseline_models, ["gogogo-s1-d1", "gogogo-s2-d2"])
+        self.assertIn("gogogo-s2-d2", state.protected_models)
+        self.assertEqual(state.active.consecutive_passes, 0)
+        self.assertEqual(state.phase, "training")
+        state.active.consecutive_passes = 1
+        state.active.evaluations = [{"stage_gate_version": 2}]
+        self.runtime._ensure_opponent_pools(state)
+        self.assertEqual(state.active.consecutive_passes, 1)
+
+    def test_old_single_anchor_passes_are_not_reused(self):
+        _make_model(self.root / "9x9", "gogogo-s1-d1")
+        state = self.runtime._adopt_existing_9x9()
+        self.runtime._ensure_opponent_pools(state)
+        state.active.consecutive_passes = 2
+        state.phase = "transition_ready"
+        state.active.evaluations = [{"passed": True}]
+        self.runtime._ensure_opponent_pools(state)
+        self.assertEqual(state.active.consecutive_passes, 0)
+        self.assertEqual(state.phase, "training")
+
+    def test_migration_selects_champion_and_never_falls_back_to_latest(self):
+        _make_model(self.root / "9x9", "gogogo-s1-d1")
+        state = self.runtime._adopt_existing_9x9()
+        state.active.latest_model = "newer-weaker-candidate"
+        state.active.champion_model = "gogogo-s1-d1"
+        self.assertEqual(self.runtime._protected_source_model(state), "gogogo-s1-d1")
+        self.assertIn("gogogo-s1-d1", state.protected_models)
+        state.active.champion_model = None
+        state.phase = "transition_ready"
+        self.assertIsNone(self.runtime._protected_source_model(state))
+        self.assertEqual(state.phase, "training")
+        self.assertIn("拒绝", state.warnings[-1]["message"])
+
+    def test_migration_recovery_preserves_previously_claimed_source(self):
+        _make_model(self.root / "9x9", "gogogo-s1-d1")
+        state = self.runtime._adopt_existing_9x9()
+        state.phase = "migrating"
+        state.active.champion_model = "new-champion"
+        state.migration = {"source_model": "old-claimed-source"}
+        self.assertEqual(self.runtime._protected_source_model(state), "old-claimed-source")
 
     def test_dashboard_contains_course_health_and_storage(self) -> None:
         run_root = self.root / "9x9"

@@ -158,10 +158,25 @@ class RLMetricStore:
                 current_time = datetime.fromisoformat(str(record["timestamp"]))
             except (KeyError, TypeError, ValueError):
                 current_time = None
-            if "cycle_seconds" not in record and previous_time and current_time:
+            wall_seconds = None
+            if previous_time and current_time:
+                try:
+                    wall_seconds = max(0.0, (current_time - previous_time).total_seconds())
+                except TypeError:
+                    pass  # An old timestamp may not include a timezone.
+            if "cycle_seconds" not in record and wall_seconds is not None:
                 record["cycle_seconds"] = max(
-                    0.0, (current_time - previous_time).total_seconds()
+                    0.0, wall_seconds
                 )
+            if index > 1 and rows > previous_rows:
+                delta = rows - previous_rows
+                cycle_seconds = record.get("cycle_seconds")
+                if isinstance(cycle_seconds, (int, float)) and cycle_seconds > 0:
+                    record["new_data_rows_per_hour"] = delta * 3600 / cycle_seconds
+                if wall_seconds is not None and wall_seconds > 0:
+                    record["wall_new_data_rows_per_hour"] = delta * 3600 / wall_seconds
+                if samples >= previous_samples:
+                    record["sample_reuse_ratio"] = (samples - previous_samples) / delta
             previous_samples = samples
             previous_rows = rows
             previous_time = current_time or previous_time

@@ -167,6 +167,9 @@ SHA-256，并放入已被 Git 忽略的 `katago/` 目录；之后程序会自动
 
 两种检查点不能直接互换。已有 `training_runs/9x9/` 与 `curriculum/` 属于 KataGo；
 继续这些记录请使用 `train_rl.py`。新运行默认使用主干的轮流冠军训练。
+KataGo 训练启动时自动适配 Windows 无显卡、低端 CUDA、高端 CUDA 三档，
+也可用 `--hardware cpu/low/high` 手动选择。资源预设、CPU 引擎安装及续训说明见
+[三档硬件适配](docs/KATAGO_TRAINING.md#windows-三档硬件适配)。
 具体操作见 [轮流冠军训练指南](docs/RL_TRAINING.md) 和
 [KataGo 续训指南](docs/KATAGO_TRAINING.md)。
 

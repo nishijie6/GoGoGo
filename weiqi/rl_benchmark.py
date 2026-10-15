@@ -93,8 +93,11 @@ def build_benchmark_command(
     batch_size: int,
     gpu_index: int = 0,
     model_kind: str = "b10c128",
+    precision: str = "amp_bfloat16",
+    allow_tf32: bool = True,
+    compile_model: bool = False,
 ) -> list[str]:
-    return [
+    command = [
         str(python_executable),
         str(benchmark_script),
         "-model-kind",
@@ -115,10 +118,16 @@ def build_benchmark_command(
         "1",
         "-mode",
         "trainloop",
-        "-use-bf16",
-        "-use-tf32-matmul",
-        "-no-compile",
     ]
+    if precision == "amp_bfloat16":
+        command.append("-use-bf16")
+    elif precision == "amp_float16":
+        command.append("-use-amp")
+    if allow_tf32:
+        command.append("-use-tf32-matmul")
+    if not compile_model:
+        command.append("-no-compile")
+    return command
 
 
 def parse_benchmark_output(

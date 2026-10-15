@@ -23,6 +23,7 @@ from typing import Iterator, Mapping, Optional, Sequence
 
 from .fileio import FileLockHeld, acquire_file_lock, release_file_lock
 from .katago import katago_subprocess_environment
+from .katago_hardware import HardwareProfile
 from .process_control import stream_command
 from .rl_config import RLTrainingConfig, load_rl_training_config
 from .rl_handoff_guard import HandoffLockedError, ensure_training_available
@@ -86,6 +87,7 @@ def build_selfplay_overrides(
     visits: Optional[int] = None,
     smoke: bool = False,
     has_model: bool = True,
+    hardware_profile: Optional[HardwareProfile] = None,
 ) -> dict[str, object]:
     """Translate the project profile into official KataGo self-play options."""
 
@@ -165,6 +167,12 @@ def build_selfplay_overrides(
     # bootstrap generator; omitting it initially avoids a noisy unused-key warning.
     if has_model:
         overrides["cudaUseNHWC"] = True
+    if hardware_profile is not None:
+        for key in ("cudaDeviceToUse", "cudaUseFP16", "cudaUseNHWC"):
+            overrides.pop(key, None)
+        overrides.update(hardware_profile.inference_overrides(has_model=has_model, smoke=smoke))
+        if hardware_profile.game_threads is not None:
+            overrides["numGameThreads"] = hardware_profile.game_threads
     return overrides
 
 
@@ -176,12 +184,16 @@ class KataGoRLRunner:
         config_path: Path = DEFAULT_RTX_PROFILE,
         project_root: Path = PROJECT_ROOT,
         run_root_override: Optional[Path] = None,
+        hardware_profile: Optional[HardwareProfile] = None,
     ) -> None:
         self.project_root = project_root.resolve()
         self.config_path = (
             config_path if config_path.is_absolute() else self.project_root / config_path
         ).resolve()
         self.config = load_rl_training_config(self.config_path)
+        self.hardware_profile = hardware_profile
+        if hardware_profile is not None:
+            self.config = hardware_profile.apply(self.config)
         configured_output = Path(self.config.runtime.output_directory)
         self.run_root = (
             run_root_override
@@ -195,6 +207,8 @@ class KataGoRLRunner:
         self.katago_executable = self.project_root / "katago" / (
             "katago.exe" if os.name == "nt" else "katago"
         )
+        if hardware_profile is not None and hardware_profile.backend == "eigen":
+            self.katago_executable = self.katago_executable.parent / "cpu" / self.katago_executable.name
         self.katago_source = self.project_root / "katago" / "source"
         self.python_source = self.katago_source / "python"
         self.selfplay_config = (
@@ -244,6 +258,11 @@ class KataGoRLRunner:
             if not path.is_file()
         ]
         if missing:
+            if not self.katago_executable.is_file() and self.hardware_profile is not None and self.hardware_profile.tier == "cpu":
+                raise KataGoRLRunnerError(
+                    "缺少 CPU 版 KataGo。请先运行 powershell -File scripts/install_katago_cpu.ps1；"
+                    "CPU 引擎安装在 katago/cpu，不会覆盖 CUDA 引擎。"
+                )
             raise KataGoRLRunnerError(
                 "缺少 KataGo 运行或训练文件：" + "、".join(str(path) for path in missing)
             )
@@ -251,7 +270,20 @@ class KataGoRLRunner:
     def _environment(self) -> dict[str, str]:
         environment = katago_subprocess_environment()
         environment["PYTHONUTF8"] = "1"
+        if self.config.hardware.device == "cpu":
+            # Official train.py auto-selects CUDA; hide it only in this child.
+            environment["CUDA_VISIBLE_DEVICES"] = "-1"
+        if self.hardware_profile is not None:
+            environment["OMP_NUM_THREADS"] = str(self.hardware_profile.cpu_threads)
+            environment["MKL_NUM_THREADS"] = str(self.hardware_profile.cpu_threads)
         return environment
+
+    def training_batch_size(self, requested: int) -> int:
+        """Clamp a persisted batch when resuming on a smaller machine."""
+        if self.hardware_profile is None:
+            return requested
+        limit = self.hardware_profile.training_batch_limit(self.config.game.board_size)
+        return min(requested, limit)
 
     def _run(
         self,
@@ -284,23 +316,28 @@ class KataGoRLRunner:
         return output
 
     def doctor(self) -> dict[str, object]:
-        """Verify pinned sources, CUDA PyTorch, GPU access, and KataGo."""
+        """Verify the selected PyTorch device and KataGo backend."""
 
         self._require_runtime()
         try:
             import torch
         except ImportError as error:
             raise KataGoRLRunnerError(
-                "未安装 CUDA PyTorch；请运行 pip install -r requirements-rl.txt"
+                "未安装 PyTorch；CPU 使用 requirements-rl-cpu.txt，CUDA 使用 requirements-rl.txt"
             ) from error
-        if not torch.cuda.is_available():
+        cpu = self.config.hardware.device == "cpu"
+        if not cpu and not torch.cuda.is_available():
             raise KataGoRLRunnerError("PyTorch 未检测到可用的 CUDA 显卡")
         device = torch.device(self.config.hardware.device.replace("auto", "cuda:0"))
         index = device.index or 0
-        self._run(
+        version = self._run(
             [self.katago_executable, "version"],
             log_name="doctor.log",
         )
+        if self.hardware_profile is not None:
+            expected = "eigen" if cpu else "cuda"
+            if expected not in version.casefold():
+                raise KataGoRLRunnerError(f"KataGo 引擎与选择的 {expected} 后端不符：{version.strip()}")
         result = {
             "config": str(self.config_path),
             "run_root": str(self.run_root),
@@ -308,9 +345,12 @@ class KataGoRLRunner:
             "torch": torch.__version__,
             "torch_cuda": torch.version.cuda,
             "cudnn": torch.backends.cudnn.version(),
-            "gpu": torch.cuda.get_device_name(index),
-            "capability": ".".join(str(part) for part in torch.cuda.get_device_capability(index)),
+            "device": str(device),
+            "gpu": None if cpu else torch.cuda.get_device_name(index),
+            "capability": None if cpu else ".".join(str(part) for part in torch.cuda.get_device_capability(index)),
         }
+        if self.hardware_profile is not None:
+            result["hardware"] = self.hardware_profile.to_dict()
         print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
         return result
 
@@ -336,6 +376,7 @@ class KataGoRLRunner:
             visits=(8 if smoke else None) if visits is None else visits,
             smoke=smoke,
             has_model=has_model,
+            hardware_profile=self.hardware_profile,
         )
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         output = self._run(
@@ -423,6 +464,7 @@ class KataGoRLRunner:
         smoke: bool = False,
         batch_size: Optional[int] = None,
         initial_checkpoint: Optional[Path] = None,
+        new_data_rows: Optional[int] = None,
     ) -> None:
         """Update the policy/value network from the newest shuffled data."""
 
@@ -433,6 +475,7 @@ class KataGoRLRunner:
             batch_size = min(32, self.config.optimizer.batch_size) if smoke else self.config.optimizer.batch_size
         if batch_size < 1:
             raise KataGoRLRunnerError("训练批次必须至少为 1")
+        batch_size = self.training_batch_size(batch_size)
         if not any(self.shuffled_dir.glob("*/train/*.npz")):
             raise KataGoRLRunnerError("没有找到已打乱的训练数据")
         max_samples = (
@@ -440,6 +483,15 @@ class KataGoRLRunner:
             if smoke
             else batch_size * self.config.optimizer.training_steps_per_iteration
         )
+        if not smoke and new_data_rows is not None:
+            if isinstance(new_data_rows, bool) or not isinstance(new_data_rows, int) or new_data_rows < 1:
+                raise KataGoRLRunnerError("本轮新增训练行必须为正整数")
+            available_samples = (4 * new_data_rows // batch_size) * batch_size
+            if available_samples < batch_size:
+                raise KataGoRLRunnerError("本轮新增数据不足以支持一个训练批次")
+            # The official train bucket permits four processed samples per new
+            # row. A large cycle must not request an epoch the bucket cannot fill.
+            max_samples = min(max_samples, available_samples)
         command: list[object] = [
             sys.executable,
             self.python_source / "train.py",
@@ -493,6 +545,9 @@ class KataGoRLRunner:
             command.append("-no-compile")
         if self.config.hardware.allow_tf32:
             command.append("-use-tf32-matmul")
+        if self.config.hardware.device.startswith("cuda:"):
+            # A single entry chooses the device without enabling DDP.
+            command.extend(["-multi-gpus", self.config.hardware.device.split(":", 1)[1]])
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         self._run(
             command,
@@ -601,6 +656,23 @@ class KataGoRLRunner:
             time.perf_counter() - stage_started
         )
 
+        if self.hardware_profile is not None and not smoke:
+            required_rows = self.config.optimizer.minimum_replay_size if min_rows is None else min_rows
+            if required_rows < 1:
+                raise KataGoRLRunnerError("打乱窗口的最小行数必须至少为 1")
+            try:
+                rows = ReplayRowLedger(self.run_root).sync().physical_rows
+            except ReplayAccountingError as error:
+                raise KataGoRLRunnerError(f"回放数据累计行号不可用：{error}") from error
+            if rows == 0:
+                raise KataGoRLRunnerError("自我对弈未产生有效训练样本")
+            if rows < required_rows:
+                # Small machines gather a few games per launch. Keep their data
+                # and continue collecting rather than publishing an empty shuffle.
+                self.metric_store.sync()
+                print(f"回放预热：已累计 {rows}/{required_rows} 行；本轮保留对弈数据，下轮继续采集。", flush=True)
+                return
+
         stage_started = time.perf_counter()
         shuffled = self.shuffle(min_rows=min_rows, smoke=smoke)
         shuffle_seconds = time.perf_counter() - stage_started
@@ -614,6 +686,7 @@ class KataGoRLRunner:
             smoke=smoke,
             batch_size=batch,
             initial_checkpoint=initial_checkpoint,
+            new_data_rows=selfplay_metrics.get("selfplay_data_rows"),
         )
         train_seconds = time.perf_counter() - stage_started
 

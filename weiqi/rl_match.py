@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from .engine import GoGame
+from .katago_hardware import HardwareProfile
 from .sgf import split_sgf_collection
 
 
@@ -185,6 +186,7 @@ def build_match_config(
     inference_batch_size: int = 128,
     gpu_index: int = 0,
     opening_directory: Optional[Path] = None,
+    hardware_profile: Optional[HardwareProfile] = None,
 ) -> str:
     """Build a fixed-protocol, mirrored-color KataGo match configuration."""
 
@@ -251,6 +253,12 @@ def build_match_config(
                 ("hintPosesProb", 1.0),
             ]
         )
+    if hardware_profile is not None:
+        hardware_keys = {"cudaDeviceToUse", "cudaUseFP16", "cudaUseNHWC",
+                         "nnCacheSizePowerOfTwo", "numNNServerThreadsPerModel"}
+        values = [(key, value) for key, value in values if key not in hardware_keys]
+        values.extend((key, str(value).lower() if isinstance(value, bool) else value)
+                      for key, value in hardware_profile.inference_overrides().items())
     return "\n".join(f"{key} = {value}" for key, value in values) + "\n"
 
 

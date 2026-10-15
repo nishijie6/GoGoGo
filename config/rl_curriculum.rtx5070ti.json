@@ -2,6 +2,9 @@
   "schema_version": 1,
   "state_directory": "training_runs/curriculum",
   "evaluation_interval_samples": 500000,
+  "evaluation_midstage_interval_samples": 2000000,
+  "evaluation_near_gate_samples": 1000000,
+  "evaluation_parallel_pairs": 4,
   "evaluation_games": 200,
   "promotion_win_rate": 0.6,
   "wilson_lower_bound": 0.5,
@@ -31,6 +34,10 @@
       "board_size": 13,
       "training_config": "config/rl_training.rtx5070ti.13x13.json",
       "min_stage_samples": 25000000,
+      "fixed_baseline_models": [
+        "gogogo-s0-d0",
+        "gogogo-s11507712-d3661143"
+      ],
       "autotune_batches": [512, 1024, 1536, 2048],
       "indefinite": false
     },
