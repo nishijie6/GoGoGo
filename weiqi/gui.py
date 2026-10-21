@@ -19,6 +19,7 @@ from .ai import (
     AIMove,
     GoAI,
     is_human_sl_difficulty,
+    is_native_difficulty,
     is_katago_difficulty,
     is_training_difficulty,
 )
@@ -42,6 +43,8 @@ from .gui_layout import GoAppLayout
 from .gui_status import StatusPanel
 from .gui_windows import CompanionWindows
 from .rl_opponents import load_training_opponents, settings_for_training_opponent
+from .rl_opponents import load_native_training_opponents
+from .native_ai import NativeModelError, NativeTrainingAI
 
 
 
@@ -87,6 +90,8 @@ class GoApp(GoAppLayout, BoardView, CompanionWindows, StatusPanel):
         self._winrate_source = "启发式估算"
         self._training_opponents = {}
         self.active_training_opponent = None
+        self._native_opponents = {}
+        self.active_native_opponent = None
 
         self.mode_var = tk.StringVar(value=MODE_AI)
         self.size_var = tk.StringVar(value="9×9")
@@ -218,14 +223,16 @@ class GoApp(GoAppLayout, BoardView, CompanionWindows, StatusPanel):
 
     def _refresh_training_opponents(self, _event=None) -> None:
         size = int(self.size_var.get().split("×", maxsplit=1)[0])
+        self._native_opponents = load_native_training_opponents(size)
         try:
             self._training_opponents = load_training_opponents(size)
         except (OSError, ValueError, KeyError) as error:
             self._training_opponents = {}
             self.notice_var.set(f"训练对手列表暂不可用：{error}")
-        self.difficulty_combo.configure(values=(*AI_DIFFICULTIES, *self._training_opponents))
+        values = (*self._native_opponents, *AI_DIFFICULTIES, *self._training_opponents)
+        self.difficulty_combo.configure(values=values)
         selected = self.difficulty_var.get()
-        if is_training_difficulty(selected) and selected not in self._training_opponents:
+        if selected not in values:
             self.difficulty_var.set("中等")
 
     def new_game(self) -> None:
@@ -237,7 +244,20 @@ class GoApp(GoAppLayout, BoardView, CompanionWindows, StatusPanel):
 
         candidate_engine: Optional[KataGoEngine] = None
         training_opponent = None
-        if selected_mode == MODE_AI and is_katago_difficulty(selected_difficulty):
+        native_opponent = None
+        if selected_mode == MODE_AI and is_native_difficulty(selected_difficulty):
+            self._native_opponents = load_native_training_opponents(size)
+            native_opponent = self._native_opponents.get(selected_difficulty)
+            if native_opponent is None:
+                self.notice_var.set("本地训练模型已变化或不支持当前棋盘，请重新选择。")
+                return
+            try:
+                candidate_ai = NativeTrainingAI(native_opponent)
+            except NativeModelError as error:
+                self.notice_var.set(f"本地模型加载失败，当前棋局已保留：{error}")
+                messagebox.showerror("本地模型加载失败", str(error), parent=self.root)
+                return
+        elif selected_mode == MODE_AI and is_katago_difficulty(selected_difficulty):
             settings = KataGoSettings.load()
             try:
                 if is_training_difficulty(selected_difficulty):
@@ -251,16 +271,10 @@ class GoApp(GoAppLayout, BoardView, CompanionWindows, StatusPanel):
                 self.notice_var.set(f"所选电脑难度需要先配置 KataGo：{error}。")
                 self.show_katago_settings(pending_new_game=True)
                 return
-            if (
-                is_human_sl_difficulty(selected_difficulty)
-                and not settings.human_style_enabled
-            ):
-                self.notice_var.set(
-                    "HumanSL 人类段位需要先配置人类风格模型。"
-                )
+            if is_human_sl_difficulty(selected_difficulty) and not settings.human_style_enabled:
+                self.notice_var.set("此旧版难度需要人类风格模型，请从列表重新选择难度。")
                 self.show_katago_settings(pending_new_game=True)
                 return
-
             if (
                 self.katago_engine is not None
                 and not self.katago_engine.closed
@@ -277,7 +291,8 @@ class GoApp(GoAppLayout, BoardView, CompanionWindows, StatusPanel):
             candidate_ai = KataGoAI(candidate_engine, selected_difficulty)
         else:
             builtin_difficulty = (
-                "中等" if is_katago_difficulty(selected_difficulty) else selected_difficulty
+                "中等" if is_katago_difficulty(selected_difficulty)
+                or is_native_difficulty(selected_difficulty) else selected_difficulty
             )
             candidate_ai = GoAI(difficulty=builtin_difficulty)
 
@@ -294,6 +309,7 @@ class GoApp(GoAppLayout, BoardView, CompanionWindows, StatusPanel):
         self.active_mode = selected_mode
         self.active_difficulty = selected_difficulty
         self.active_training_opponent = training_opponent
+        self.active_native_opponent = native_opponent
         self.human_color = (
             BLACK if self.human_color_var.get().startswith("黑") else WHITE
         )
@@ -313,11 +329,10 @@ class GoApp(GoAppLayout, BoardView, CompanionWindows, StatusPanel):
             self.notice_var.set(
                 f"新对局已开始，电脑难度：{self.active_difficulty}{engine_note}。"
             )
-            if is_human_sl_difficulty(self.active_difficulty) and size != 19:
+            if native_opponent is not None:
                 self.notice_var.set(
                     self.notice_var.get()
-                    + " HumanSL 级段位主要基于 19×19 人类棋谱，"
-                    "当前尺寸仅作风格模拟。"
+                    + f" 训练记录：{native_opponent.run_name}；第 {candidate_ai.iteration} 轮。"
                 )
         else:
             self.notice_var.set("新对局已开始，请在棋盘交叉点落子。")
@@ -417,7 +432,7 @@ class GoApp(GoAppLayout, BoardView, CompanionWindows, StatusPanel):
         snapshot = self.game.clone()
         cancel_event = threading.Event()
         self._ai_cancel_event = cancel_event
-        if isinstance(self.ai, KataGoAI):
+        if isinstance(self.ai, (KataGoAI, NativeTrainingAI)):
             self.ai_future = self.executor.submit(
                 self.ai.choose_move,
                 snapshot,
@@ -447,6 +462,10 @@ class GoApp(GoAppLayout, BoardView, CompanionWindows, StatusPanel):
         try:
             decision = future.result()
         except Exception as error:  # Keep the GUI usable if an AI bug occurs.
+            if isinstance(self.ai, NativeTrainingAI):
+                self._refresh(f"本地模型计算失败，棋盘已保留：{error}。请重新选择对手并开始新局。")
+                messagebox.showerror("本地模型计算失败", str(error), parent=self.root)
+                return
             if isinstance(error, KataGoError) or isinstance(self.ai, KataGoAI):
                 self._refresh(
                     f"KataGo 计算失败，棋盘已保留：{error}。"
