@@ -6,7 +6,7 @@ import tkinter as tk
 from tkinter import messagebox
 from typing import Optional
 
-from .ai import AIMove, is_human_sl_difficulty
+from .ai import AIMove, is_native_difficulty
 from .engine import BLACK, WHITE, MoveRecord, color_name
 from .gui_constants import COLUMN_NAMES, MODE_AI
 from .winrate import WinRateEstimate
@@ -169,7 +169,7 @@ class StatusPanel:
         )
 
     def _store_katago_winrate(self, decision: AIMove) -> None:
-        """Cache KataGo's post-move evaluation for the position now on screen."""
+        """Cache the selected engine's evaluation for the position now on screen."""
 
         probability = decision.black_win_probability
         if probability is None or self.game.game_over:
@@ -189,7 +189,8 @@ class StatusPanel:
             phase=heuristic.phase,
         )
         self._winrate_cache_key = self._position_cache_key()
-        source = "HumanSL" if is_human_sl_difficulty(self.active_difficulty) else "KataGo"
+        source = ("本地模型胜率 / 目差估算"
+                  if is_native_difficulty(self.active_difficulty) else "KataGo")
         self._winrate_source = f"{source} · {decision.analysis_visits} visits"
 
     def _draw_winrate_bar(self) -> None:

@@ -1,4 +1,4 @@
-"""Read the two training-model pools for desktop opponent selection."""
+"""Discover native checkpoints and KataGo training pools without loading PyTorch."""
 
 from __future__ import annotations
 
@@ -22,6 +22,60 @@ class TrainingOpponent:
     model_path: Path
     board_size: int
     role: str
+
+
+@dataclass(frozen=True)
+class NativeTrainingOpponent:
+    label: str
+    run_directory: Path
+    run_name: str
+    checkpoint_path: Path
+    board_size: int
+    role: str
+
+
+def load_native_training_opponents(
+    board_size: int, *, project_root: Path = PROJECT_ROOT,
+) -> dict[str, NativeTrainingOpponent]:
+    """Offer the newest saved run for this board, including imported handoffs.
+
+    Read only JSON and file metadata here. Small inference exports take priority
+    over the full training checkpoint, which also contains the replay buffer.
+    """
+    runs_root = project_root / "training_runs"
+    metadata = [*runs_root.glob("*/config.resolved.json"),
+                *runs_root.glob("*/run/config.resolved.json")]
+    candidates = []
+    for path in metadata:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            size = raw["game"]["board_size"]
+            if type(size) is not int or size != board_size:
+                continue
+            run = path.parent
+            latest = run / "latest.pt"
+            choices = {}
+            for role, filename, title in (("latest", "candidate.pt", "最新模型"),
+                                          ("best", "best.pt", "最佳模型")):
+                checkpoint = run / filename
+                if not checkpoint.is_file():
+                    checkpoint = latest
+                if checkpoint.is_file():
+                    label = f"本地训练·{title}"
+                    choices[label] = NativeTrainingOpponent(
+                        label, run, run.relative_to(runs_root).as_posix(),
+                        checkpoint, size, role,
+                    )
+            if choices:
+                saved = latest if latest.is_file() else max(
+                    (item.checkpoint_path for item in choices.values()),
+                    key=lambda item: item.stat().st_mtime_ns,
+                )
+                candidates.append((saved.stat().st_mtime_ns, str(run), choices))
+        except (OSError, ValueError, KeyError, TypeError):
+            # An incomplete or stale run must not hide other playable models.
+            continue
+    return max(candidates, key=lambda item: item[:2])[2] if candidates else {}
 
 
 def load_training_opponents(board_size: int, *, project_root: Path = PROJECT_ROOT,

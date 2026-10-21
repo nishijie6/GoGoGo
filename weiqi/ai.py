@@ -29,7 +29,6 @@ HUMANSL_DIFFICULTIES = (
 AI_DIFFICULTIES = (
     BUILTIN_DIFFICULTIES
     + KATAGO_DIFFICULTIES
-    + HUMANSL_DIFFICULTIES
 )
 
 
@@ -41,6 +40,10 @@ def is_katago_difficulty(label: str) -> bool:
 
 def is_training_difficulty(label: str) -> bool:
     return label.startswith("训练·")
+
+
+def is_native_difficulty(label: str) -> bool:
+    return label.startswith("本地训练·")
 
 
 def is_human_sl_difficulty(label: str) -> bool:
