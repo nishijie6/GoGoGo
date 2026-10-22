@@ -170,6 +170,37 @@ class KataGoLabelTests(unittest.TestCase):
 
 
 class EvaluationOverrideTests(unittest.TestCase):
+    def test_resumed_policy_can_batch_search_without_changing_training_budgets(self):
+        import json
+        from dataclasses import replace
+        from train import with_training_policy
+        from weiqi.rl_config import resolve_rl_training_config
+
+        previous = resolve_rl_training_config(overrides={
+            "search": {"leaf_batch_size": 1, "simulations_per_move": 64},
+            "evaluation": {"simulations_per_move": 96},
+            "self_play": {"joseki_fraction": 0.25},
+        })
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "policy.json"
+            for batch in (4, 8):
+                with self.subTest(batch=batch):
+                    path.write_text(json.dumps({"search": {"leaf_batch_size": batch}}),
+                                    encoding="utf-8")
+                    try:
+                        adjusted = with_training_policy(previous, path)
+                    except ValueError as error:
+                        self.fail(f"Valid search batching policy was rejected: {error}")
+                    self.assertEqual(adjusted.search.leaf_batch_size, batch)
+                    self.assertEqual(replace(adjusted, search=previous.search), previous)
+                    self.assertEqual(adjusted.search.simulations_per_move, 64)
+            for batch in (0, -1, True, 1.5):
+                with self.subTest(invalid_batch=batch):
+                    path.write_text(json.dumps({"search": {"leaf_batch_size": batch}}),
+                                    encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        with_training_policy(previous, path)
+
     def test_resumed_policy_changes_only_opponents_and_confirmation(self):
         import json
         from train import with_training_policy
