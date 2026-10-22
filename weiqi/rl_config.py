@@ -96,6 +96,8 @@ class SelfPlayTrainingConfig:
     max_game_length_factor: float
     resign_threshold: Optional[float]
     resign_min_move: int
+    # Opt-in native-trainer experiment; forced starts are never policy targets.
+    joseki_fraction: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -231,6 +233,7 @@ _BALANCED_PRESET: Dict[str, Any] = {
         # Early models must not poison their own data with false resignations.
         "resign_threshold": None,
         "resign_min_move": 0,
+        "joseki_fraction": 0.0,
     },
     "optimizer": {
         "batch_size": 128,
@@ -326,6 +329,7 @@ _HIGH_PERFORMANCE_PRESET: Dict[str, Any] = {
         "max_game_length_factor": 2.5,
         "resign_threshold": None,
         "resign_min_move": 0,
+        "joseki_fraction": 0.0,
     },
     "optimizer": {
         "batch_size": 256,
@@ -562,6 +566,7 @@ def _validate_self_play(self_play: SelfPlayTrainingConfig) -> None:
     _require_int("self_play.inference_batch_size", self_play.inference_batch_size, 1)
     _require_probability("self_play.champion_fraction", self_play.champion_fraction)
     _require_probability("self_play.milestone_fraction", self_play.milestone_fraction)
+    _require_probability("self_play.joseki_fraction", self_play.joseki_fraction)
     if self_play.champion_fraction + self_play.milestone_fraction > 1:
         raise _config_error("self_play", "冠军与里程碑对局比例之和不能超过 1")
     if _require_number(

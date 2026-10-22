@@ -55,6 +55,104 @@ class SearchTests(unittest.TestCase):
             self.assertLessEqual(abs(value), 1.0)
             self.assertAlmostEqual(float((policy * simulations).sum()), simulations, places=3)
 
+    def test_evaluation_uses_each_players_leaf_batch_after_swapping_colors(self):
+        from dataclasses import replace
+        config = replace(self.config, evaluation=replace(self.config.evaluation,
+                                                        simulations_per_move=8),
+                         self_play=replace(self.config.self_play, max_game_length_factor=1.0))
+        for color in (BLACK, WHITE):
+            with self.subTest(candidate_color=color):
+                try:
+                    job = GameJob(0, 71, color, candidate_leaf_batch_size=4,
+                                  opponent_leaf_batch_size=1)
+                except TypeError as error:
+                    self.fail(f"Per-player search batches are not supported: {error}")
+                calls = []
+
+                def many(model_id, features):
+                    calls.append((model_id, len(features)))
+                    rows = [self.seeded_evaluator(row) for row in features]
+                    return np.array([row[0] for row in rows]), np.array([row[1] for row in rows])
+
+                def one(model_id, features):
+                    policies, values = many(model_id, features[None])
+                    return policies[0], float(values[0])
+
+                result = play_game(config, job, one, training=False, evaluate_batch=many)
+                self.assertTrue(any(model_id == 1 and size > 1 for model_id, size in calls))
+                self.assertTrue(any(model_id == 0 for model_id, _ in calls))
+                self.assertTrue(all(size == 1 for model_id, size in calls if model_id == 0))
+                self.assertEqual(result.examples, [])
+                self.assertEqual(result.candidate_color, color)
+
+    def test_player_batch_overrides_are_validated_and_evaluation_only(self):
+        try:
+            job = GameJob(0, 71, candidate_leaf_batch_size=4, opponent_leaf_batch_size=1)
+        except TypeError as error:
+            self.fail(f"Per-player search batches are not supported: {error}")
+        with self.assertRaisesRegex(ValueError, "evaluation"):
+            play_game(self.config, job, self.pass_evaluator, training=True)
+        from dataclasses import replace
+        for size in (0, -1, True, 1.5):
+            with self.subTest(size=size), self.assertRaises(ValueError):
+                play_game(self.config, replace(job, candidate_leaf_batch_size=size),
+                          self.pass_evaluator, training=False)
+
+    def test_direct_comparison_replays_an_interrupted_trailing_opening_pair(self):
+        import json
+        from pathlib import Path
+        import tempfile
+        from scripts import compare_search_batching
+        from weiqi.rl.selfplay import GameResult
+
+        checksum = "a" * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            directory = output / "games"
+            directory.mkdir()
+            for index in range(3):
+                game = GameResult(index, 500 + index // 2,
+                                  BLACK if index % 2 == 0 else WHITE,
+                                  WHITE, "two_passes", 1.0, 7.5,
+                                  [(BLACK, 0), (WHITE, 1), (BLACK, 81), (WHITE, 81)], 0.1)
+                row = game.record(self.config)
+                row.update(model_sha256=checksum,
+                           search_leaf_batches={"candidate": 4, "opponent": 1})
+                (directory / f"game_{index:04d}.json").write_text(json.dumps(row))
+                (directory / f"game_{index:04d}.sgf").write_text(f"saved-game-{index}")
+            first_pair = (directory / "game_0000.json").read_bytes()
+            try:
+                restored = compare_search_batching.load_saved_games(output, 500, 4, 4, 1, checksum)
+            except AttributeError as error:
+                self.fail(f"Interrupted paired matches cannot resume: {error}")
+            self.assertEqual([game.index for game in restored], [0, 1])
+            self.assertEqual((directory / "game_0000.json").read_bytes(), first_pair)
+            self.assertFalse((directory / "game_0002.json").exists())
+            self.assertEqual(len(list((output / "interrupted").rglob("game_0002.json"))), 1)
+            self.assertEqual(len(list((output / "interrupted").rglob("game_0002.sgf"))), 1)
+
+    def test_exported_match_records_keep_search_metadata_with_actual_game_fields(self):
+        import json
+        from pathlib import Path
+        import tempfile
+        from weiqi.rl.selfplay import GameResult
+        from weiqi.rl.storage import write_games
+        game = GameResult(0, 71, BLACK, WHITE, "two_passes", 1.0, 7.5,
+                          [(BLACK, 81), (WHITE, 81)], 0.1)
+        metadata = {"search_leaf_batches": {"candidate": 4, "opponent": 1},
+                    "model_sha256": "a" * 64, "index": 999}
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            try:
+                write_games([game], self.config, directory, metadata=metadata)
+            except TypeError as error:
+                self.fail(f"Search metadata cannot be saved with the game: {error}")
+            row = json.loads((directory / "game_0000.json").read_text())
+            self.assertEqual(row["index"], 0)
+            self.assertEqual(row["search_leaf_batches"], {"candidate": 4, "opponent": 1})
+            self.assertEqual(row["model_sha256"], "a" * 64)
+            self.assertTrue((directory / "game_0000.sgf").is_file())
+
     def test_batch_augmentation_matches_row_wise_augmentation(self):
         generator = np.random.default_rng(0)
         features = generator.random((32, 20, 9, 9)).astype(np.float32)

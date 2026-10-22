@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import multiprocessing as mp
 from multiprocessing.connection import wait
 from queue import Empty
@@ -15,6 +15,7 @@ import numpy as np
 
 from ..engine import BLACK, WHITE
 from ..rl_config import RLTrainingConfig
+from .openings import select_training_opening
 from .search import choose_action, search
 from .state import Position
 
@@ -27,6 +28,8 @@ class GameJob:
     opponent_id: int = 0
     opponent_name: str = ""
     opponent_sha256: str | None = None
+    candidate_leaf_batch_size: int | None = None
+    opponent_leaf_batch_size: int | None = None
 
 
 @dataclass
@@ -44,6 +47,8 @@ class GameResult:
     examples: list[tuple] = field(default_factory=list)
     opponent_name: str = ""
     opponent_sha256: str | None = None
+    opening_id: str | None = None
+    opening_moves: int = 0
 
     def record(self, config: RLTrainingConfig) -> dict:
         record = {
@@ -56,15 +61,31 @@ class GameResult:
         if self.opponent_name:
             record["training_opponent"] = {"name": self.opponent_name,
                                            "sha256": self.opponent_sha256}
+        if self.opening_id:
+            record["opening"] = {"id": self.opening_id, "moves": self.opening_moves}
         return record
 
 
 def play_game(config, job, evaluate, *, training: bool, evaluate_batch=None) -> GameResult:
+    batches = (job.candidate_leaf_batch_size, job.opponent_leaf_batch_size)
+    if training and any(batch is not None for batch in batches):
+        raise ValueError("Per-player leaf batches are only supported for evaluation")
+    searches = []
+    for batch in batches:
+        if batch is not None and (type(batch) is not int or batch < 1):
+            raise ValueError("Per-player leaf batch size must be a positive integer")
+        searches.append(config.search if batch is None else replace(config.search, leaf_batch_size=batch))
     rng = np.random.default_rng(job.seed)
     state = Position.new(config.game.board_size, config.game.komi)
     started = time.monotonic()
     samples, moves = [], []
     reason = "length_limit"
+    opening = (select_training_opening(config.game.board_size, job.seed,
+                                      config.self_play.joseki_fraction) if training else None)
+    if opening is not None:
+        for action in opening.actions:
+            moves.append((state.game.current_player, action))
+            state = state.play(action)
     # Use identical two-stone openings for color-swapped evaluation pairs.
     if not training:
         for _ in range(2):
@@ -92,8 +113,9 @@ def play_game(config, job, evaluate, *, training: bool, evaluate_batch=None) -> 
                        or rng.random() < config.search.full_search_probability)
         if not full_search:
             simulations = min(simulations, config.search.fast_simulations_per_move)
+        search_config = searches[0 if color == job.candidate_color else 1]
         policy, value = search(
-            state, evaluator, config.search, rng,
+            state, evaluator, search_config, rng,
             simulations=simulations, add_noise=training and full_search,
             evaluate_batch=batch_evaluator,
         )
@@ -133,6 +155,8 @@ def play_game(config, job, evaluate, *, training: bool, evaluate_batch=None) -> 
         job.index, job.seed, job.candidate_color, winner, reason,
         score.black_total, score.white_total, moves, time.monotonic() - started, examples,
         opponent_name=job.opponent_name, opponent_sha256=job.opponent_sha256,
+        opening_id=opening.name if opening is not None else None,
+        opening_moves=len(opening.actions) if opening is not None else 0,
     )
 
 
@@ -187,6 +211,10 @@ def run_games(
         "opponent_name": job.opponent_name or ("candidate_self" if training and job.opponent_id == 0
                                                 else "unknown"),
         "opponent_sha256": job.opponent_sha256,
+        **({"candidate_leaf_batch_size": job.candidate_leaf_batch_size,
+            "opponent_leaf_batch_size": job.opponent_leaf_batch_size}
+           if job.candidate_leaf_batch_size is not None or job.opponent_leaf_batch_size is not None
+           else {}),
     } for job in jobs}
     progress({**(metadata or {}), "event": "games_started", "batch_id": batch_id,
               "total": len(jobs), "training": training,
