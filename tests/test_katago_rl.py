@@ -19,7 +19,7 @@ from weiqi.katago_rl import (
     KataGoRLRunner,
 )
 from weiqi.katago_rl_cli import build_parser
-from weiqi.rl_config import load_rl_training_config
+from weiqi.rl_config import load_rl_training_config, resolve_rl_training_config, RLConfigError
 
 
 class KataGoRLConfigurationTests(unittest.TestCase):
@@ -98,14 +98,14 @@ class KataGoRLConfigurationTests(unittest.TestCase):
                     config.search.temperature_moves,
                     temperature_halflife,
                 )
-                self.assertEqual(config.self_play.games_per_iteration, 512 if board_size == 13 else 128)
+                self.assertEqual(config.self_play.games_per_iteration, 512 if board_size == 13 else 2048)
                 self.assertIsNone(config.self_play.resign_threshold)
                 self.assertEqual(config.runtime.output_directory, output_directory)
 
                 self.assertEqual(overrides["dataBoardLen"], board_size)
                 self.assertEqual(overrides["bSizes"], board_size)
                 self.assertEqual(overrides["maxVisits"], visits)
-                self.assertEqual(overrides["numGameThreads"], 256 if board_size == 13 else 128)
+                self.assertEqual(overrides["numGameThreads"], 256)
                 self.assertEqual(overrides["nnMaxBatchSize"], 128)
                 self.assertAlmostEqual(
                     overrides["rootDirichletNoiseTotalConcentration"],
@@ -115,7 +115,7 @@ class KataGoRLConfigurationTests(unittest.TestCase):
                     overrides["chosenMoveTemperatureHalflife"],
                     temperature_halflife,
                 )
-                self.assertFalse(overrides["initGamesWithPolicy"])
+                self.assertEqual(overrides["initGamesWithPolicy"], board_size == 19)
 
                 self.assertNotIn(output_directory, stage_directories)
                 stage_directories.add(output_directory)
@@ -141,6 +141,36 @@ class KataGoRLConfigurationTests(unittest.TestCase):
             overrides["rootDirichletNoiseTotalConcentration"],
             9.72,
         )
+
+    def test_opening_exploration_keeps_fixed_rules_and_komi(self):
+        config = load_rl_training_config(DEFAULT_RTX_PROFILE.with_name(
+            "rl_training.rtx5070ti.curriculum.19x19.json"))
+        overrides = build_selfplay_overrides(config)
+        self.assertTrue(overrides["initGamesWithPolicy"])
+        self.assertEqual(overrides["policyInitAreaProp"], 0.04)
+        self.assertEqual(overrides["earlyForkGameProb"], 0.04)
+        self.assertEqual(overrides["forkGameProb"], 0.01)
+        for key in ("forkCompensateKomiProb", "compensateAfterPolicyInitProb",
+                    "handicapProb", "komiStdev", "komiBigStdevProb",
+                    "allowRectangleProb", "sekiForkHackProb", "flipKomiProbWhenNoCompensate"):
+            self.assertEqual(overrides[key], 0, key)
+        self.assertFalse(overrides["komiAuto"])
+        self.assertFalse(overrides["fancyKomiVarying"])
+        self.assertEqual(overrides["komiMean"], 6.5)
+        self.assertEqual(overrides["bSizes"], 19)
+        self.assertEqual(overrides["koRules"], "POSITIONAL")
+        self.assertEqual(overrides["scoringRules"], "AREA")
+        bootstrap = build_selfplay_overrides(config, has_model=False)
+        self.assertFalse(bootstrap["initGamesWithPolicy"])
+        self.assertEqual(bootstrap["earlyForkGameProb"], 0)
+        self.assertEqual(bootstrap["forkGameProb"], 0)
+
+    def test_opening_settings_reject_invalid_values(self):
+        for key, value in (("init_games_with_policy", 1), ("policy_init_area_prop", -0.01),
+                           ("early_fork_game_probability", 0.51),
+                           ("fork_game_probability", float("nan"))):
+            with self.subTest(key=key), self.assertRaises(RLConfigError):
+                resolve_rl_training_config(self.config.preset, {"self_play": {key: value}})
 
     def test_random_bootstrap_smoke_profile_avoids_model_only_option(self) -> None:
         overrides = build_selfplay_overrides(

@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from weiqi.training_monitor import MonitorStore
+from weiqi.gpu_monitor import GPUMonitor
 
 
 ROOT = Path(__file__).resolve().parent
@@ -17,6 +18,7 @@ WEB = ROOT / "weiqi" / "monitor_web"
 
 def make_server(root, host="127.0.0.1", port=8766, preferred_run=None):
     store = MonitorStore(Path(root), preferred_run)
+    gpu_monitor = GPUMonitor()
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -27,8 +29,15 @@ def make_server(root, host="127.0.0.1", port=8766, preferred_run=None):
                 elif parsed.path == "/api/snapshot":
                     run_id = parse_qs(parsed.query).get("run", [None])[0]
                     self.send_json(store.snapshot(run_id))
+                elif parsed.path == "/api/champion-curve":
+                    query = parse_qs(parsed.query)
+                    self.send_json(store.champion_curve(query.get("run", [None])[0], query.get("round", [None])[0]))
                 elif parsed.path == "/api/health":
                     self.send_json({"ok": True})
+                elif parsed.path == "/api/hardware":
+                    self.send_json(gpu_monitor.snapshot())
+                elif parsed.path == "/api/recovery":
+                    self.send_json(store.read_json(store.root / "curriculum" / "recovery_status.json"))
                 elif parsed.path in {"/", "/index.html", "/style.css", "/app.js"}:
                     filename = "index.html" if parsed.path == "/" else parsed.path.lstrip("/")
                     content_types = {".html": "text/html", ".css": "text/css", ".js": "text/javascript"}
@@ -69,6 +78,7 @@ def make_server(root, host="127.0.0.1", port=8766, preferred_run=None):
     server = ThreadingHTTPServer((host, port), Handler)
     server.daemon_threads = True
     server.monitor_store = store
+    server.gpu_monitor = gpu_monitor
     return server
 
 
@@ -85,10 +95,12 @@ def main(argv=None):
         parser.exit(1, f"监控服务启动失败：{error}\n")
     print(f"围棋训练监控：http://{args.host}:{server.server_port}\n读取目录：{args.root.resolve()}\n按 Ctrl+C 停止监控服务。", flush=True)
     try:
+        server.gpu_monitor.start()
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
         pass
     finally:
+        server.gpu_monitor.stop()
         server.server_close()
     return 0
 

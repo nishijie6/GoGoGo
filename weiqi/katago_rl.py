@@ -135,17 +135,24 @@ def build_selfplay_overrides(
         # Keep every generated position on the exact rule/komi domain used by
         # the desktop game. The stock training config otherwise varies komi
         # for forked and asymmetric games.
-        "earlyForkGameProb": 0.0,
-        "forkGameProb": 0.0,
+        "earlyForkGameProb": config.self_play.early_fork_game_probability if has_model else 0.0,
+        "earlyForkGameExpectedMoveProp": 0.025,
+        "forkGameProb": config.self_play.fork_game_probability if has_model else 0.0,
+        "forkGameMinChoices": 3,
+        "earlyForkGameMaxChoices": 12,
+        "forkGameMaxChoices": 36,
         "sekiForkHackProb": 0.0,
+        "forkCompensateKomiProb": 0.0,
+        "sgfCompensateKomiProb": 0.0,
+        "handicapCompensateKomiProb": 0.0,
+        "flipKomiProbWhenNoCompensate": 0.0,
         "compensateAfterPolicyInitProb": 0.0,
         "normalAsymmetricPlayoutProb": 0.0,
         "fancyKomiVarying": False,
-        # Raw-policy initialization is especially destructive for a weak
-        # small-board model: it can select pass twice before MCTS ever sees
-        # the position. Exploration remains provided by root noise and the
-        # move-temperature schedule below.
-        "initGamesWithPolicy": False,
+        # Opt in per profile; weak small-board/bootstrap models keep policy
+        # initialization disabled to avoid games ending before MCTS starts.
+        "initGamesWithPolicy": config.self_play.init_games_with_policy and has_model,
+        "policyInitAreaProp": config.self_play.policy_init_area_prop,
         # Translate the profile's exploration controls to KataGo's native
         # self-play names.
         "rootNoiseEnabled": config.search.dirichlet_epsilon > 0,

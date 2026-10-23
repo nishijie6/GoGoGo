@@ -96,6 +96,10 @@ class SelfPlayTrainingConfig:
     max_game_length_factor: float
     resign_threshold: Optional[float]
     resign_min_move: int
+    init_games_with_policy: bool = False
+    policy_init_area_prop: float = 0.04
+    early_fork_game_probability: float = 0.0
+    fork_game_probability: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -226,6 +230,10 @@ _BALANCED_PRESET: Dict[str, Any] = {
         "games_per_iteration": 32,
         "inference_batch_size": 8,
         "champion_fraction": 0.25,
+        "init_games_with_policy": False,
+        "policy_init_area_prop": 0.04,
+        "early_fork_game_probability": 0.0,
+        "fork_game_probability": 0.0,
         "milestone_fraction": 0.25,
         "max_game_length_factor": 2.5,
         # Early models must not poison their own data with false resignations.
@@ -322,6 +330,10 @@ _HIGH_PERFORMANCE_PRESET: Dict[str, Any] = {
         "games_per_iteration": 64,
         "inference_batch_size": 64,
         "champion_fraction": 0.5,
+        "init_games_with_policy": False,
+        "policy_init_area_prop": 0.04,
+        "early_fork_game_probability": 0.0,
+        "fork_game_probability": 0.0,
         "milestone_fraction": 0.0,
         "max_game_length_factor": 2.5,
         "resign_threshold": None,
@@ -580,6 +592,14 @@ def _validate_self_play(self_play: SelfPlayTrainingConfig) -> None:
                 "启用认输时必须在 -1 到 0 之间",
             )
     _require_int("self_play.resign_min_move", self_play.resign_min_move)
+    if not isinstance(self_play.init_games_with_policy, bool):
+        raise _config_error("self_play.init_games_with_policy", "必须是布尔值")
+    _require_probability("self_play.policy_init_area_prop", self_play.policy_init_area_prop)
+    for name in ("early_fork_game_probability", "fork_game_probability"):
+        value = getattr(self_play, name)
+        _require_probability(f"self_play.{name}", value)
+        if value > 0.5:
+            raise _config_error(f"self_play.{name}", "不能大于 0.5（KataGo 限制）")
 
 
 def _validate_optimizer(optimizer: OptimizerTrainingConfig) -> None:

@@ -46,6 +46,17 @@
 
       <div id="error-banner" class="notice error-notice" role="alert" hidden><span aria-hidden="true">!</span><div id="error-message"></div><button type="button" id="retry-button">重新连接</button></div>
       <div id="warnings" class="warnings" aria-live="polite"></div>
+      <section id="recovery-panel" class="recovery-panel" aria-labelledby="recovery-title" hidden>
+        <div class="recovery-heading"><h2 id="recovery-title">训练自动恢复</h2><span id="recovery-state"></span></div>
+        <p id="recovery-summary"></p>
+        <details><summary>异常与恢复记录</summary><ol id="recovery-events"></ol></details>
+      </section>
+
+      <section class="panel gpu-panel" aria-labelledby="gpu-title">
+        <div class="gpu-heading"><h2 id="gpu-title">GPU 实时状态</h2><span id="gpu-updated">正在读取</span></div>
+        <div id="gpu-devices" class="gpu-devices"><p class="gpu-unavailable">等待 GPU 数据</p></div>
+        <p class="gpu-note">整机 GPU 负载，包含其他程序 · 每 2 秒采样 · 历史保留最近 30 分钟，监控服务重启后重新积累</p>
+      </section>
 
       <section id="empty-state" class="empty-state" hidden>
         <span class="empty-stones" aria-hidden="true">● ○</span><h2>等待第一条训练记录</h2><p>开始训练后，胜率、对手和训练进度会自动出现在这里。</p><span>此页面会持续检查新的训练记录。</span>
@@ -89,6 +100,12 @@
         <div class="middle-grid">
           <section class="panel trend-panel" id="trend" aria-labelledby="trend-title">
             <div class="panel-header"><div><span class="section-kicker">PERFORMANCE</span><h2 id="trend-title">评估胜率趋势</h2></div><span class="soft-tag" id="history-count">0 轮记录</span></div>
+            <section id="evaluation-curve-panel" class="evaluation-curve" aria-labelledby="evaluation-curve-title" hidden>
+              <div class="evaluation-curve-heading"><h3 id="evaluation-curve-title">评测过程胜率变化</h3><label for="evaluation-curve-select">查看轮次</label><select id="evaluation-curve-select"></select></div>
+              <p id="evaluation-curve-summary" class="evaluation-curve-summary"></p>
+              <div id="evaluation-curve-chart"></div>
+              <p id="evaluation-curve-note" class="evaluation-curve-note">横轴为已完成局数，纵轴为累计胜率；按棋谱保存顺序恢复，结束后保留完整曲线。</p>
+            </section>
             <div class="chart-legend" id="trend-legend"><span><i class="legend-dot eval-dot"></i>晋级评估</span><span><i class="legend-dot screening-dot"></i>早期筛选</span><span class="chart-legend-note">胜场 / 总对局</span></div>
             <div class="diagnostic-grid legacy-trend" id="legacy-trend" hidden></div><div class="chart-area" id="chart-area"><svg id="trend-chart" viewBox="0 0 760 256" role="img" aria-labelledby="chart-title chart-description"><title id="chart-title">候选模型评估胜率趋势</title><desc id="chart-description">尚无评估数据</desc></svg><div class="chart-empty" id="chart-empty"><span aria-hidden="true">⌁</span><strong>评估完成后，这里会绘出趋势</strong><p>自我对弈不会产生候选模型胜率。</p></div></div>
             <div class="chart-note"><span aria-hidden="true">ⓘ</span><span id="trend-note">每轮对手可能变化，胜率不能直接作为棋力增长曲线；缺失数据保留空档。</span></div>

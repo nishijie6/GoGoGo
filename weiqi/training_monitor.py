@@ -211,6 +211,44 @@ class MonitorStore:
         self.tails = OrderedDict()
         self.json_cache = OrderedDict()
         self.history_cache = OrderedDict()
+        self.match_cache = OrderedDict()
+        self.curve_cache = OrderedDict()
+
+    def champion_curve(self, run_id, round_id):
+        """Completed curves are reconstructed from the retained evaluation SGFs."""
+        with self.lock:
+            path = self.run_path(run_id)
+            try:
+                round_number = int(round_id)
+            except (TypeError, ValueError):
+                raise ValueError("无效的评测轮次") from None
+            if round_number < 1:
+                raise ValueError("无效的评测轮次")
+            snapshot = self.snapshot(run_id)
+            championship = snapshot.get("championship") or {}
+            rounds = championship.get("rounds", [])
+            row = next((item for item in rounds if item.get("champion_round") == round_number), None)
+            if row is None:
+                raise FileNotFoundError("评测轮次不存在")
+            key = (run_id, championship.get("stage"), row.get("candidate"), row.get("name"), row.get("samples"))
+            cached = self.curve_cache.get(key)
+            if cached:
+                self.curve_cache.move_to_end(key)
+                return cached
+            from .monitor_match import read_champion_match
+            curve = read_champion_match(self, path, candidate=row["candidate"], champion=row["name"],
+                                        board=int(championship["stage"].split("x")[0]), samples=row["samples"])
+            result = {"round": round_number, "champion_label": row.get("champion_label"),
+                      "candidate": row.get("candidate"), "name": row.get("name"),
+                      "games": row.get("games"), "total": row.get("games"), "win_rate": row.get("win_rate"),
+                      "wins": row.get("wins"), "losses": row.get("losses"), "draws": row.get("draws"),
+                      "live": False, "points": curve["points"] if curve else []}
+            # Do not retain an incomplete reconstruction from a racing writer.
+            if len(result["points"]) == row.get("games"):
+                self.curve_cache[key] = result
+                if len(self.curve_cache) > 32:
+                    self.curve_cache.popitem(last=False)
+            return result
 
     def read_history(self, path):
         path = self.safe_path(path)

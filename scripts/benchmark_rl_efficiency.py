@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import shutil
 import subprocess
 import sys
@@ -63,10 +64,53 @@ class GpuMonitor:
         }
 
 
-def validate_training(runner, state, candidate, profile, selfplay_input, output):
+def optimizer_steps(checkpoint):
+    """Inspect Adam state on CPU without allocating GPU memory."""
+    import torch
+
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False, mmap=True)
+    return {str(key): int(value["step"]) for key, value in payload["optimizer"]["state"].items()}
+
+
+def validate_checkpoint_update(before_path, after_path):
+    """Require finite model/optimizer tensors and an actual parameter update."""
+    import torch
+
+    before = torch.load(before_path, map_location="cpu", weights_only=False, mmap=True)
+    after = torch.load(after_path, map_location="cpu", weights_only=False, mmap=True)
+    checked = 0
+
+    def inspect(value, name):
+        nonlocal checked
+        if isinstance(value, torch.Tensor):
+            if value.is_floating_point():
+                checked += 1
+                if not torch.isfinite(value).all().item():
+                    raise RuntimeError(f"nonfinite checkpoint tensor: {name}")
+        elif isinstance(value, dict):
+            for key, child in value.items():
+                inspect(child, f"{name}.{key}")
+        elif isinstance(value, (list, tuple)):
+            for index, child in enumerate(value):
+                inspect(child, f"{name}.{index}")
+
+    for key in ("model", "swa_model", "optimizer"):
+        inspect(after[key], key)
+    if before["model"].keys() != after["model"].keys():
+        raise RuntimeError("checkpoint model structure changed during resume")
+    changed = sum(not torch.equal(value, after["model"][key]) for key, value in before["model"].items())
+    if not changed:
+        raise RuntimeError("checkpoint model parameters did not change")
+    return {"finite_tensors_checked": checked, "changed_model_tensors": changed}
+
+
+def validate_training(runner, state, candidate, profile, selfplay_input, output, training_steps=None):
     """Resume the real optimizer in an isolated copy using new benchmark data."""
     bench = KataGoRLRunner(runner.config_path, run_root_override=output / "run",
                            hardware_profile=profile)
+    if training_steps is not None:
+        bench.config = replace(bench.config, optimizer=replace(
+            bench.config.optimizer, training_steps_per_iteration=training_steps))
     # Copy the retained replay and its ledger together, preserving the logical
     # row offset and allowing the official train bucket to advance normally.
     ledger_path = runner.run_root / "replay_rows.json"
@@ -88,36 +132,57 @@ def validate_training(runner, state, candidate, profile, selfplay_input, output)
         shutil.copy2(source, target)
     source_checkpoint = runner.run_root / "train/gogogo/checkpoint.ckpt"
     source_hash = sha256_file(source_checkpoint)
+    before = checkpoint_metrics(source_checkpoint)
+    expected = parse_model_name(str(state.active.latest_model))
+    if (before.get("trained_samples"), before.get("data_rows")) != expected:
+        raise RuntimeError("source checkpoint and curriculum model counters disagree")
+    steps_before = optimizer_steps(source_checkpoint)
     checkpoint = bench.run_root / "train/gogogo/checkpoint.ckpt"
     checkpoint.parent.mkdir(parents=True)
     shutil.copy2(source_checkpoint, checkpoint)
     target_model = bench.models_dir / str(state.active.latest_model) / "model.bin.gz"
     target_model.parent.mkdir(parents=True)
     shutil.copy2(candidate, target_model)
-    before = parse_model_name(str(state.active.latest_model))
     batch_size = state.active.autotune_batch or runner.config.optimizer.batch_size
     timings = {}
+    gpu_metrics = {}
     started = time.perf_counter()
     bench.shuffle()
     timings["shuffle_seconds"] = time.perf_counter() - started
     started = time.perf_counter()
-    new_rows = json.loads((bench.run_root / "replay_rows.json").read_text(encoding="utf-8"))["logical_rows"] - before[1]
-    bench.train(batch_size=batch_size, new_data_rows=new_rows)
+    new_rows = json.loads((bench.run_root / "replay_rows.json").read_text(encoding="utf-8"))["logical_rows"] - before["data_rows"]
+    with GpuMonitor(profile.gpu_index) as monitor:
+        bench.train(batch_size=batch_size, new_data_rows=new_rows)
+    gpu_metrics.update(monitor.metrics())
     timings["train_seconds"] = time.perf_counter() - started
     started = time.perf_counter()
     exported = bench.export_new_models()
     timings["export_seconds"] = time.perf_counter() - started
     after = checkpoint_metrics(checkpoint)
-    if not exported or after["trained_samples"] <= before[0] or after["data_rows"] <= before[1]:
+    if not exported or after["trained_samples"] <= before["trained_samples"] or after["data_rows"] <= before["data_rows"]:
         raise RuntimeError("isolated resume failed to advance training and data counters")
     if sha256_file(source_checkpoint) != source_hash:
         raise RuntimeError("source checkpoint changed during isolated validation")
+    sample_delta = after["trained_samples"] - before["trained_samples"]
+    batches, remainder = divmod(sample_delta, batch_size)
+    steps_after = optimizer_steps(checkpoint)
+    if remainder or not steps_before or steps_before.keys() != steps_after.keys() or any(
+        steps_after[key] - step != batches for key, step in steps_before.items()
+    ):
+        raise RuntimeError("isolated resume did not preserve and advance every optimizer step")
+    health = validate_checkpoint_update(source_checkpoint, checkpoint)
+    if any(not math.isfinite(value) for value in after.values()):
+        raise RuntimeError("isolated resume produced nonfinite training metrics")
     return {
         "mode": "training_validation", "source_checkpoint_sha256": source_hash,
-        "trained_samples_before": before[0], "trained_samples_after": after["trained_samples"],
-        "new_data_rows": after["data_rows"] - before[1],
-        "sample_reuse_ratio": (after["trained_samples"] - before[0]) / (after["data_rows"] - before[1]),
-        "batch_size": batch_size, "exported_models": [p.name for p in exported], **timings,
+        "trained_samples_before": before["trained_samples"], "trained_samples_after": after["trained_samples"],
+        "new_data_rows": after["data_rows"] - before["data_rows"],
+        "sample_reuse_ratio": sample_delta / (after["data_rows"] - before["data_rows"]),
+        "batch_size": batch_size, "requested_training_steps": bench.config.optimizer.training_steps_per_iteration,
+        "actual_training_batches": batches, "optimizer_state_entries": len(steps_before),
+        "optimizer_step_before": min(steps_before.values()), "optimizer_step_after": min(steps_after.values()),
+        "exported_models": [p.name for p in exported], "checkpoint_metrics": after,
+        **health, **timings, **gpu_metrics,
     }
 
 
@@ -128,10 +193,20 @@ def main():
     parser.add_argument("--output", type=Path)
     parser.add_argument("--pairs", type=int, default=4)
     parser.add_argument("--games", type=int, default=512)
+    parser.add_argument("--threads", type=int, nargs="+", default=[128, 256],
+                        help="self-play game threads to compare (multiples of 16, 32 to 256)")
+    parser.add_argument("--training-steps", type=int,
+                        help="override training budget only in the isolated validation")
     parser.add_argument("--selfplay-input", type=Path, help="isolated self-play run for --mode training")
     args = parser.parse_args()
     if args.pairs < 1 or args.games < 1:
         parser.error("pairs and games must be positive")
+    if len(set(args.threads)) != len(args.threads) or any(
+        threads < 32 or threads > 256 or threads % 16 for threads in args.threads
+    ):
+        parser.error("threads must be distinct multiples of 16 from 32 to 256")
+    if args.training_steps is not None and args.training_steps < 1:
+        parser.error("training-steps must be positive")
     if args.mode == "training" and args.selfplay_input is None:
         parser.error("--mode training requires --selfplay-input")
     runtime = CurriculumRuntime(args.curriculum_config)
@@ -180,7 +255,7 @@ def main():
                             "visits": runner.config.evaluation.simulations_per_move,
                             **result.to_dict(), **monitor.metrics()})
             if args.mode in {"all", "selfplay"}:
-                for threads in (128, 256):
+                for threads in args.threads:
                     bench = KataGoRLRunner(runner.config_path, run_root_override=output / f"selfplay-t{threads}",
                                            hardware_profile=profile)
                     bench.config = replace(bench.config, self_play=replace(
@@ -197,12 +272,13 @@ def main():
                         raise RuntimeError("benchmark did not finish the requested self-play games")
                     if health["damaged_games"] or health["no_result_games"]:
                         raise RuntimeError("benchmark produced damaged or unfinished games")
-                    record({"mode": "selfplay", "game_threads": threads, "seconds": seconds,
+                    record({"mode": "selfplay", "game_threads": threads, "requested_games": args.games,
+                            "visits": bench.config.search.simulations_per_move, "seconds": seconds,
                             "new_data_rows_per_hour": metrics["selfplay_data_rows"] * 3600 / seconds,
                             **metrics, **health, **monitor.metrics()})
             if args.mode == "training":
                 record(validate_training(runner, state, candidate, profile,
-                                         args.selfplay_input.resolve(), output))
+                                         args.selfplay_input.resolve(), output, args.training_steps))
             if sha256_file(candidate) != candidate_hash:
                 raise RuntimeError("source model changed during benchmark")
             print(f"Benchmark saved: {output / 'summary.json'}", flush=True)
