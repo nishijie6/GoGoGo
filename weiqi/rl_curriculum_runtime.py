@@ -185,7 +185,8 @@ class CurriculumRuntime(EvaluationSteps, TransitionSteps, CleanupSteps):
             self._model_path(runner, name)
         pool_changed = active.fixed_baseline_models != fixed or active.baseline_model != fixed[0]
         old_gate_passes = active.consecutive_passes > 0 and (
-            not active.evaluations or active.evaluations[-1].get("stage_gate_version") != 2
+            not active.evaluations or next((row.get("stage_gate_version") for row in reversed(active.evaluations)
+                                           if row.get("evaluation_scope") != "champion_cycle"), None) != 2
         )
         changed = pool_changed or not active.champion_model or old_gate_passes
         if changed:
@@ -343,6 +344,8 @@ class CurriculumRuntime(EvaluationSteps, TransitionSteps, CleanupSteps):
                 due = self._refresh_progress(state, runner)
                 if due:
                     self._evaluate(state)
+                elif self.config.champion_evaluation_every_cycle and self._needs_champion_evaluation(state):
+                    self._evaluate_champion(state)
                 if state.phase in {"transition_ready", "migrating"}:
                     self._migrate(state)
         except Exception as error:
@@ -390,7 +393,10 @@ class CurriculumRuntime(EvaluationSteps, TransitionSteps, CleanupSteps):
                     continue
                 if state.phase == "evaluating":
                     with self._stage_runner(state).lock():
-                        self._evaluate(state)
+                        if state.active.pending_champion_evaluation:
+                            self._evaluate_champion(state)
+                        else:
+                            self._evaluate(state)
                 if state.phase in {"transition_ready", "migrating"}:
                     with self._stage_runner(state).lock():
                         self._migrate(state)
@@ -403,6 +409,15 @@ class CurriculumRuntime(EvaluationSteps, TransitionSteps, CleanupSteps):
                 if state.phase != "training":
                     self._render_dashboard(state)
                     continue
+                if self.config.champion_evaluation_every_cycle and self._needs_champion_evaluation(state):
+                    with self._stage_runner(state).lock():
+                        if state.active.samples >= state.active.next_evaluation_sample:
+                            self._evaluate(state)
+                        else:
+                            self._evaluate_champion(state)
+                    self._render_dashboard(state)
+                    if state.phase != "training":
+                        continue
                 print(
                     f"\n===== 课程循环 {completed + 1} · {state.active.board_size}x{state.active.board_size} =====",
                     flush=True,

@@ -40,6 +40,7 @@ class StageProgress:
     next_evaluation_sample: int = 0
     consecutive_passes: int = 0
     evaluations: list[dict[str, object]] = field(default_factory=list)
+    pending_champion_evaluation: bool = False
     autotune_batch: Optional[int] = None
     started_at: str = field(default_factory=local_timestamp)
     completed_at: Optional[str] = None
@@ -59,6 +60,7 @@ class StageProgress:
                 next_evaluation_sample=int(value.get("next_evaluation_sample", 0)),
                 consecutive_passes=int(value.get("consecutive_passes", 0)),
                 evaluations=list(value.get("evaluations", [])),
+                pending_champion_evaluation=bool(value.get("pending_champion_evaluation", False)),
                 autotune_batch=(
                     int(value["autotune_batch"])
                     if value.get("autotune_batch") is not None

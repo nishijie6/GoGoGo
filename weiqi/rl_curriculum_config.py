@@ -112,6 +112,7 @@ class CurriculumConfig:
     evaluation_parallel_pairs: int = 1
     evaluation_midstage_interval_samples: Optional[int] = None
     evaluation_near_gate_samples: int = 1_000_000
+    champion_evaluation_every_cycle: bool = False
 
     def state_root(self, project_root: Path) -> Path:
         path = Path(self.state_directory)
@@ -164,7 +165,7 @@ def load_curriculum_config(path: Path) -> CurriculumConfig:
     _require_exact_keys(
         raw, path="课程配置", required=_ROOT_FIELDS,
         optional={"evaluation_parallel_pairs", "evaluation_midstage_interval_samples",
-                  "evaluation_near_gate_samples"},
+                  "evaluation_near_gate_samples", "champion_evaluation_every_cycle"},
     )
     if (
         isinstance(raw["schema_version"], bool)
@@ -195,6 +196,9 @@ def load_curriculum_config(path: Path) -> CurriculumConfig:
         raw.get("evaluation_near_gate_samples", 1_000_000), "evaluation_near_gate_samples"
     )
     games = _positive_int(raw["evaluation_games"], "evaluation_games")
+    every_cycle = raw.get("champion_evaluation_every_cycle", False)
+    if not isinstance(every_cycle, bool):
+        raise CurriculumConfigError("champion_evaluation_every_cycle 必须是布尔值")
     if games % 2:
         raise CurriculumConfigError("evaluation_games 必须是偶数")
     promotion = _probability(raw["promotion_win_rate"], "promotion_win_rate")
@@ -306,6 +310,7 @@ def load_curriculum_config(path: Path) -> CurriculumConfig:
         evaluation_parallel_pairs=parallel_pairs,
         evaluation_midstage_interval_samples=midstage_interval,
         evaluation_near_gate_samples=near_gate_samples,
+        champion_evaluation_every_cycle=every_cycle,
     )
 
 
