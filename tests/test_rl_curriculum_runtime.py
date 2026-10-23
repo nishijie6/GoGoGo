@@ -776,6 +776,95 @@ class CurriculumRuntimeStateTests(unittest.TestCase):
         self.assertEqual(state.active.champion_model, "gogogo-s10000000-d4")
         self.assertIn("gogogo-s2-d2", state.protected_models)
 
+    def test_champion_cycle_resumes_pending_match_and_does_not_advance_fixed_gate(self):
+        from test_rl_curriculum import passing_match
+        from unittest.mock import patch
+        for name in ("gogogo-s1-d1", "gogogo-s1000-d20"):
+            _make_model(self.root / "9x9", name)
+        state = self.runtime._adopt_existing_9x9()
+        state.active.champion_model = "gogogo-s1-d1"
+        self.runtime._ensure_opponent_pools(state)
+        boundary = state.active.next_evaluation_sample
+        state.active.consecutive_passes = 1
+        state.active.evaluations = [{"stage_gate_version": 2}]
+        with patch.object(self.runtime, "_pending_evaluation_directory", return_value=None), patch.object(
+                self.runtime, "_match_opponent", side_effect=RuntimeError("interrupted")):
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                self.runtime._evaluate_champion(state)
+        recovered = self.runtime.store.load()
+        self.assertTrue(recovered.active.pending_champion_evaluation)
+        self.assertEqual(recovered.phase, "evaluating")
+        self.assertEqual(recovered.active.champion_model, "gogogo-s1-d1")
+        with patch.object(self.runtime, "_pending_evaluation_directory", return_value=None), patch.object(
+                self.runtime, "_match_opponent", return_value=passing_match()) as match:
+            self.runtime._evaluate_champion(recovered)
+        self.assertEqual(match.call_args.args[4], ["champion"])
+        self.assertEqual(recovered.active.champion_model, "gogogo-s1000-d20")
+        self.assertEqual(recovered.active.consecutive_passes, 1)
+        self.assertEqual(recovered.active.next_evaluation_sample, boundary)
+        self.assertFalse(recovered.active.pending_champion_evaluation)
+        self.assertFalse(self.runtime._needs_champion_evaluation(recovered))
+        self.runtime._ensure_opponent_pools(recovered)
+        self.assertEqual(recovered.active.consecutive_passes, 1)
+
+    def test_champion_cycle_rejects_incomplete_match_and_keeps_unpromoted_result(self):
+        from test_rl_curriculum import passing_match
+        for name in ("gogogo-s1-d1", "gogogo-s1000-d20"):
+            _make_model(self.root / "9x9", name)
+        state = self.runtime._adopt_existing_9x9()
+        state.active.champion_model = "gogogo-s1-d1"
+        before = state.to_dict()
+        with self.assertRaises(CurriculumStateError):
+            self.runtime.controller.record_champion_evaluation(state, match=replace(passing_match(), games=198))
+        self.assertEqual(state.to_dict(), before)
+        losing = replace(passing_match(), candidate_wins=90, baseline_wins=110,
+                         win_rate=0.45, wilson_lower=0.38)
+        self.runtime.controller.record_champion_evaluation(state, match=losing, training_cycle=8)
+        self.assertEqual(state.active.champion_model, "gogogo-s1-d1")
+        self.assertFalse(state.active.evaluations[-1]["champion_promoted"])
+        self.assertEqual(state.active.evaluations[-1]["training_cycle"], 8)
+        self.assertFalse(self.runtime._needs_champion_evaluation(state))
+
+    def test_each_cycle_evaluates_champion_and_full_due_cycle_is_not_duplicated(self):
+        from unittest.mock import Mock, patch
+        for name in ("gogogo-s1-d1", "gogogo-s1000-d20"):
+            _make_model(self.root / "9x9", name)
+        state = self.runtime._adopt_existing_9x9()
+        state.active.champion_model = "gogogo-s1-d1"
+        self.runtime.config = replace(self.runtime.config, champion_evaluation_every_cycle=True)
+        runner = self.runtime._stage_runner(state)
+        runner.cycle = Mock()
+        for due in (False, True):
+            with self.subTest(due=due), patch.object(self.runtime, "_stage_runner", return_value=runner), patch.object(
+                    self.runtime, "_refresh_progress", return_value=due), patch.object(
+                    self.runtime, "_evaluate") as full, patch.object(self.runtime, "_evaluate_champion") as champion:
+                self.runtime._cycle(state, smoke=False)
+                self.assertEqual(full.call_count, int(due))
+                self.assertEqual(champion.call_count, int(not due))
+        state.active.champion_model = state.active.latest_model
+        with patch.object(self.runtime, "_stage_runner", return_value=runner), patch.object(
+                self.runtime, "_refresh_progress", return_value=False), patch.object(
+                self.runtime, "_evaluate_champion") as champion:
+            self.runtime._cycle(state, smoke=False)
+            champion.assert_not_called()
+
+    def test_champion_commit_failure_keeps_champion_and_pending_state(self):
+        from test_rl_curriculum import passing_match
+        from unittest.mock import patch
+        for name in ("gogogo-s1-d1", "gogogo-s1000-d20"):
+            _make_model(self.root / "9x9", name)
+        state = self.runtime._adopt_existing_9x9()
+        state.active.champion_model = "gogogo-s1-d1"
+        state.active.pending_champion_evaluation = True
+        state.phase = "evaluating"
+        self.runtime.store.save(state)
+        before = state.to_dict()
+        with patch.object(self.runtime.store, "save", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.runtime.controller.record_champion_evaluation(state, match=passing_match())
+        self.assertEqual(state.to_dict(), before)
+        self.assertEqual(self.runtime.store.load().active.champion_model, "gogogo-s1-d1")
+
     def test_missing_pool_model_prevents_initialization_and_cleanup(self):
         from unittest.mock import patch
         run_root = self.root / "9x9"

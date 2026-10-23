@@ -27,9 +27,13 @@
       "temperature_moves": 30
     },
     "self_play": {
-      "workers": 8,
-      "games_per_iteration": 128,
+      "workers": 16,
+      "games_per_iteration": 2048,
       "inference_batch_size": 128,
+      "init_games_with_policy": true,
+      "policy_init_area_prop": 0.04,
+      "early_fork_game_probability": 0.04,
+      "fork_game_probability": 0.01,
       "resign_threshold": null,
       "resign_min_move": 0
     },
@@ -37,7 +41,7 @@
       "batch_size": 512,
       "replay_buffer_capacity": 500000,
       "minimum_replay_size": 2048,
-      "training_steps_per_iteration": 4
+      "training_steps_per_iteration": 256
     },
     "evaluation": {
       "games": 200,

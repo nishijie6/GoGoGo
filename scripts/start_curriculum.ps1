@@ -60,6 +60,19 @@ function Format-Argument([string]$Value) {
     return '"' + $Value.Replace('"', '\"') + '"'
 }
 
+$env:PYTHONUTF8 = "1"
+Push-Location $resolvedProjectRoot
+try {
+    & $resolvedPythonPath -m weiqi.training_watchdog can-start --project-root $resolvedProjectRoot --curriculum-config $resolvedCurriculumConfig
+    $guardExit = $LASTEXITCODE
+}
+finally { Pop-Location }
+if ($guardExit -eq 10) {
+    Write-LauncherLog ("{0:o} startup skipped: manual pause or handoff hold" -f (Get-Date))
+    exit 0
+}
+if ($guardExit -ne 0) { exit $guardExit }
+
 Write-LauncherLog ("{0:o} starting curriculum (pid={1}, config={2})" -f `
     (Get-Date), $PID, $resolvedCurriculumConfig)
 
@@ -87,7 +100,7 @@ try {
         -WorkingDirectory $resolvedProjectRoot `
         -RedirectStandardOutput $stdoutLog `
         -RedirectStandardError $stderrLog `
-        -NoNewWindow -PassThru
+        -WindowStyle Hidden -PassThru
     # Reading Handle before waiting makes ExitCode available afterwards.
     $null = $process.Handle
     Write-LauncherLog ("{0:o} curriculum process started (pid={1})" -f (Get-Date), $process.Id)
