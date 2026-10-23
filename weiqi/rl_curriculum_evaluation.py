@@ -154,6 +154,41 @@ class EvaluationSteps:
             config_builder=config_builder, execute=execute,
         )
 
+    def _needs_champion_evaluation(self, state):
+        active = state.active
+        if not active.latest_model or not active.champion_model or active.latest_model == active.champion_model:
+            return False
+        return not any(record.get("candidate_model") == active.latest_model
+                       and any("champion" in item.get("roles", [])
+                               and item.get("match", {}).get("games") == self.config.evaluation_games
+                               for item in (record.get("opponents") or []))
+                       for record in active.evaluations)
+
+    def _evaluate_champion(self, state: CurriculumState) -> None:
+        runner = self._stage_runner(state)
+        self._ensure_opponent_pools(state)
+        candidate_name, champion = state.active.latest_model, state.active.champion_model
+        if not champion or candidate_name == champion:
+            raise CurriculumStateError("冠军评测需要不同于候选的冠军模型")
+        state.phase = "evaluating"
+        state.active.pending_champion_evaluation = True
+        self.store.save(state)
+        opponents = {champion: ["champion"]}
+        output_dir = self._pending_evaluation_directory(state, runner, candidate_name, opponents) or self._evaluation_directory(state)
+        print(f"每轮冠军评测：{candidate_name} vs {champion} · {self.config.evaluation_games} 局", flush=True)
+        # A failed or interrupted match stays pending. Restart reuses completed
+        # opening pairs before allowing the next model to train.
+        match = self._match_opponent(state, runner, candidate_name, champion, ["champion"],
+                                     output_dir / f"opponent-00-{champion}")
+        records = self._read_metric_records(runner)
+        self.controller.record_champion_evaluation(state, match=match,
+                                                   training_cycle=records[-1].get("cycle") if records else None)
+        try:
+            atomic_write_json(output_dir / "summary.json", state.active.evaluations[-1])
+        except OSError as error:
+            print(f"冠军评测已提交，辅助文件写入失败：{error}", file=sys.stderr, flush=True)
+        print(f"冠军评测完成：胜率 {match.win_rate:.1%} · 冠军 {state.active.champion_model}", flush=True)
+
     def _evaluate(self, state: CurriculumState) -> None:
         runner = self._stage_runner(state)
         committed = False
@@ -181,6 +216,8 @@ class EvaluationSteps:
             gate = self.controller.record_evaluation(
                 state, candidate_model=str(candidate_name), match=summary,
                 health=health, opponent_results=results,
+                training_cycle=next((row.get("cycle") for row in reversed(self._read_metric_records(runner))
+                                     if row.get("cycle") is not None), None),
             )
             committed = True
             atomic_write_json(output_dir / "summary.json", state.active.evaluations[-1])

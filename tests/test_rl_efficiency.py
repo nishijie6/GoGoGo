@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import io
 import json
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stderr
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -18,6 +20,7 @@ from weiqi.rl_curriculum_runtime import CurriculumRuntime
 from weiqi.rl_match_jobs import run_opening_pairs
 from weiqi.rl_metric_store import RLMetricStore
 from weiqi.katago_rl import KataGoRLRunner, KataGoRLRunnerError
+from scripts.benchmark_rl_efficiency import main as benchmark_main, validate_checkpoint_update
 
 
 PAIR = "(;PB[candidate]PW[baseline]RE[B+1.5])\n(;PB[baseline]PW[candidate]RE[W+1.5])\n"
@@ -216,6 +219,25 @@ class EfficiencyMetricTests(unittest.TestCase):
 
 
 class LargerCycleTrainingTests(unittest.TestCase):
+    def test_expanded_19x19_budget_preserves_evaluation_and_fits_fresh_data(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            profile = Path(__file__).resolve().parents[1] / "config/rl_training.rtx5070ti.curriculum.19x19.json"
+            runner = KataGoRLRunner(profile, run_root_override=Path(temporary))
+            self.assertEqual(runner.config.self_play.games_per_iteration, 2048)
+            self.assertEqual(runner.config.evaluation.games, 200)
+            self.assertEqual(runner.config.evaluation.promotion_win_rate, 0.6)
+            data = runner.shuffled_dir / "latest/train/data.npz"
+            data.parent.mkdir(parents=True)
+            data.touch()
+            with patch.object(runner, "_require_runtime"), patch.object(runner, "_run") as run:
+                runner.train(batch_size=1280, new_data_rows=158_448)
+                command = run.call_args.args[0]
+                self.assertEqual(command[command.index("-samples-per-epoch") + 1], 327_680)
+                self.assertEqual(command[command.index("-max-train-bucket-per-new-data") + 1], 4)
+                runner.train(batch_size=1280, new_data_rows=10_000)
+                command = run.call_args.args[0]
+                self.assertEqual(command[command.index("-samples-per-epoch") + 1], 39_680)
+
     def test_large_epoch_fits_the_fresh_data_bucket(self):
         with tempfile.TemporaryDirectory() as temporary:
             profile = Path(__file__).resolve().parents[1] / "config/rl_training.rtx5070ti.13x13.json"
@@ -233,6 +255,41 @@ class LargerCycleTrainingTests(unittest.TestCase):
                 self.assertEqual(command[command.index("-max-train-bucket-per-new-data") + 1], 4)
                 with self.assertRaises(KataGoRLRunnerError):
                     runner.train(batch_size=2048, new_data_rows=100)
+
+
+class EfficiencyBenchmarkTests(unittest.TestCase):
+    def test_validation_rejects_nonfinite_optimizer_or_unchanged_weights(self):
+        import torch
+        with tempfile.TemporaryDirectory() as temporary:
+            before, after = (Path(temporary) / name for name in ("before.ckpt", "after.ckpt"))
+            payload = {"model": {"weight": torch.tensor([1.0])}, "swa_model": {},
+                       "optimizer": {"state": {1: {"exp_avg": torch.tensor([0.0])}}}}
+            torch.save(payload, before)
+            torch.save(payload, after)
+            with self.assertRaisesRegex(RuntimeError, "did not change"):
+                validate_checkpoint_update(before, after)
+            payload["model"]["weight"] = torch.tensor([2.0])
+            torch.save(payload, after)
+            self.assertEqual(validate_checkpoint_update(before, after)["changed_model_tensors"], 1)
+            payload["optimizer"]["state"][1]["exp_avg"] = torch.tensor([float("nan")])
+            torch.save(payload, after)
+            with self.assertRaisesRegex(RuntimeError, "nonfinite"):
+                validate_checkpoint_update(before, after)
+
+    def test_invalid_resource_requests_fail_before_opening_the_live_curriculum(self):
+        cases = (
+            ["--threads", "0"], ["--threads", "31"], ["--threads", "129"],
+            ["--threads", "272"], ["--threads", "128", "128"],
+            ["--training-steps", "0"], ["--mode", "training"],
+        )
+        for arguments in cases:
+            with self.subTest(arguments=arguments), patch(
+                "sys.argv", ["benchmark_rl_efficiency.py", *arguments]
+            ), patch("scripts.benchmark_rl_efficiency.CurriculumRuntime") as runtime:
+                with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+                    benchmark_main()
+                self.assertEqual(raised.exception.code, 2)
+                runtime.assert_not_called()
 
 
 if __name__ == "__main__":

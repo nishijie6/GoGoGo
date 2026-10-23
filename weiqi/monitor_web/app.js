@@ -35,6 +35,11 @@
   let legacyTrendCount = 0;
   let integrationSignature = "";
   let baselineGroups = new Map();
+  let curvePinned = false;
+  let curveSelection = "";
+  let curveOptionsSignature = "";
+  let curveRenderSignature = "";
+  const completedCurves = new Map();
 
   function finite(value) { return typeof value === "number" && Number.isFinite(value); }
   function count(value) { return finite(value) ? numberFormat.format(value) : "—"; }
@@ -129,6 +134,11 @@
     return runs;
   }
   function resetRun() {
+    curvePinned = false;
+    curveSelection = "";
+    curveOptionsSignature = "";
+    curveRenderSignature = "";
+    $("evaluation-curve-panel").hidden = true;
     lastSnapshot = null;
     opponentsSignature = eventsSignature = chartSignature = "";
     integrationSignature = "";
@@ -387,13 +397,22 @@
     $("event-list").replaceChildren(fragment);
     $("event-list").scrollTop = scroll;
   }
-  function compactChart(rows, fields, { probability = false, connect = true, xKey = "iteration", xLabel = "训练轮次", intervals = false } = {}) {
+  function compactChart(rows, fields, { probability = false, fitY = false, connect = true, xKey = "iteration", xLabel = "训练轮次", intervals = false } = {}) {
     const svg = svgElement("svg", { viewBox: "0 0 680 235", role: "img", "aria-label": `${fields.map((f) => f[1]).join("、")}；横轴${xLabel}` });
     const xs = rows.map((row) => row[xKey]).filter(finite);
     const values = rows.flatMap((row) => fields.map(([key]) => row[key])).filter(finite);
     if (!xs.length || !values.length) return element("p", "integration-empty", "暂无记录；数据产生后自动显示");
     const lowX = Math.min(...xs), highX = Math.max(...xs);
-    const lowY = probability ? 0 : Math.min(0, ...values), highY = probability ? 1 : Math.max(1, ...values);
+    let lowY = probability ? 0 : Math.min(0, ...values), highY = probability ? 1 : Math.max(1, ...values);
+    if (probability && fitY) {
+      lowY = Math.min(...values);
+      highY = Math.max(...values);
+      // Keep a visible, finite scale for a single result or equal win rates.
+      if (lowY === highY) {
+        lowY = Math.max(0, lowY - 0.005);
+        highY = Math.min(1, highY + 0.005);
+      }
+    }
     const x = (v) => highX === lowX ? 360 : 64 + (v - lowX) / (highX - lowX) * 592;
     const y = (v) => 187 - (v - lowY) / (highY - lowY) * 167;
     const fmt = (v) => probability ? percent(v) : numberFormat.format(Number(v.toFixed(2)));
@@ -423,14 +442,14 @@
         }
         const detail = `${xLabel} ${count(row[xKey])}，${label} ${fmt(row[key])}${intervals ? `，${count(row.games)} 局，${interval?.method || "未记录区间"} ${percent(interval?.lower)}–${percent(interval?.upper)}` : ""}`;
         const point = svgElement("circle", { cx: px, cy: py, r: rows.length > 80 ? 2 : 4, fill: color, tabindex: "0", class: "chart-point", "aria-label": detail });
-        point.append(svgElement("title", {}, detail));
+        point.append(svgElement("title", {}, detail + (xKey === "completed" ? `，${count(row.wins)} 胜 / ${count(row.losses)} 负 / ${count(row.draws)} 和` : "")));
         svg.append(point);
       }
     }
     return svg;
   }
   function renderIntegrated(snapshot) {
-    const signature = JSON.stringify([snapshot.run?.id, snapshot.diagnostics, snapshot.evaluations, snapshot.health, snapshot.curriculum]);
+    const signature = JSON.stringify([snapshot.run?.id, snapshot.diagnostics, snapshot.evaluations, snapshot.health, snapshot.curriculum, snapshot.championship]);
     if (signature === integrationSignature) return;
     integrationSignature = signature;
     const legacy = snapshot.source === "legacy";
@@ -457,9 +476,9 @@
     $("health-metrics").replaceChildren(...health.map(([label, value]) => { const item = element("div"); item.append(element("dt", "", label), element("dd", "", value)); return item; }));
     const c = snapshot.curriculum;
     $("curriculum-detail").hidden = !c?.board_size;
-    text("curriculum-detail", c ? `课程棋盘 ${c.board_size} × ${c.board_size} · 已训练 ${count(c.samples)} 样本 · 下次评测 ${count(c.next_evaluation_sample)} 样本 · 连续通过 ${count(c.passes)} 次 · 冠军 ${c.champion || "未记录"} · 磁盘剩余 ${finite(c.disk_free_gib) ? c.disk_free_gib.toFixed(1) : "—"} GiB` : "");
+    text("curriculum-detail", c ? `课程棋盘 ${c.board_size} × ${c.board_size} · 已训练 ${count(c.samples)} 样本 · 下次固定基准评测 ${count(c.next_evaluation_sample)} 样本 · 连续通过 ${count(c.passes)} 次 · 冠军 ${snapshot.championship?.current?.label || c.champion || "未记录"} · 磁盘剩余 ${finite(c.disk_free_gib) ? c.disk_free_gib.toFixed(1) : "—"} GiB` : "");
     text("diagnostic-note", `最多显示最近 300 轮。${legacy ? "损失为旧版检查点移动平均，吞吐为训练样本 / 参数训练耗时。" : "吞吐为新增样本 / 自我对弈耗时。"}损失下降不等同于棋力提升。`);
-    legacyTrendCount = legacy ? renderLegacyTrend(snapshot.evaluations) : 0;
+    legacyTrendCount = legacy ? (snapshot.championship ? renderChampionTrend(snapshot.championship) : renderLegacyTrend(snapshot.evaluations)) : 0;
     const oldValue = $("baseline-select").value;
     baselineGroups = new Map();
     for (const row of list(snapshot.evaluations)) {
@@ -470,7 +489,7 @@
     }
     const options = Array.from(baselineGroups, ([key, group]) => {
       const row = group[0];
-      const option = element("option", "", `${row.stage ? `${row.stage} · ` : ""}${row.role === "champion" ? "滚动冠军" : row.role === "pool" ? "固定基准" : "晋级挑战"} · ${opponentName(row.name)} · ${shortHash(row.sha256)} · ${count(row.games)} 局 · 搜索 ${count(row.simulations_per_move)}`);
+      const option = element("option", "", `${row.stage ? `${row.stage} · ` : ""}${row.role === "champion" ? `冠军 ${row.champion_label || ""}` : row.role === "pool" ? "固定基准" : "晋级挑战"} · ${opponentName(row.name)} · ${shortHash(row.sha256)} · ${count(row.games)} 局 · 搜索 ${count(row.simulations_per_move)}`);
       option.value = key;
       return option;
     });
@@ -480,6 +499,46 @@
     if (baselineGroups.has(oldValue)) $("baseline-select").value = oldValue;
     renderBaseline();
   }
+  function renderChampionTrend(championship) {
+    const colors = ["#c3a36b", "#2d7b65", "#637fc1", "#af739e", "#8a9753", "#bd795e"];
+    const rounds = list(championship.rounds);
+    const current = championship.current;
+    const champions = [current, ...list(championship.champions)
+      .filter((champion) => champion.tier !== current?.tier && rounds.some((row) => row.champion_tier === champion.tier))
+      .sort((a, b) => b.tier - a.tier)].filter(Boolean);
+    const cards = champions.map((champion) => {
+      const rows = rounds.filter((row) => row.champion_tier === champion.tier).map((row) => ({ ...row, win_rate: rate(row.win_rate) }));
+      const fields = [["win_rate", `对 ${champion.label} 胜率`, colors[champion.tier % colors.length]]];
+      const card = element("article", "diagnostic-card champion-trend");
+      card.append(element("h3", "", `${championship.stage} · ${champion.tier === current?.tier ? "当前冠军" : "历史冠军"} ${champion.label}`));
+      card.append(compactChart(rows, fields, { probability: true, fitY: true, connect: true, xKey: "champion_round", xLabel: "冠军评测轮次" }));
+      const legend = element("div", "diagnostic-legend");
+      for (const [, label, color] of fields) { const item = element("span", "", label); item.style.color = color; legend.append(item); }
+      card.append(legend);
+      const tableRegion = element("div", "table-scroll champion-rounds");
+      const table = element("table");
+      const head = element("thead");
+      const headRow = element("tr");
+      for (const value of ["评测轮次", "训练轮次", "对手冠军", "胜 / 负 / 和", "胜率", "结果"]) headRow.append(element("th", "", value));
+      head.append(headRow);
+      const body = element("tbody");
+      for (const row of rows.slice(-40).reverse()) {
+        const tr = element("tr");
+        tr.title = `${row.candidate || "未知候选"} vs ${row.name || "未知冠军"} · ${timestamp(row.timestamp, true)}`;
+        for (const value of [count(row.champion_round), count(row.iteration), row.champion_label || "未编号冠军",
+          `${count(row.wins)} / ${count(row.losses)} / ${count(row.draws)}`, percent(row.win_rate),
+          row.promoted && finite(row.champion_tier) ? `晋级 T${row.champion_tier + 1}` : "未晋级"]) tr.append(element("td", "", value));
+        body.append(tr);
+      }
+      table.append(head, body);
+      tableRegion.append(table);
+      card.append(tableRegion);
+      return card;
+    });
+    $("legacy-trend").replaceChildren(...cards);
+    return cards.length;
+  }
+
   function renderLegacyTrend(evaluations) {
     const stages = new Map();
     for (const row of list(evaluations)) {
@@ -526,6 +585,7 @@
   $("baseline-select").addEventListener("change", renderBaseline);
   function renderSnapshot(snapshot) {
     lastSnapshot = snapshot;
+    text("trend-title", snapshot.championship ? "每轮冠军挑战胜率" : "评估胜率趋势");
     const status = snapshot.status || {};
     $("main").setAttribute("aria-busy", "false");
     $("dashboard").style.opacity = "";
@@ -578,7 +638,254 @@
         text("confidence-note", `${batch.interval.method} ${percent(batch.interval.lower)}–${percent(batch.interval.upper)}`);
       }
     }
+    if (snapshot.championship) renderChampionship(snapshot.championship);
   }
+
+  function renderChampionship(championship) {
+    const champion = championship.current;
+    const label = champion?.label || "待确认";
+    const live = championship.live_match;
+    const match = live || championship.match;
+    const winRate = rate(match?.win_rate);
+    text("rate-title", `对当前冠军 ${label} 胜率`);
+    metricValue("win-rate", winRate == null ? "—" : (winRate * 100).toFixed(1), winRate == null ? "" : "%");
+    $("win-rate-track").style.width = `${(winRate ?? 0) * 100}%`;
+    text("rate-caption", live ? `已完成 ${count(live.games)} / ${count(live.total)} 局 · ${count(live.wins)} 胜 / ${count(live.losses)} 负 / ${count(live.draws)} 和`
+      : match ? `当前模型对 ${label} · ${count(match.wins)} 胜 / ${count(match.games)} 局`
+      : championship.pending ? `正在对 ${label} 评测 200 局，完成后显示成绩`
+      : championship.latest_model === champion?.model ? `当前模型已成为 ${label}，等待下一轮模型挑战`
+      : `当前模型尚未对 ${label} 完成评测`);
+    text("score-rate", live ? `实时暂时成绩 · 含和棋得分率 ${percent(live.score_rate)}`
+      : match ? `含和棋折算得分率 ${percent(match.score_rate)}` : "每轮 200 局 · 旧冠军成绩保留在历史曲线");
+    text("opponent-title", "当前 T 级冠军");
+    text("current-opponent", label);
+    $("current-opponent").title = champion?.model || "";
+    text("opponent-caption", champion?.model || "等待冠军记录");
+    text("opponent-hash", "初始 T0 · 每晋级一次 +1");
+    text("best-iteration", `当前冠军 ${label}`);
+    text("trend-title", "每轮冠军挑战胜率");
+    text("history-count", `${count(list(championship.rounds).length)} 轮评测`);
+    text("trend-note", "当前冠军与历史冠军分开显示，纵轴分别按各自胜率的最低值到最高值缩放。每轮 200 局，历史缺测不补造。各表展示最近 40 项，悬停可看模型和时间。");
+    if (live) {
+      const progress = live.total > 0 ? live.games / live.total * 100 : 0;
+      metricValue("progress-value", count(live.games), ` / ${count(live.total)} 局`);
+      $("progress-fill").style.width = `${progress}%`;
+      $("phase-progress").setAttribute("aria-valuenow", String(Math.round(progress)));
+      text("progress-caption", `已结束棋局实时统计 · ${count(live.completed_pairs)} 组换色开局已完成`);
+      text("phase-label", "冠军评测进度");
+      text("state-badge", "实时统计");
+      $("state-badge").className = "status-badge";
+      text("data-age", live.updated_at ? `评测文件更新 ${timestamp(live.updated_at)}` : "等待首局结束");
+      $("data-age").title = live.updated_at ? `评测文件更新时间：${timestamp(live.updated_at, true)}` : "尚无有效对局结果";
+      text("detail-title", "本轮评测实时成绩");
+      text("batch-tag", "实时暂时成绩");
+      text("batch-context", `当前模型对 ${label} · 已完成 ${count(live.games)} / ${count(live.total)} 局`);
+      for (const key of ["wins", "losses", "draws", "truncated", "unknown"]) {
+        const value = live[key] || 0;
+        if (key !== "unknown") text(key, count(value));
+        $("bar-" + key).style.width = `${live.games > 0 ? value / live.games * 100 : 0}%`;
+      }
+      $("result-bar").setAttribute("aria-label", `${live.wins} 胜，${live.losses} 负，${live.draws} 和棋`);
+      $("unknown-results").hidden = true;
+      $("confidence-note").hidden = false;
+      text("confidence-note", "暂时胜率只统计已结束的有效对局；完成全部 200 局且换色完整后再判定晋级。");
+    }
+  }
+  let gpuHistory = [];
+
+  function gpuMeter(label, value, caption) {
+    const block = document.createElement("div");
+    block.className = "gpu-gauge";
+    const heading = document.createElement("span");
+    heading.className = "gpu-gauge-label";
+    heading.textContent = label;
+    const reading = document.createElement("strong");
+    reading.className = "gpu-value";
+    reading.textContent = caption;
+    const meter = document.createElement("meter");
+    meter.min = 0;
+    meter.max = 100;
+    meter.value = finite(value) ? Math.max(0, Math.min(100, value)) : 0;
+    meter.hidden = !finite(value);
+    meter.setAttribute("aria-label", label);
+    meter.setAttribute("aria-valuetext", caption);
+    block.append(heading, reading, meter);
+    return block;
+  }
+
+  function gpuHistoryChart(gpu) {
+    const panel = document.createElement("div");
+    panel.className = "gpu-history";
+    const heading = document.createElement("p");
+    heading.className = "gpu-history-heading";
+    heading.textContent = "GPU 使用率历史 · 最近 30 分钟";
+    const end = Date.now();
+    const rows = gpuHistory.map((sample) => ({
+      time: Date.parse(sample.sampled_at),
+      value: list(sample.gpus).find((item) => item.index === gpu.index && item.name === gpu.name)?.utilization_percent,
+    })).filter((row) => Number.isFinite(row.time) && row.time >= end - 1800000 && row.time <= end);
+    const start = Math.max(end - 1800000, Math.min(rows[0]?.time ?? end, end - 60000));
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 640 170");
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", `GPU ${gpu.index} 使用率历史，纵轴 0 到 100%，横轴为采样时间`);
+    const add = (tag, attributes, content) => {
+      const element = document.createElementNS(svg.namespaceURI, tag);
+      for (const [key, value] of Object.entries(attributes)) element.setAttribute(key, value);
+      if (content != null) element.textContent = content;
+      svg.append(element);
+      return element;
+    };
+    for (const percent of [0, 50, 100]) {
+      const y = 136 - percent * 1.18;
+      add("line", { x1: 44, x2: 626, y1: y, y2: y, class: "gpu-chart-grid" });
+      add("text", { x: 36, y: y + 4, "text-anchor": "end", class: "gpu-chart-label" }, `${percent}%`);
+    }
+    for (const [x, time, anchor] of [[44, start, "start"], [335, (start + end) / 2, "middle"], [626, end, "end"]]) {
+      add("text", { x, y: 158, "text-anchor": anchor, class: "gpu-chart-label" }, timestamp(time));
+    }
+    let path = "";
+    let previous = null;
+    const values = [];
+    for (const row of rows) {
+      if (!finite(row.value)) { previous = null; continue; }
+      const x = 44 + (row.time - start) / (end - start) * 582;
+      const y = 136 - Math.max(0, Math.min(100, row.value)) * 1.18;
+      const connected = previous != null && row.time - previous <= 10000;
+      path += `${connected ? "L" : "M"}${x.toFixed(2)},${y.toFixed(2)} `;
+      // Isolated samples remain visible without bridging gaps in telemetry.
+      if (!connected) add("circle", { cx: x, cy: y, r: 2.5, class: "gpu-chart-point" });
+      previous = row.time;
+      values.push(row.value);
+    }
+    if (path) add("path", { d: path, class: "gpu-chart-line" });
+    const summary = document.createElement("p");
+    summary.className = "gpu-chart-summary";
+    summary.textContent = values.length
+      ? `${values.length} 次采样 · 平均 ${(values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(0)}% · 峰值 ${Math.max(...values).toFixed(0)}%${values.length === 1 ? " · 正在积累曲线" : ""}`
+      : "等待有效采样；读取中断处保留空档";
+    panel.append(heading, svg, summary);
+    return panel;
+  }
+
+  function renderHardware(hardware) {
+    const container = $("gpu-devices");
+    container.replaceChildren();
+    if (Array.isArray(hardware?.history)) gpuHistory = hardware.history;
+    const gpus = hardware?.available ? list(hardware.gpus) : [];
+    text("gpu-updated", hardware?.sampled_at ? `采样于 ${timestamp(hardware.sampled_at)}` : "数据不可用");
+    if (!hardware?.available || !gpus.length) {
+      const message = document.createElement("p");
+      message.className = "gpu-unavailable";
+      message.textContent = hardware?.reason || "暂时无法读取 GPU 状态";
+      container.append(message);
+      const last = [...gpuHistory].reverse().find((sample) => list(sample.gpus).length);
+      for (const gpu of list(last?.gpus)) gpus.push({ index: gpu.index, name: gpu.name });
+    }
+    for (const gpu of gpus) {
+      const card = document.createElement("article");
+      card.className = "gpu-device";
+      const name = document.createElement("h3");
+      name.textContent = `GPU ${gpu.index} · ${gpu.name}`;
+      const utilization = finite(gpu.utilization_percent) ? Math.max(0, Math.min(100, gpu.utilization_percent)) : null;
+      const memory = finite(gpu.memory_used_mib) && finite(gpu.memory_total_mib) && gpu.memory_total_mib > 0
+        ? `${(gpu.memory_used_mib / 1024).toFixed(1)} / ${(gpu.memory_total_mib / 1024).toFixed(1)} GiB` : "不可用";
+      const memoryPercent = memory === "不可用" ? null : gpu.memory_used_mib / gpu.memory_total_mib * 100;
+      const gauges = document.createElement("div");
+      gauges.className = "gpu-gauges";
+      gauges.append(
+        gpuMeter(`GPU ${gpu.index} 使用率`, utilization, utilization == null ? "不可用" : `${utilization.toFixed(0)}%`),
+        gpuMeter("显存占用", memoryPercent, memory),
+        gpuMeter("温度 · 0–100°C 刻度", gpu.temperature_c, finite(gpu.temperature_c) ? `${gpu.temperature_c.toFixed(0)}°C` : "不可用"),
+      );
+      card.append(name, gauges, gpuHistoryChart(gpu));
+      container.append(card);
+    }
+  }
+
+  function renderEvaluationCurve(curve, label) {
+    const signature = JSON.stringify([label, curve]);
+    if (signature === curveRenderSignature) return;
+    curveRenderSignature = signature;
+    const points = list(curve.points);
+    text("evaluation-curve-summary", `${label} · ${curve.live ? "评测中 · " : ""}${count(curve.games)} / ${count(curve.total)} 局 · ${count(curve.wins)} 胜 / ${count(curve.losses)} 负 / ${count(curve.draws)} 和 · 胜率 ${percent(curve.win_rate)}`);
+    $("evaluation-curve-chart").replaceChildren(points.length
+      ? compactChart(points, [["win_rate", "累计胜率", "#2d7b65"]], { probability: true, fitY: true, connect: true, xKey: "completed", xLabel: "已完成局数" })
+      : element("p", "integration-empty", curve.live ? "首局结束后开始绘制曲线" : "该轮尚无可恢复的逐局棋谱"));
+    text("evaluation-curve-note", `按已保存棋谱的写入顺序恢复累计胜率，已恢复 ${count(points.length)} 条逐局记录。${curve.live ? "每 2 秒刷新；当前为暂时成绩，完整评测后才判定晋级。" : "历史曲线可在刷新或重启监控后继续查看。"}`);
+  }
+
+  async function refreshEvaluationCurve(snapshot, signal, requestGeneration) {
+    const championship = snapshot.championship;
+    $("evaluation-curve-panel").hidden = !championship;
+    if (!championship) return;
+    const rounds = list(championship.rounds);
+    const choices = [];
+    if (championship.live_match) choices.push(["live", `本轮实时 · 对 ${championship.current?.label || "当前冠军"}`]);
+    for (const row of rounds.slice().reverse()) choices.push([String(row.champion_round), `第 ${count(row.champion_round)} 轮 · 对 ${row.champion_label || "历史冠军"} · 已结束`]);
+    const selected = curvePinned && choices.some(([key]) => key === curveSelection) ? curveSelection : choices[0]?.[0] || "";
+    curveSelection = selected;
+    const optionsSignature = JSON.stringify(choices);
+    if (optionsSignature !== curveOptionsSignature) {
+      curveOptionsSignature = optionsSignature;
+      const options = choices.map(([key, label]) => { const option = element("option", "", label); option.value = key; return option; });
+      if (!options.length) options.push(element("option", "", "等待冠军评测记录"));
+      $("evaluation-curve-select").replaceChildren(...options);
+    }
+    $("evaluation-curve-select").value = selected;
+    $("evaluation-curve-select").disabled = !choices.length;
+    if (!selected) {
+      curveRenderSignature = "";
+      text("evaluation-curve-summary", "等待首轮评测");
+      $("evaluation-curve-chart").replaceChildren(element("p", "integration-empty", "评测开始后自动显示"));
+      return;
+    }
+    const label = choices.find(([key]) => key === selected)[1];
+    if (selected === "live") { renderEvaluationCurve(championship.live_match, label); return; }
+    const row = rounds.find((item) => String(item.champion_round) === selected);
+    const cacheKey = JSON.stringify([snapshot.run.id, championship.stage, row.candidate, row.name, row.samples]);
+    let curve = completedCurves.get(cacheKey);
+    try {
+      if (!curve) {
+        text("evaluation-curve-summary", `${label} · 正在恢复曲线…`);
+        curveRenderSignature = "";
+        $("evaluation-curve-chart").replaceChildren();
+        curve = await fetchJSON(`/api/champion-curve?run=${encodeURIComponent(snapshot.run.id)}&round=${encodeURIComponent(selected)}`, signal);
+        if (requestGeneration !== generation || curveSelection !== selected) return;
+        if (list(curve.points).length === curve.games) {
+          completedCurves.set(cacheKey, curve);
+          if (completedCurves.size > 32) completedCurves.delete(completedCurves.keys().next().value);
+        }
+      }
+      renderEvaluationCurve(curve, label);
+    } catch (error) {
+      if (requestGeneration !== generation || error?.name === "AbortError") return;
+      text("evaluation-curve-summary", `${label} · 暂时无法恢复曲线，下次刷新重试`);
+    }
+  }
+
+  $("evaluation-curve-select").addEventListener("change", () => {
+    curvePinned = true;
+    curveSelection = $("evaluation-curve-select").value;
+    generation += 1;
+    refresh();
+  });
+
+  function renderRecovery(recovery) {
+    $("recovery-panel").hidden = !recovery?.checked_at;
+    if (!recovery?.checked_at) return;
+    const stale = !finite(recovery.checked_epoch) || Date.now() / 1000 - recovery.checked_epoch > 180;
+    const services = [recovery.training, recovery.monitor].filter(Boolean);
+    const failed = stale || services.some((item) => item.state === "failed");
+    const waiting = services.some((item) => item.state !== "healthy");
+    $("recovery-panel").className = `recovery-panel${failed ? " failed" : waiting ? " waiting" : ""}`;
+    text("recovery-state", stale ? "守护检查已超过 3 分钟未更新" : failed ? "恢复失败，需要处理" : waiting ? "恢复或暂停中" : "守护正常");
+    const restarts = services.reduce((sum, item) => sum + (item.restart_count || 0), 0);
+    text("recovery-summary", `每分钟独立检查 · 最近检查 ${timestamp(recovery.checked_at)} · 自动恢复 ${count(restarts)} 次 · 训练：${recovery.training?.message || "未读取"} · 监控：${recovery.monitor?.message || "未读取"}`);
+    $("recovery-events").replaceChildren(...list(recovery.events).slice(-10).reverse().map((event) =>
+      element("li", "", `${timestamp(event.timestamp, true)} · ${event.service === "training" ? "训练" : "监控"} · ${event.message}`)));
+  }
+
   async function refresh() {
     const thisGeneration = generation;
     clearTimeout(timer);
@@ -587,14 +894,21 @@
     const requestController = controller;
     const timeout = setTimeout(() => requestController.abort(new DOMException("请求超时", "TimeoutError")), 12000);
     try {
-      const runData = await fetchJSON("/api/runs", requestController.signal);
+      const [runData, hardware, recovery] = await Promise.all([
+        fetchJSON("/api/runs", requestController.signal),
+        fetchJSON("/api/hardware", requestController.signal).catch(() => ({ available: false, reason: "GPU 状态连接失败" })),
+        fetchJSON("/api/recovery", requestController.signal).catch(() => ({ checked_at: null })),
+      ]);
       if (thisGeneration !== generation) return;
+      renderHardware(hardware);
+      renderRecovery(recovery);
       const runs = renderRuns(runData);
       if (runs.length && selectedRun) {
         const requestedRun = selectedRun;
         const snapshot = await fetchJSON(`/api/snapshot?run=${encodeURIComponent(requestedRun)}`, requestController.signal);
         if (thisGeneration !== generation || selectedRun !== requestedRun) return;
         renderSnapshot(snapshot);
+        await refreshEvaluationCurve(snapshot, requestController.signal, thisGeneration);
       } else {
         $("dashboard").hidden = true;
         $("empty-state").hidden = false;
@@ -602,11 +916,13 @@
         text("page-description", "尚未发现训练运行，启动训练后会自动显示。");
         text("last-refresh", `页面刷新 ${timestamp(Date.now())}`);
       }
+      if (thisGeneration !== generation) return;
       setConnection(true);
       $("error-banner").hidden = true;
     } catch (error) {
       if (thisGeneration !== generation || error?.name === "AbortError") return;
       setConnection(false);
+      renderHardware({ available: false, reason: "连接中断，无法读取 GPU 状态" });
       $("main").setAttribute("aria-busy", "false");
       $("dashboard").style.opacity = lastSnapshot ? "" : ".55";
       text("error-message", `${errorMessage(error)}${lastSnapshot ? " 当前保留上次成功读取的数据。" : ""}`);

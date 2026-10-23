@@ -463,6 +463,40 @@ class MonitorHTTPTests(unittest.TestCase):
         self.assertEqual(self.request("/api/snapshot")[0], 400)
         self.assertEqual(self.request("/api/snapshot?run=missing")[0], 404)
 
+    def test_hardware_endpoint_is_independent_of_training_run(self):
+        payload = {"available": True, "gpus": [{"index": 0, "utilization_percent": 95}],
+                   "sampled_at": "2026-10-21T01:00:00+00:00", "reason": None}
+        with patch("monitor_training.GPUMonitor.snapshot", return_value=payload):
+            status, headers, body = self.request("/api/hardware")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), payload)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+
+    def test_recovery_endpoint_reads_persisted_events_without_mutation_or_cache(self):
+        path = self.run.parent / "curriculum" / "recovery_status.json"
+        payload = {"checked_at": "2026-10-22T15:00:00+08:00", "training": {"state": "healthy"},
+                   "events": [{"service": "training", "message": "自动恢复完成"}]}
+        write_json(path, payload)
+        before = path.read_bytes()
+        status, headers, body = self.request("/api/recovery")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), payload)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_champion_curve_route_is_read_only_and_requires_valid_run_and_round(self):
+        url = "/api/champion-curve?" + urlencode({"run": self.run.name, "round": 1})
+        payload = {"round": 1, "live": False, "points": [{"completed": 1, "win_rate": 1.0}]}
+        with patch.object(self.server.monitor_store, "champion_curve", return_value=payload) as reader:
+            status, headers, body = self.request(url)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), payload)
+        reader.assert_called_once_with(self.run.name, "1")
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(self.request("/api/champion-curve?run=../outside&round=1")[0], 400)
+        self.assertEqual(self.request("/api/champion-curve?" + urlencode({"run": self.run.name, "round": "bad"}))[0], 400)
+        self.assertEqual(self.request(url)[0], 404)
+
     def test_static_allowlist_and_post_cannot_read_private_files_or_mutate_training(self):
         before = {path.relative_to(self.run): path.read_bytes() for path in self.run.rglob("*") if path.is_file()}
         for path, mime in (("/", "text/html"), ("/app.js", "text/javascript"), ("/style.css", "text/css")):

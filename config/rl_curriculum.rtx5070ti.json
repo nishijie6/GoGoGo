@@ -6,6 +6,7 @@
   "evaluation_near_gate_samples": 1000000,
   "evaluation_parallel_pairs": 4,
   "evaluation_games": 200,
+  "champion_evaluation_every_cycle": true,
   "promotion_win_rate": 0.6,
   "wilson_lower_bound": 0.5,
   "required_consecutive_passes": 2,

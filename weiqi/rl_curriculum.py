@@ -283,6 +283,37 @@ class CurriculumController:
                 opponents.setdefault(name, []).append("fixed")
         return opponents
 
+    def record_champion_evaluation(self, state: CurriculumState, *, match: MatchSummary, training_cycle=None) -> None:
+        """Commit a full champion challenge without advancing the fixed-pool gate."""
+        if (match.games != self.config.evaluation_games
+                or match.requested_games != self.config.evaluation_games
+                or match.candidate_black_games != self.config.evaluation_games // 2
+                or match.candidate_white_games != self.config.evaluation_games // 2
+                or match.damaged_games or match.no_result_games):
+            raise CurriculumStateError("冠军评测必须完整完成指定局数并严格交换黑白")
+        candidate = copy.deepcopy(state)
+        active = candidate.active
+        before = active.champion_model
+        if not before or before == active.latest_model:
+            raise CurriculumStateError("冠军评测需要不同于候选的冠军模型")
+        promoted = (match.win_rate >= self.config.promotion_win_rate
+                    and match.wilson_lower > self.config.wilson_lower_bound)
+        if promoted:
+            active.champion_model = active.latest_model
+            active.champion_established = True
+        active.evaluations.append({
+            "evaluation_scope": "champion_cycle", "timestamp": local_timestamp(),
+            "training_cycle": training_cycle,
+            "candidate_model": active.latest_model, "stage_samples": active.samples,
+            "champion_before": before, "champion_after": active.champion_model,
+            "champion_promoted": promoted,
+            "opponents": [{"model": before, "roles": ["champion"], "match": match.to_dict()}],
+        })
+        active.pending_champion_evaluation = False
+        candidate.phase = "training"
+        self.store.save(candidate)
+        state.__dict__.update(candidate.__dict__)
+
     def record_evaluation(
         self,
         state: CurriculumState,
@@ -291,6 +322,7 @@ class CurriculumController:
         match: MatchSummary,
         health: HealthSummary,
         opponent_results: Optional[Mapping[str, MatchSummary]] = None,
+        training_cycle: Optional[int] = None,
     ) -> QualityGate:
         stage_definition = self.config.stages[state.active_stage_index]
         # Stage advancement uses every frozen historical anchor. Champion promotion
@@ -305,6 +337,7 @@ class CurriculumController:
         )
         candidate = copy.deepcopy(state)
         record: dict[str, object] = {
+            "training_cycle": training_cycle,
             "stage_gate_version": 2,
             "timestamp": local_timestamp(),
             "candidate_model": candidate_model,
