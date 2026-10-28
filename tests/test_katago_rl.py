@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -306,6 +307,41 @@ class KataGoRLConfigurationTests(unittest.TestCase):
             self.assertEqual(runner._batch_fitting_shuffle(shuffled.parent, 2048), 1024)
             (shuffled / "data0.json").write_text('{"num_rows": 9000}', encoding="utf-8")
             self.assertEqual(runner._batch_fitting_shuffle(shuffled.parent, 2048), 2048)
+
+    def test_shuffle_reserves_full_autotuned_sample_budget(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runner = KataGoRLRunner(DEFAULT_RTX_PROFILE.with_name(
+                "rl_training.rtx5070ti.curriculum.19x19.json"), run_root_override=Path(temporary))
+            data = runner.selfplay_dir / "gogogo-s100-d600000/tdata/data.npz"
+            data.parent.mkdir(parents=True)
+            np.savez_compressed(data, globalInputNC=np.zeros((600000, 1), dtype=np.float32))
+            with patch.object(runner, "_require_runtime"), patch.object(runner, "_run") as run:
+                shuffled = runner.shuffle(training_batch_size=1280, new_data_rows=147006)
+            command = run.call_args.args[0]
+            self.assertEqual(command[command.index("-min-rows") + 1], 491520)
+            self.assertEqual(command[command.index("-approx-rows-per-out-file") + 1], 20480)
+            self.assertEqual(command[command.index("-keep-target-rows") + 1], 500000)
+            for i in range(24):
+                (shuffled / "train" / f"data{i}.json").write_text('{"num_rows": 20000}')
+            self.assertEqual(runner._batch_fitting_shuffle(shuffled, 1280), 1280)
+            self.assertEqual(runner.training_sample_budget(1280, new_data_rows=147006), 327680)
+            self.assertEqual(runner.training_sample_budget(1280, new_data_rows=10000), 39680)
+
+    def test_mature_run_rejects_training_that_stops_below_budget(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runner = KataGoRLRunner(DEFAULT_RTX_PROFILE, run_root_override=Path(temporary))
+            data = runner.shuffled_dir / "latest/train/data.npz"
+            data.parent.mkdir(parents=True)
+            data.write_bytes(b"data")
+            checkpoint = runner.run_root / "train/gogogo/checkpoint.ckpt"
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_bytes(b"saved-checkpoint")
+            with patch.object(runner, "_require_runtime"), patch.object(runner, "_run"), patch(
+                    "weiqi.katago_rl.checkpoint_metrics", side_effect=[
+                        {"trained_samples": 10000}, {"trained_samples": 12048}]), patch(
+                    "weiqi.katago_rl.ReplayRowLedger.sync", return_value=SimpleNamespace(physical_rows=10000)):
+                with self.assertRaisesRegex(KataGoRLRunnerError, "拒绝发布不足预算"):
+                    runner.train()
 
     def test_curriculum_commands_have_a_dedicated_config(self) -> None:
         args = build_parser().parse_args(["curriculum-status"])

@@ -112,6 +112,7 @@ class HardwareRoutingTests(unittest.TestCase):
 
     def test_cycle_caps_a_saved_large_batch_for_new_hardware(self):
         runtime = CurriculumRuntime.__new__(CurriculumRuntime)
+        runtime.config = SimpleNamespace(champion_evaluation_every_cycle=False)
         runtime.hardware_profile = cpu_profile()
         runner = KataGoRLRunner(hardware_profile=cpu_profile())
         runner.lock = contextlib.nullcontext

@@ -25,6 +25,7 @@ from weiqi.rl_curriculum import GlobalCurriculumLock
 from weiqi.rl_curriculum_runtime import CurriculumRuntime
 from weiqi.rl_metrics import parse_sgfs
 from weiqi.rl_metrics import checkpoint_metrics, parse_model_name
+from weiqi.replay_accounting import ReplayRowLedger
 
 
 class GpuMonitor:
@@ -147,7 +148,8 @@ def validate_training(runner, state, candidate, profile, selfplay_input, output,
     timings = {}
     gpu_metrics = {}
     started = time.perf_counter()
-    bench.shuffle()
+    new_rows = ReplayRowLedger(bench.run_root).sync().logical_rows - before["data_rows"]
+    bench.shuffle(training_batch_size=batch_size, new_data_rows=new_rows)
     timings["shuffle_seconds"] = time.perf_counter() - started
     started = time.perf_counter()
     new_rows = json.loads((bench.run_root / "replay_rows.json").read_text(encoding="utf-8"))["logical_rows"] - before["data_rows"]
@@ -164,6 +166,9 @@ def validate_training(runner, state, candidate, profile, selfplay_input, output,
     if sha256_file(source_checkpoint) != source_hash:
         raise RuntimeError("source checkpoint changed during isolated validation")
     sample_delta = after["trained_samples"] - before["trained_samples"]
+    requested_samples = bench.training_sample_budget(batch_size, new_data_rows=new_rows)
+    if sample_delta < requested_samples:
+        raise RuntimeError("isolated resume stopped before the requested sample budget")
     batches, remainder = divmod(sample_delta, batch_size)
     steps_after = optimizer_steps(checkpoint)
     if remainder or not steps_before or steps_before.keys() != steps_after.keys() or any(
@@ -177,6 +182,7 @@ def validate_training(runner, state, candidate, profile, selfplay_input, output,
         "mode": "training_validation", "source_checkpoint_sha256": source_hash,
         "trained_samples_before": before["trained_samples"], "trained_samples_after": after["trained_samples"],
         "new_data_rows": after["data_rows"] - before["data_rows"],
+        "requested_training_samples": requested_samples,
         "sample_reuse_ratio": sample_delta / (after["data_rows"] - before["data_rows"]),
         "batch_size": batch_size, "requested_training_steps": bench.config.optimizer.training_steps_per_iteration,
         "actual_training_batches": batches, "optimizer_state_entries": len(steps_before),
@@ -240,9 +246,10 @@ def main():
                 # in a separate suite; never rewrite the live 100-opening suite.
                 runtime.state_root = output / "evaluation-state"
                 baseline = state.active.champion_model or state.active.baseline_model
-                for parallel in (1, 4):
+                for parallel, inference in ((4, 128), (8, 2)):
                     runtime.config = replace(runtime.config, evaluation_games=2 * args.pairs,
-                                             evaluation_parallel_pairs=parallel)
+                                             evaluation_parallel_pairs=parallel,
+                                             evaluation_inference_batch_size=inference)
                     started = time.perf_counter()
                     with GpuMonitor(profile.gpu_index) as monitor:
                         result = runtime._match_opponent(
@@ -251,6 +258,7 @@ def main():
                         )
                     seconds = time.perf_counter() - started
                     record({"mode": "evaluation", "parallel_pairs": runtime._parallel_pairs(),
+                            "inference_batch_size": inference,
                             "seconds": seconds, "games_per_hour": result.games * 3600 / seconds,
                             "visits": runner.config.evaluation.simulations_per_move,
                             **result.to_dict(), **monitor.metrics()})

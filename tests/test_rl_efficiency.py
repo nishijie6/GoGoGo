@@ -7,6 +7,7 @@ import json
 import tempfile
 import threading
 import unittest
+from types import SimpleNamespace
 from contextlib import redirect_stderr
 from dataclasses import replace
 from pathlib import Path
@@ -125,6 +126,37 @@ class PairedMatchExecutionTests(unittest.TestCase):
 
 
 class AdaptiveEvaluationTests(unittest.TestCase):
+    def test_compact_workspace_reuses_old_protocol_pairs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path, _ = _write_profiles(root)
+            runtime = CurriculumRuntime(path, project_root=root, runner_factory=_FakeRunner)
+            runtime.config = replace(runtime.config, evaluation_games=4, evaluation_parallel_pairs=4)
+            for name in ("gogogo-s1-d1", "gogogo-s2-d2"):
+                _make_model(root / "9x9", name)
+            state = runtime._adopt_existing_9x9()
+            runner = runtime._stage_runner(state)
+            calls = []
+            def execute(command, **_kwargs):
+                calls.append(command)
+                sgfs = Path(command[command.index("-sgf-output-dir") + 1])
+                (sgfs / "pair.sgfs").write_text(PAIR)
+                return SimpleNamespace(returncode=0)
+            output = runtime.state_root / "resource-test"
+            with patch.object(runtime, "_run_external", side_effect=execute):
+                runtime._match_opponent(state, runner, "gogogo-s2-d2", "gogogo-s1-d1", ["champion"], output)
+                self.assertEqual(len(calls), 2)
+                saved = (output / "pairs/opening-000/match.cfg").read_text()
+                runtime.config = replace(runtime.config, evaluation_inference_batch_size=2, evaluation_parallel_pairs=8)
+                result = runtime._match_opponent(state, runner, "gogogo-s2-d2", "gogogo-s1-d1", ["champion"], output)
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(result.games, 4)
+                self.assertEqual((output / "pairs/opening-000/match.cfg").read_text(), saved)
+                other = runtime.state_root / "compact-new"
+                runtime._match_opponent(state, runner, "gogogo-s2-d2", "gogogo-s1-d1", ["champion"], other)
+                self.assertIn("nnMaxBatchSize=2", calls[-1])
+                self.assertEqual((other / "pairs/opening-000/match.cfg").read_text(), saved)
+
     def test_invalid_parallelism_and_intervals_are_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "config.json"
