@@ -17,6 +17,29 @@ from weiqi.katago_rl import build_selfplay_overrides, KataGoRLRunner, KataGoRLRu
 
 @unittest.skipUnless(AVAILABLE, 'Optional training dependency NumPy is not installed')
 class ForcedPlayoutTests(unittest.TestCase):
+    def test_joseki_selfplay_plays_raw_policy_and_stores_pruned_targets(self):
+        from weiqi.rl.selfplay import GameJob, play_game
+        config = resolve_rl_training_config(overrides={
+            'search': {'forced_playouts_coefficient': 2, 'policy_target_pruning': True,
+                       'full_search_probability': 1.0, 'temperature_moves': 0},
+            'self_play': {'joseki_fraction': 1.0},
+        })
+        def controlled_search(position, _evaluate, search_config, _rng, *, target_policy_out, **_options):
+            self.assertEqual(search_config.forced_playouts_coefficient, 2)
+            played = np.zeros(len(position.legal), np.float32)
+            played[-1] = 1
+            target_policy_out.fill(0)
+            target_policy_out[np.flatnonzero(position.legal[:-1])[0]] = 1
+            return played, 0.0
+        with patch('weiqi.rl.selfplay.search', side_effect=controlled_search):
+            result = play_game(config, GameJob(0, 1), lambda *_: None, training=True)
+        self.assertIsNotNone(result.opening_id)
+        self.assertGreater(result.opening_moves, 0)
+        self.assertEqual(len(result.moves), result.opening_moves + 2)
+        self.assertEqual(len(result.examples), 2)
+        self.assertEqual([move[1] for move in result.moves[-2:]], [81, 81])
+        self.assertTrue(all(example[1][-1] == 0 for example in result.examples))
+
     def test_targeted_path_resolves_from_project_and_missing_pool_fails(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

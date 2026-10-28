@@ -85,8 +85,9 @@ def with_training_policy(config, path: Path):
 
     changes = json.loads(path.read_text(encoding="utf-8"))
     allowed = {
-        "search": {"full_search_probability", "fast_simulations_per_move"},
-        "self_play": {"champion_fraction", "milestone_fraction", "games_per_iteration"},
+        "search": {"full_search_probability", "fast_simulations_per_move", "leaf_batch_size"},
+        "self_play": {"champion_fraction", "milestone_fraction", "games_per_iteration",
+                      "joseki_fraction"},
         "optimizer": {"target_sample_reuse", "training_steps_per_iteration"},
         "evaluation": {"games", "promotion_win_rate", "promotion_test",
                        "confirmation_max_game_length_factor", "confidence_level",
