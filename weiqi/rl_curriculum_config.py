@@ -113,6 +113,7 @@ class CurriculumConfig:
     evaluation_midstage_interval_samples: Optional[int] = None
     evaluation_near_gate_samples: int = 1_000_000
     champion_evaluation_every_cycle: bool = False
+    evaluation_inference_batch_size: int = 128
 
     def state_root(self, project_root: Path) -> Path:
         path = Path(self.state_directory)
@@ -165,7 +166,8 @@ def load_curriculum_config(path: Path) -> CurriculumConfig:
     _require_exact_keys(
         raw, path="课程配置", required=_ROOT_FIELDS,
         optional={"evaluation_parallel_pairs", "evaluation_midstage_interval_samples",
-                  "evaluation_near_gate_samples", "champion_evaluation_every_cycle"},
+                  "evaluation_near_gate_samples", "champion_evaluation_every_cycle",
+                  "evaluation_inference_batch_size"},
     )
     if (
         isinstance(raw["schema_version"], bool)
@@ -187,6 +189,9 @@ def load_curriculum_config(path: Path) -> CurriculumConfig:
     parallel_pairs = _positive_int(raw.get("evaluation_parallel_pairs", 1), "evaluation_parallel_pairs")
     if parallel_pairs > 16:
         raise CurriculumConfigError("evaluation_parallel_pairs 不能大于 16")
+    inference_batch = _positive_int(raw.get("evaluation_inference_batch_size", 128), "evaluation_inference_batch_size")
+    if inference_batch > 128:
+        raise CurriculumConfigError("evaluation_inference_batch_size 不能大于 128")
     midstage_interval = raw.get("evaluation_midstage_interval_samples")
     if midstage_interval is not None:
         midstage_interval = _positive_int(midstage_interval, "evaluation_midstage_interval_samples")
@@ -311,6 +316,7 @@ def load_curriculum_config(path: Path) -> CurriculumConfig:
         evaluation_midstage_interval_samples=midstage_interval,
         evaluation_near_gate_samples=near_gate_samples,
         champion_evaluation_every_cycle=every_cycle,
+        evaluation_inference_batch_size=inference_batch,
     )
 
 

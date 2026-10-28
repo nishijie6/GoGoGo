@@ -28,8 +28,9 @@ from .process_control import stream_command
 from .rl_config import RLTrainingConfig, load_rl_training_config
 from .rl_handoff_guard import HandoffLockedError, ensure_training_available
 from .rl_metric_store import RLMetricStore
-from .rl_metrics import parse_selfplay_output
+from .rl_metrics import checkpoint_metrics, parse_selfplay_output
 from .replay_accounting import ReplayAccountingError, ReplayRowLedger
+from .rl_shuffle import align_training_files
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -405,7 +406,9 @@ class KataGoRLRunner:
         )
         return parse_selfplay_output(output)
 
-    def shuffle(self, *, min_rows: Optional[int] = None, smoke: bool = False) -> Path:
+    def shuffle(self, *, min_rows: Optional[int] = None, smoke: bool = False,
+                training_batch_size: Optional[int] = None,
+                new_data_rows: Optional[int] = None) -> Path:
         """Shuffle the current replay window into consumable training batches."""
 
         self._require_runtime()
@@ -413,7 +416,8 @@ class KataGoRLRunner:
         if not any(self.selfplay_dir.glob("**/tdata/*.npz")):
             raise KataGoRLRunnerError("没有找到自我对弈训练数据")
         try:
-            replay_offset = ReplayRowLedger(self.run_root).sync().deleted_rows_offset
+            ledger = ReplayRowLedger(self.run_root).sync()
+            replay_offset = ledger.deleted_rows_offset
         except ReplayAccountingError as error:
             raise KataGoRLRunnerError(f"回放数据累计行号不可用：{error}") from error
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -429,8 +433,15 @@ class KataGoRLRunner:
         ) if min_rows is None else min_rows
         if required_rows < 1:
             raise KataGoRLRunnerError("打乱窗口的最小行数必须至少为 1")
+        batch = self.training_batch_size(training_batch_size or self.config.optimizer.batch_size)
+        if not smoke:
+            budget = self.training_sample_budget(batch, new_data_rows=new_data_rows)
+            # The output target alone does not enlarge KataGo's tapered input
+            # window. Keep enough unique rows for the epoch plus per-file tails.
+            available = min(ledger.physical_rows, self.config.optimizer.replay_buffer_capacity)
+            required_rows = max(required_rows, min(available, math.ceil(budget * 1.5)))
         workers = max(1, min(4, self.config.hardware.data_loader_workers))
-        rows_per_file = max(4096, self.config.optimizer.batch_size * 16)
+        rows_per_file = max(4096, batch * 16)
         self._run(
             [
                 sys.executable,
@@ -460,10 +471,22 @@ class KataGoRLRunner:
             cwd=self.python_source,
             log_name=f"shuffle-{stamp}.log",
         )
+        if not smoke and batch >= 128 and available >= budget * 1.5 and any(output_dir.glob("*.npz")):
+            align_training_files(temporary_parent, batch_size=batch, samples=budget)
         final_parent = self.shuffled_dir / stamp
         temporary_parent.replace(final_parent)
         print(f"已生成打乱数据：{final_parent}", flush=True)
         return final_parent
+
+    def training_sample_budget(self, batch_size: int, *, new_data_rows: Optional[int] = None) -> int:
+        budget = batch_size * self.config.optimizer.training_steps_per_iteration
+        if new_data_rows is not None:
+            if isinstance(new_data_rows, bool) or not isinstance(new_data_rows, int) or new_data_rows < 1:
+                raise KataGoRLRunnerError("本轮新增训练行必须为正整数")
+            budget = min(budget, (4 * new_data_rows // batch_size) * batch_size)
+        if budget < batch_size:
+            raise KataGoRLRunnerError("本轮新增数据不足以支持一个训练批次")
+        return budget
 
     def train(
         self,
@@ -472,7 +495,7 @@ class KataGoRLRunner:
         batch_size: Optional[int] = None,
         initial_checkpoint: Optional[Path] = None,
         new_data_rows: Optional[int] = None,
-    ) -> None:
+    ) -> dict[str, int]:
         """Update the policy/value network from the newest shuffled data."""
 
         self._require_runtime()
@@ -485,20 +508,7 @@ class KataGoRLRunner:
         batch_size = self.training_batch_size(batch_size)
         if not any(self.shuffled_dir.glob("*/train/*.npz")):
             raise KataGoRLRunnerError("没有找到已打乱的训练数据")
-        max_samples = (
-            batch_size
-            if smoke
-            else batch_size * self.config.optimizer.training_steps_per_iteration
-        )
-        if not smoke and new_data_rows is not None:
-            if isinstance(new_data_rows, bool) or not isinstance(new_data_rows, int) or new_data_rows < 1:
-                raise KataGoRLRunnerError("本轮新增训练行必须为正整数")
-            available_samples = (4 * new_data_rows // batch_size) * batch_size
-            if available_samples < batch_size:
-                raise KataGoRLRunnerError("本轮新增数据不足以支持一个训练批次")
-            # The official train bucket permits four processed samples per new
-            # row. A large cycle must not request an epoch the bucket cannot fill.
-            max_samples = min(max_samples, available_samples)
+        max_samples = batch_size if smoke else self.training_sample_budget(batch_size, new_data_rows=new_data_rows)
         command: list[object] = [
             sys.executable,
             self.python_source / "train.py",
@@ -556,11 +566,23 @@ class KataGoRLRunner:
             # A single entry chooses the device without enabling DDP.
             command.extend(["-multi-gpus", self.config.hardware.device.split(":", 1)[1]])
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        checkpoint = self.run_root / "train" / "gogogo" / "checkpoint.ckpt"
+        before = checkpoint_metrics(checkpoint) if checkpoint.is_file() else {}
         self._run(
             command,
             cwd=self.python_source,
             log_name=f"train-{timestamp}.log",
         )
+        result = {"training_batch_size": batch_size, "training_requested_samples": max_samples}
+        if before.get("trained_samples") is not None:
+            after = checkpoint_metrics(checkpoint)
+            if after.get("trained_samples") is None:
+                raise KataGoRLRunnerError("训练结束后无法核对检查点样本数")
+            actual = int(after["trained_samples"] - before["trained_samples"])
+            result["training_actual_samples"] = actual
+            if not smoke and batch_size >= 128 and actual < max_samples and ReplayRowLedger(self.run_root).sync().physical_rows >= max_samples * 1.5:
+                raise KataGoRLRunnerError(f"训练实际只处理 {actual}/{max_samples} 条样本，拒绝发布不足预算的模型")
+        return result
 
     def _batch_fitting_shuffle(self, shuffled: Path, requested: int) -> int:
         """Fit one training epoch into the shuffled files at a new stage."""
@@ -681,15 +703,23 @@ class KataGoRLRunner:
                 return
 
         stage_started = time.perf_counter()
-        shuffled = self.shuffle(min_rows=min_rows, smoke=smoke)
+        shuffled = self.shuffle(min_rows=min_rows, smoke=smoke,
+                                training_batch_size=training_batch_size,
+                                new_data_rows=selfplay_metrics.get("selfplay_data_rows"))
         shuffle_seconds = time.perf_counter() - stage_started
 
         stage_started = time.perf_counter()
         batch = training_batch_size
         if not smoke and isinstance(shuffled, Path):
             batch = batch or self.config.optimizer.batch_size
-            batch = self._batch_fitting_shuffle(shuffled, batch)
-        self.train(
+            fitted = self._batch_fitting_shuffle(shuffled, batch)
+            # Once enough replay exists, shrinking the batch would silently cut
+            # the epoch budget too. Fail visibly instead of publishing that run.
+            if fitted != batch and ReplayRowLedger(self.run_root).sync().physical_rows >= self.training_sample_budget(
+                    batch, new_data_rows=selfplay_metrics.get("selfplay_data_rows")) * 1.5:
+                raise KataGoRLRunnerError("打乱数据未覆盖完整训练预算，拒绝静默缩小批次")
+            batch = fitted
+        training_metrics = self.train(
             smoke=smoke,
             batch_size=batch,
             initial_checkpoint=initial_checkpoint,
@@ -707,6 +737,11 @@ class KataGoRLRunner:
         status = self.status()
         live_metrics: dict[str, object] = {
             **selfplay_metrics,
+            **(training_metrics if isinstance(training_metrics, dict) else {}),
+            "training_batch_size": batch or self.config.optimizer.batch_size,
+            "training_requested_samples": (
+                (batch or self.config.optimizer.batch_size) if smoke else self.training_sample_budget(
+                    batch or self.config.optimizer.batch_size, new_data_rows=selfplay_metrics.get("selfplay_data_rows"))),
             "shuffle_seconds": shuffle_seconds,
             "train_seconds": train_seconds,
             "export_seconds": export_seconds,

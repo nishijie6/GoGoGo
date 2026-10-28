@@ -75,7 +75,8 @@ class EvaluationSteps:
             return 1
         # Independent engines each load two nets and inference workspaces.
         budget = min(self.config.max_gpu_memory_gib, max(0, profile.memory_gib - 2))
-        return min(requested, max(1, int(budget // 2.5)))
+        per_engine_gib = 1.0 if self.config.evaluation_inference_batch_size <= 2 else 2.5
+        return min(requested, max(1, int(budget // per_engine_gib)))
 
     @staticmethod
     def _manifest_matches(path, expected):
@@ -118,6 +119,11 @@ class EvaluationSteps:
         if not manifest_path.exists():
             atomic_write_json(manifest_path, {**manifest, "created_at": local_timestamp()})
         environment = runner._environment()
+        atomic_write_json(output_dir / "execution.json", {
+            "parallel_pairs": self._parallel_pairs(),
+            "inference_batch_size": self.config.evaluation_inference_batch_size,
+            "updated_at": local_timestamp(),
+        })
 
         def config_builder(opening):
             return build_match_config(
@@ -134,12 +140,16 @@ class EvaluationSteps:
             )
 
         def execute(config_path, sgf_dir, log_path):
+            # Resource allocation only: keep the protocol config byte-identical
+            # so previously completed opening/color pairs remain reusable.
             execution = self._run_external(
                 [
                     runner.katago_executable,
                     "match",
                     "-config",
                     config_path,
+                    "-override-config",
+                    f"nnMaxBatchSize={self.config.evaluation_inference_batch_size}",
                     "-sgf-output-dir",
                     sgf_dir,
                 ],
@@ -163,6 +173,28 @@ class EvaluationSteps:
                                and item.get("match", {}).get("games") == self.config.evaluation_games
                                for item in (record.get("opponents") or []))
                        for record in active.evaluations)
+
+    def _defer_disabled_champion_evaluation(self, state) -> bool:
+        """Apply a changed per-cycle schedule without cancelling a due gate.
+
+        Cached opening pairs remain on disk. Deferral is an audit event, never
+        a match result or a champion promotion.
+        """
+        active = state.active
+        if (self.config.champion_evaluation_every_cycle or state.phase != "evaluating"
+                or not active.pending_champion_evaluation
+                or active.samples >= active.next_evaluation_sample):
+            return False
+        state.warnings.append({
+            "timestamp": local_timestamp(), "kind": "evaluation_deferred",
+            "candidate_model": active.latest_model,
+            "message": "已切换到按样本间隔评测；本轮冠军评测延期，已完成开局配对保留，冠军不变",
+            "next_evaluation_sample": active.next_evaluation_sample,
+        })
+        active.pending_champion_evaluation = False
+        state.phase = "training"
+        self.store.save(state)
+        return True
 
     def _evaluate_champion(self, state: CurriculumState) -> None:
         runner = self._stage_runner(state)

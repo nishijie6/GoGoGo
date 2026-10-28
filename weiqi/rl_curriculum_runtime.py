@@ -391,6 +391,9 @@ class CurriculumRuntime(EvaluationSteps, TransitionSteps, CleanupSteps):
                         break
                     self.sleep(DISK_POLL_SECONDS)
                     continue
+                if self._defer_disabled_champion_evaluation(state):
+                    self._render_dashboard(state)
+                    print("冠军评测已按新调度延期，继续训练；已完成开局配对保留。", flush=True)
                 if state.phase == "evaluating":
                     with self._stage_runner(state).lock():
                         if state.active.pending_champion_evaluation:
