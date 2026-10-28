@@ -92,10 +92,15 @@ def play_game(config, job, evaluate, *, training: bool, evaluate_batch=None) -> 
                        or rng.random() < config.search.full_search_probability)
         if not full_search:
             simulations = min(simulations, config.search.fast_simulations_per_move)
+        target_policy = (np.empty(len(state.legal), dtype=np.float32)
+                         if training and full_search and config.search.policy_target_pruning
+                         and config.search.forced_playouts_coefficient > 0 else None)
+        target_options = {} if target_policy is None else {"target_policy_out": target_policy}
         policy, value = search(
             state, evaluator, config.search, rng,
             simulations=simulations, add_noise=training and full_search,
             evaluate_batch=batch_evaluator,
+            **target_options,
         )
         threshold = config.self_play.resign_threshold if training else None
         if threshold is not None and len(moves) >= config.self_play.resign_min_move and value < threshold:
@@ -103,7 +108,7 @@ def play_game(config, job, evaluate, *, training: bool, evaluate_batch=None) -> 
             reason = "resign"
             break
         if training and full_search:
-            samples.append((state.features(), policy, color))
+            samples.append((state.features(), policy if target_policy is None else target_policy, color))
         temperature = (
             config.search.root_temperature
             if training and len(moves) < config.search.temperature_moves else 0.0

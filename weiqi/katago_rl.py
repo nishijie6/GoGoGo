@@ -112,6 +112,7 @@ def build_selfplay_overrides(
     overrides: dict[str, object] = {
         "numGameThreads": game_threads,
         "maxVisits": requested_visits,
+        "rootDesiredPerChildVisitsCoeff": config.search.katago_forced_playouts_coefficient,
         "cheapSearchVisits": cheap_visits,
         "reducedVisitsMin": cheap_visits,
         "nnMaxBatchSize": batch_size,
@@ -175,6 +176,12 @@ def build_selfplay_overrides(
     # bootstrap generator; omitting it initially avoids a noisy unused-key warning.
     if has_model:
         overrides["cudaUseNHWC"] = True
+        if config.self_play.targeted_start_probability:
+            overrides["hintPosesProb"] = config.self_play.targeted_start_probability
+            overrides["hintPosesDir"] = config.self_play.targeted_positions_directory
+            # A null hint move samples a weak position without privileging a
+            # potentially mistaken move; retain its full recorded history.
+            overrides["startPosesPolicyInitAreaProp"] = 0.0
     if hardware_profile is not None:
         for key in ("cudaDeviceToUse", "cudaUseFP16", "cudaUseNHWC"):
             overrides.pop(key, None)
@@ -379,6 +386,14 @@ class KataGoRLRunner:
         if requested_games < 1:
             raise KataGoRLRunnerError("自我对弈局数必须至少为 1")
         has_model = any(self.models_dir.glob("*/model.bin.gz"))
+        targeted_directory = None
+        if has_model and self.config.self_play.targeted_start_probability:
+            directory = Path(self.config.self_play.targeted_positions_directory)
+            if not directory.is_absolute():
+                directory = self.project_root / directory
+            if not directory.is_dir() or not any(directory.glob("*.startposes.txt")):
+                raise KataGoRLRunnerError("定向采样目录不存在或缺少 .startposes.txt 局面文件")
+            targeted_directory = directory.resolve()
         overrides = build_selfplay_overrides(
             self.config,
             visits=(8 if smoke else None) if visits is None else visits,
@@ -386,6 +401,8 @@ class KataGoRLRunner:
             has_model=has_model,
             hardware_profile=self.hardware_profile,
         )
+        if targeted_directory is not None:
+            overrides["hintPosesDir"] = str(targeted_directory)
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         output = self._run(
             [

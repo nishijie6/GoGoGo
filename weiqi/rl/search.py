@@ -84,6 +84,8 @@ def search(
     simulations: int | None = None,
     add_noise: bool = False,
     evaluate_batch: BatchEvaluator | None = None,
+    target_policy_out: np.ndarray | None = None,
+    diagnostics: dict | None = None,
 ) -> tuple[np.ndarray, float]:
     if position.game.game_over:
         raise ValueError("Cannot search a finished game")
@@ -97,6 +99,8 @@ def search(
         root.priors = (root.priors * (1 - config.dirichlet_epsilon)
                        + noise * config.dirichlet_epsilon)
     batch_size = config.leaf_batch_size if evaluate_batch is not None else 1
+    forced_coefficient = config.forced_playouts_coefficient if add_noise else 0.0
+    forced_count = 0
     done = 0
     while done < count:
         # Select up to batch_size leaves; virtual loss steers later picks elsewhere.
@@ -104,9 +108,18 @@ def search(
         pending_ids: set[int] = set()
         while done < count and len(pending) < batch_size:
             node, state = root, position
+            forced_root = False
             path: list[tuple[Node, int]] = []  # (parent, child index) edges
             while node.expanded and not state.game.game_over:
-                index = node.select(config.c_puct, rng)
+                eligible = (np.flatnonzero(
+                    (node.child_visits > 0) & (node.child_visits < np.sqrt(
+                        forced_coefficient * node.priors * max(1, node.visits))))
+                    if node is root and forced_coefficient > 0 else ())
+                if len(eligible):
+                    index = int(rng.choice(eligible))
+                    forced_root = True
+                else:
+                    index = node.select(config.c_puct, rng)
                 child = node.children[index]
                 if child is None:
                     child = node.children[index] = Node(state.play(int(node.actions[index])))
@@ -114,6 +127,7 @@ def search(
                 node, state = child, child.position
             if state.game.game_over:
                 _backup(root, path, state.terminal_value(), 0.0)
+                forced_count += int(forced_root)
                 done += 1
                 continue
             if id(node) in pending_ids:
@@ -121,6 +135,7 @@ def search(
             if batch_size > 1:
                 _backup_virtual(root, path)
             pending.append((path, state, node))
+            forced_count += int(forced_root)
             pending_ids.add(id(node))
             done += 1
         if not pending:
@@ -135,7 +150,50 @@ def search(
     policy = np.zeros(len(position.legal), dtype=np.float32)
     policy[root.actions] = root.child_visits
     policy /= policy.sum()
+    target_visits = root.child_visits
+    if forced_coefficient > 0 and config.policy_target_pruning:
+        target_visits = prune_policy_visits(root, config.c_puct, forced_coefficient)
+    if target_policy_out is not None:
+        if target_policy_out.shape != policy.shape:
+            raise ValueError("Target policy shape does not match the action space")
+        target_policy_out.fill(0)
+        target_policy_out[root.actions] = target_visits / target_visits.sum()
+    if diagnostics is not None:
+        diagnostics.update(forced_playouts=forced_count, visits=int(root.child_visits.sum()),
+                           pruned_visits=float((root.child_visits - target_visits).sum()),
+                           visited_actions=int(np.count_nonzero(root.child_visits)))
     return policy, root.value
+
+
+def prune_policy_visits(root: Node, c_puct: float, coefficient: float) -> np.ndarray:
+    """Remove forced exploration from targets using the final root PUCT scores.
+
+    Keep the most visited move intact. For other moves, remove at most the
+    forced quota while their PUCT score stays below that move's score, then
+    discard singleton targets as in the original method. Search
+    statistics and the policy used to play the game remain unchanged.
+    """
+    visits = root.child_visits
+    result = visits.copy()
+    best = int(np.argmax(visits))
+    q = -np.divide(root.child_values, visits, out=np.zeros_like(visits), where=visits > 0)
+    exploration = c_puct * np.sqrt(max(1, root.visits)) * root.priors
+    best_score = q[best] + exploration[best] / (1 + visits[best])
+    quota = np.sqrt(coefficient * root.priors * max(1, root.visits))
+    for i in np.flatnonzero(visits):
+        if i == best:
+            continue
+        minimum = max(0, int(np.ceil(visits[i] - quota[i])))
+        # Removing visits increases exploration monotonically, so the first
+        # count whose score is no greater than the best is the retained count.
+        gap = best_score - q[i]
+        if gap <= 0:
+            continue
+        required = max(0, int(np.ceil(exploration[i] / gap - 1)))
+        result[i] = min(visits[i], max(minimum, required))
+        if result[i] <= 1 and minimum <= 1:
+            result[i] = 0
+    return result
 
 
 def _visit(parent: Node, index: int, visits: int, value: float) -> None:

@@ -82,6 +82,12 @@ class SearchTrainingConfig:
     # full search and becomes a policy target; the rest use a cheap search.
     full_search_probability: float = 1.0
     fast_simulations_per_move: int = 16
+    # Native self-play only; zero preserves existing search and RNG behavior.
+    forced_playouts_coefficient: float = 0.0
+    policy_target_pruning: bool = False
+    # Official backend already enables this in selfplay1.cfg; keep it separate
+    # from the native implementation's opt-in default above.
+    katago_forced_playouts_coefficient: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -100,6 +106,8 @@ class SelfPlayTrainingConfig:
     policy_init_area_prop: float = 0.04
     early_fork_game_probability: float = 0.0
     fork_game_probability: float = 0.0
+    targeted_start_probability: float = 0.0
+    targeted_positions_directory: str = ""
 
 
 @dataclass(frozen=True)
@@ -224,6 +232,9 @@ _BALANCED_PRESET: Dict[str, Any] = {
         "leaf_batch_size": 4,
         "full_search_probability": 0.25,
         "fast_simulations_per_move": 16,
+        "forced_playouts_coefficient": 0.0,
+        "policy_target_pruning": False,
+        "katago_forced_playouts_coefficient": 2.0,
     },
     "self_play": {
         "workers": 2,
@@ -234,6 +245,8 @@ _BALANCED_PRESET: Dict[str, Any] = {
         "policy_init_area_prop": 0.04,
         "early_fork_game_probability": 0.0,
         "fork_game_probability": 0.0,
+        "targeted_start_probability": 0.0,
+        "targeted_positions_directory": "",
         "milestone_fraction": 0.25,
         "max_game_length_factor": 2.5,
         # Early models must not poison their own data with false resignations.
@@ -324,6 +337,9 @@ _HIGH_PERFORMANCE_PRESET: Dict[str, Any] = {
         "leaf_batch_size": 1,
         "full_search_probability": 1.0,
         "fast_simulations_per_move": 100,
+        "forced_playouts_coefficient": 0.0,
+        "policy_target_pruning": False,
+        "katago_forced_playouts_coefficient": 2.0,
     },
     "self_play": {
         "workers": 8,
@@ -334,6 +350,8 @@ _HIGH_PERFORMANCE_PRESET: Dict[str, Any] = {
         "policy_init_area_prop": 0.04,
         "early_fork_game_probability": 0.0,
         "fork_game_probability": 0.0,
+        "targeted_start_probability": 0.0,
+        "targeted_positions_directory": "",
         "milestone_fraction": 0.0,
         "max_game_length_factor": 2.5,
         "resign_threshold": None,
@@ -550,6 +568,11 @@ def _validate_network(network: NetworkTrainingConfig) -> None:
 
 
 def _validate_search(search: SearchTrainingConfig) -> None:
+    if not 0 <= _require_number("search.katago_forced_playouts_coefficient", search.katago_forced_playouts_coefficient) <= 100:
+        raise _config_error("search.katago_forced_playouts_coefficient", "必须在 0 到 100 之间")
+    if _require_number("search.forced_playouts_coefficient", search.forced_playouts_coefficient) < 0:
+        raise _config_error("search.forced_playouts_coefficient", "不能小于 0")
+    _require_bool("search.policy_target_pruning", search.policy_target_pruning)
     _require_int("search.simulations_per_move", search.simulations_per_move, 1)
     _require_int("search.leaf_batch_size", search.leaf_batch_size, 1)
     _require_positive_number("search.c_puct", search.c_puct)
@@ -569,6 +592,13 @@ def _validate_search(search: SearchTrainingConfig) -> None:
 
 
 def _validate_self_play(self_play: SelfPlayTrainingConfig) -> None:
+    _require_probability("self_play.targeted_start_probability", self_play.targeted_start_probability)
+    if self_play.targeted_start_probability > 0.5:
+        raise _config_error("self_play.targeted_start_probability", "不能大于 0.5")
+    if not isinstance(self_play.targeted_positions_directory, str):
+        raise _config_error("self_play.targeted_positions_directory", "必须是路径字符串")
+    if self_play.targeted_start_probability and not self_play.targeted_positions_directory.strip():
+        raise _config_error("self_play.targeted_positions_directory", "启用定向采样时必须指定局面目录")
     _require_int("self_play.workers", self_play.workers, 1)
     _require_int("self_play.games_per_iteration", self_play.games_per_iteration, 1)
     _require_int("self_play.inference_batch_size", self_play.inference_batch_size, 1)
