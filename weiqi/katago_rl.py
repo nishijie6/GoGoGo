@@ -92,6 +92,10 @@ def build_selfplay_overrides(
 ) -> dict[str, object]:
     """Translate the project profile into official KataGo self-play options."""
 
+    if config.self_play.joseki_fraction:
+        raise KataGoRLRunnerError(
+            "self_play.joseki_fraction 目前仅由普通版 train.py 支持，不能用于 KataGo 训练"
+        )
     requested_visits = (
         config.search.simulations_per_move if visits is None else visits
     )

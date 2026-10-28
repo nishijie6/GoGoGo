@@ -397,6 +397,8 @@ class Trainer:
             "new_samples": sum(len(game.examples) for game in games), "replay_samples": len(self.replay),
             "selfplay_seconds": time.monotonic() - started,
             "selfplay_opponents": list(opponent_rows.values()),
+            "selfplay_joseki_games": sum(game.opening_id is not None for game in games),
+            "selfplay_joseki_fraction": config.self_play.joseki_fraction,
         }
 
     def _position_quality(self, directory: Path) -> dict:

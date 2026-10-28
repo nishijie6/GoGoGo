@@ -51,6 +51,7 @@ def checkpoint_config(payload: dict):
     # Schema-1 checkpoints predate these policy fields. Preserve their actual
     # training/evaluation behavior rather than inheriting newer preset defaults.
     overrides.setdefault("self_play", {}).setdefault("milestone_fraction", 0.0)
+    overrides["self_play"].setdefault("joseki_fraction", 0.0)
     evaluation = overrides.setdefault("evaluation", {})
     evaluation.setdefault("promotion_test", "paired_hoeffding")
     evaluation.setdefault("confirmation_max_game_length_factor",
@@ -160,12 +161,12 @@ class ReplayBuffer:
                                 scores.tolist(), weights.tolist()))[-self.capacity:]
 
 
-def write_games(games, config, directory: Path) -> None:
+def write_games(games, config, directory: Path, *, metadata: dict | None = None) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     size = config.game.board_size
     for game in games:
         stem = f"game_{game.index:04d}"
-        atomic_json(game.record(config), directory / (stem + ".json"))
+        atomic_json({**(metadata or {}), **game.record(config)}, directory / (stem + ".json"))
         outcome = ""
         if game.reason != "length_limit":
             if game.winner is None:
