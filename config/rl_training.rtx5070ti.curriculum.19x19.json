@@ -24,7 +24,8 @@
       "dirichlet_alpha": 0.03,
       "dirichlet_epsilon": 0.25,
       "root_temperature": 1.0,
-      "temperature_moves": 30
+      "temperature_moves": 30,
+      "katago_forced_playouts_coefficient": 2.0
     },
     "self_play": {
       "workers": 16,
@@ -35,7 +36,9 @@
       "early_fork_game_probability": 0.04,
       "fork_game_probability": 0.01,
       "resign_threshold": null,
-      "resign_min_move": 0
+      "resign_min_move": 0,
+      "targeted_start_probability": 0.0,
+      "targeted_positions_directory": ""
     },
     "optimizer": {
       "batch_size": 512,
