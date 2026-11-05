@@ -25,7 +25,8 @@
       "dirichlet_epsilon": 0.25,
       "root_temperature": 1.0,
       "temperature_moves": 30,
-      "katago_forced_playouts_coefficient": 2.0
+      "katago_forced_playouts_coefficient": 2.0,
+      "katago_cheap_search_visits": 60
     },
     "self_play": {
       "workers": 16,
