@@ -24,7 +24,7 @@ PAIR = ("(;GM[1]SZ[{size}]KM[7.5]RU[koPOSITIONALscoreAREAtaxNONEsui0]"
 
 
 def config_values(path: Path) -> dict[str, str]:
-    return {key.strip(): value.strip() for line in path.read_text().splitlines()
+    return {key.strip(): value.strip() for line in path.read_text(encoding="utf-8").splitlines()
             if "=" in line for key, value in [line.split("=", 1)]}
 
 
@@ -55,9 +55,9 @@ class EngineBoundary:
         values = config_values(config)
         size = int(values["bSizes"])
         (sgfs / "pair.sgfs").write_text(
-            self.result_text if self.result_text is not None else PAIR.format(size=size))
+            self.result_text if self.result_text is not None else PAIR.format(size=size), encoding="utf-8")
         if log_name is not None:
-            Path(log_name).write_text("mocked engine boundary\n")
+            Path(log_name).write_text("mocked engine boundary\n", encoding="utf-8")
         return "mocked engine boundary\n"
 
 
@@ -66,7 +66,7 @@ class MixedEvaluationTests(unittest.TestCase):
         self.evaluate(games_per_board=8, parallel_pairs=4)
         self.assertEqual(len(self.runner.calls), 4)
         self.assertEqual(self.manifest()["protocol"]["parallel_pairs"], 4)
-        progress = json.loads((self.output / "boards/9x9/progress.json").read_text())
+        progress = json.loads((self.output / "boards/9x9/progress.json").read_text(encoding="utf-8"))
         self.assertEqual(progress["parallel_pairs"], 4)
         self.runner.calls.clear()
         self.evaluate(games_per_board=8, parallel_pairs=4)
@@ -123,7 +123,7 @@ class MixedEvaluationTests(unittest.TestCase):
                            "boards": [9], "games_per_board": 4, "visits": 16, **changes})
 
     def manifest(self):
-        return json.loads((self.output / "evaluation_manifest.json").read_text())
+        return json.loads((self.output / "evaluation_manifest.json").read_text(encoding="utf-8"))
 
     def test_all_five_sizes_use_frozen_models_singleton_pairs_and_metal(self):
         result = self.evaluate(boards=None)
@@ -159,7 +159,7 @@ class MixedEvaluationTests(unittest.TestCase):
                 self.assertTrue(frozen.is_file())
             opening = Path(values["hintPosesDir"])
             self.assertEqual(len(list(opening.iterdir())), 1)
-            sample = json.loads((opening / "opening.startposes.txt").read_text())
+            sample = json.loads((opening / "opening.startposes.txt").read_text(encoding="utf-8"))
             self.assertEqual(sample["xSize"], int(values["bSizes"]))
             suites.add(opening.parent)
             self.assertTrue((cfg.parent / "match.log").exists())
@@ -238,7 +238,7 @@ class MixedEvaluationTests(unittest.TestCase):
         self.assertEqual(second["candidate"], first["candidate"])
         self.assertEqual(self.runner.calls, [])
         self.assertEqual((self.output / "evaluation_manifest.json").read_bytes(), before)
-        progress = json.loads((self.output / "boards/9x9/progress.json").read_text())
+        progress = json.loads((self.output / "boards/9x9/progress.json").read_text(encoding="utf-8"))
         self.assertEqual(progress["reused_pairs"], 2)
 
     def test_interrupted_evaluation_reuses_finished_pairs_after_source_pruning(self):
@@ -275,9 +275,10 @@ class MixedEvaluationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "interrupted"):
             self.evaluate()
         self.assertEqual(seals_seen_before_next_pair, [True])
-        evidence = json.loads((self.output / "boards/9x9/pairs/opening-000/pair-evidence.json").read_text())
+        pair_root = self.output / "boards/9x9/pairs/opening-000"
+        evidence = json.loads((pair_root / "pair-evidence.json").read_text(encoding="utf-8"))
         self.assertEqual(evidence["pair_artifact"]["sgfs"][0]["sha256"],
-                         hashlib.sha256(PAIR.format(size=9).encode()).hexdigest())
+                         hashlib.sha256((pair_root / "sgfs/pair.sgfs").read_bytes()).hexdigest())
 
     def test_interrupted_board_cannot_reuse_a_modified_completed_pair(self):
         self.runner.fail_at = 2
@@ -286,7 +287,8 @@ class MixedEvaluationTests(unittest.TestCase):
         self.runner.fail_at = None
         self.runner.calls.clear()
         first_sgf = self.output / "boards/9x9/pairs/opening-000/sgfs/pair.sgfs"
-        first_sgf.write_text(first_sgf.read_text().replace("RE[B+1.5]", "RE[W+1.5]"))
+        first_sgf.write_text(first_sgf.read_text(encoding="utf-8").replace("RE[B+1.5]", "RE[W+1.5]"),
+                             encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "SHA|校验|改变|不一致"):
             self.evaluate()
         self.assertEqual(self.runner.calls, [])
@@ -342,8 +344,9 @@ class MixedEvaluationTests(unittest.TestCase):
         manifest["protocol"]["version"] = 1
         manifest["protocol"].pop("katago_sha256", None)
         path = self.output / "evaluation_manifest.json"
-        path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-        (self.output / "evaluation_manifest.sha256").write_text(hashlib.sha256(path.read_bytes()).hexdigest() + "\n")
+        path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        (self.output / "evaluation_manifest.sha256").write_text(
+            hashlib.sha256(path.read_bytes()).hexdigest() + "\n", encoding="ascii")
         before = {item: item.read_bytes() for item in self.output.rglob("*") if item.is_file()}
         self.runner.calls.clear()
         with self.assertRaisesRegex(ValueError, "不一致|协议|引擎|版本"):
@@ -390,7 +393,7 @@ class MixedEvaluationTests(unittest.TestCase):
         self.assertEqual(sample.read_bytes(), b"{}\n")
         sample.write_bytes(original)
         cfg = self.output / "boards/9x9/pairs/opening-000/match.cfg"
-        cfg.write_text(cfg.read_text() + "maxVisits = 1\n")
+        cfg.write_text(cfg.read_text(encoding="utf-8") + "maxVisits = 1\n", encoding="utf-8")
         with self.assertRaises(ValueError):
             self.evaluate()
         self.assertEqual(self.runner.calls, [])
@@ -400,7 +403,8 @@ class MixedEvaluationTests(unittest.TestCase):
         self.evaluate()
         self.runner.calls.clear()
         sgf = self.output / "boards/9x9/pairs/opening-000/sgfs/pair.sgfs"
-        sgf.write_text(sgf.read_text().replace("RE[B+1.5]", "RE[W+1.5]"))
+        sgf.write_text(sgf.read_text(encoding="utf-8").replace("RE[B+1.5]", "RE[W+1.5]"),
+                       encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "SHA|校验|改变|不一致"):
             self.evaluate()
         self.assertEqual(self.runner.calls, [])
@@ -417,10 +421,10 @@ class MixedEvaluationTests(unittest.TestCase):
     def test_existing_unidentified_output_is_not_adopted(self):
         self.output.mkdir()
         marker = self.output / "old-result.json"
-        marker.write_text("preserve me")
+        marker.write_text("preserve me", encoding="utf-8")
         with self.assertRaises(ValueError):
             self.evaluate()
-        self.assertEqual(marker.read_text(), "preserve me")
+        self.assertEqual(marker.read_text(encoding="utf-8"), "preserve me")
         self.assertEqual(self.runner.calls, [])
 
     def test_invalid_sizes_counts_rules_and_komi_fail_before_engine_execution(self):
@@ -462,7 +466,7 @@ class MixedEvaluationTests(unittest.TestCase):
                     self.evaluate()
                 self.assertFalse((self.output / "summary.json").exists())
                 self.assertFalse((self.output / "boards/9x9/match-result.json").exists())
-                progress = json.loads((self.output / "progress.json").read_text())
+                progress = json.loads((self.output / "progress.json").read_text(encoding="utf-8"))
                 self.assertEqual(progress["status"], "failed")
 
 

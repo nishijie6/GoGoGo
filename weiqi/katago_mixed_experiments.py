@@ -16,7 +16,7 @@ from pathlib import Path
 import random
 import shutil
 
-from .fileio import atomic_write_json, local_timestamp, sha256_file
+from .fileio import atomic_write_json, atomic_write_text, local_timestamp, sha256_file
 from .katago_mixed import MixedBoardRunner
 from .replay_accounting import ReplayRowLedger
 from .rl_config import resolve_rl_training_config
@@ -369,7 +369,7 @@ def prepare_mixed_experiment(source_run: Path, config_path: Path, output_root: P
     starts_dir.mkdir()
     for name, text in starts.items():
         path = starts_dir / name
-        path.write_text(text, encoding="utf-8")
+        atomic_write_text(path, text)
 
     for name, arm in arms.items():
         root, path = Path(arm["run_root"]), Path(arm["config_path"])

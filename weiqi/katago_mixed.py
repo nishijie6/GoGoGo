@@ -268,7 +268,7 @@ class MixedBoardRunner(KataGoRLRunner):
         import numpy as np
         size = self.config.game.board_size
         cache_path = self.run_root / "board_inventory.json"
-        old = json.loads(cache_path.read_text()) if cache_path.exists() else {}
+        old = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
         inventory, total = {}, Counter({str(b):0 for b in self.mixed.board_sizes})
         for path in sorted(self.selfplay_dir.glob("**/tdata/*.npz")):
             stat = path.stat()

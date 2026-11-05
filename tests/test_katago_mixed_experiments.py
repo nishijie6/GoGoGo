@@ -98,7 +98,7 @@ class MixedExperimentPreparationTests(unittest.TestCase):
         }
         self.config_path.write_text(json.dumps(self.config), encoding="utf-8")
         path = self.source / "mixed_manifest.json"
-        document = json.loads(path.read_text())
+        document = json.loads(path.read_text(encoding="utf-8"))
         document["identity"] = MixedBoardRunner(self.config_path).manifest_identity()
         path.write_text(json.dumps(document), encoding="utf-8")
 
@@ -124,7 +124,7 @@ class MixedExperimentPreparationTests(unittest.TestCase):
         manifest["source"]["config"].update(config_record)
         source_manifest = self.source / "mixed_manifest.json"
         manifest["source"]["mixed_manifest"] = {
-            "identity": json.loads(source_manifest.read_text())["identity"],
+            "identity": json.loads(source_manifest.read_text(encoding="utf-8"))["identity"],
             "sha256": _hash(source_manifest), "size": source_manifest.stat().st_size,
             "mtime_ns": source_manifest.stat().st_mtime_ns,
         }
@@ -179,8 +179,8 @@ class MixedExperimentPreparationTests(unittest.TestCase):
 
     def test_arm_configs_change_only_output_and_training_exploration(self) -> None:
         manifest = self.prepare()
-        control = json.loads(Path(manifest["arms"]["control"]["config_path"]).read_text())
-        variant = json.loads(Path(manifest["arms"]["sgf_starts"]["config_path"]).read_text())
+        control = json.loads(Path(manifest["arms"]["control"]["config_path"]).read_text(encoding="utf-8"))
+        variant = json.loads(Path(manifest["arms"]["sgf_starts"]["config_path"]).read_text(encoding="utf-8"))
         for name, config in (("control", control), ("sgf_starts", variant)):
             run_root = manifest["arms"][name]["run_root"]
             self.assertEqual(config["training"]["overrides"]["runtime"]["output_directory"], run_root)
@@ -278,6 +278,8 @@ class MixedExperimentPreparationTests(unittest.TestCase):
                     self.assertTrue(liberties, f"capture/suicide in {path}: {origin}")
             recorded = first["training_starts"]["files"][path.name]
             self.assertEqual(recorded["sha256"], _hash(path))
+            self.assertEqual(recorded["size"], path.stat().st_size)
+            self.assertNotIn(b"\r", path.read_bytes())
         self.assertEqual(observed, {(size, count) for size in (7, 8, 9, 13, 19) for count in (2, 4, 6)})
         self.assertEqual(dict(boards), {7: 6, 8: 6, 9: 9, 13: 6, 19: 3})
         self.assertEqual(len(positions), 30)
@@ -302,7 +304,7 @@ class MixedExperimentPreparationTests(unittest.TestCase):
         self.config["board_weights"] = [.123456789, .23456789, .3456789, .111111, .185185421]
         self.config_path.write_text(json.dumps(self.config), encoding="utf-8")
         manifest_path = self.source / "mixed_manifest.json"
-        source_manifest = json.loads(manifest_path.read_text())
+        source_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         source_manifest["identity"] = MixedBoardRunner(self.config_path).manifest_identity()
         manifest_path.write_text(json.dumps(source_manifest), encoding="utf-8")
 
@@ -372,7 +374,7 @@ class MixedExperimentPreparationTests(unittest.TestCase):
 
     def test_source_manifest_mismatch_is_rejected_without_mutating_source(self) -> None:
         path = self.source / "mixed_manifest.json"
-        document = json.loads(path.read_text())
+        document = json.loads(path.read_text(encoding="utf-8"))
         document["identity"]["board_weights"] = [1, 1, 1, 1, 1]
         path.write_text(json.dumps(document), encoding="utf-8")
         before = _hashes(self.source)

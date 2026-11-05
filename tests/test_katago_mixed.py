@@ -199,7 +199,7 @@ class MixedBoardTests(unittest.TestCase):
     def test_board_statistics_validate_format_and_include_small_boards(self):
         runner = self.runner()
         runner.ensure_manifest()
-        folder = runner.selfplay_dir / "seed" / "tdata"
+        folder = runner.selfplay_dir / "训练模型" / "tdata"
         folder.mkdir(parents=True)
         masks = np.zeros((5, 22, 19, 19), dtype=np.uint8)
         for row, size in enumerate((7, 8, 9, 13, 19)):
@@ -210,6 +210,9 @@ class MixedBoardTests(unittest.TestCase):
             valueTargetsNCHW=np.zeros((5,5,19,19),dtype=np.float32))
         stats = runner.board_statistics()
         self.assertEqual(stats["rows_by_board"], {str(size):1 for size in (7,8,9,13,19)})
+        with patch("numpy.load", side_effect=AssertionError("应复用中文路径的统计缓存")):
+            cached = runner.board_statistics()
+        self.assertEqual(cached["rows_by_board"], stats["rows_by_board"])
         np.savez_compressed(path, binaryInputNCHWPacked=np.zeros((1,22,11),dtype=np.uint8),
                             valueTargetsNCHW=np.zeros((1,5,9,9),dtype=np.float32))
         with self.assertRaisesRegex(ValueError, "尺寸|张量|格式"):
