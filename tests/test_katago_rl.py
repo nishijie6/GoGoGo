@@ -186,6 +186,20 @@ class KataGoRLConfigurationTests(unittest.TestCase):
         self.assertEqual(overrides["maxVisits"], 8)
         self.assertNotIn("cudaUseNHWC", overrides)
 
+    def test_katago_cheap_search_override_changes_only_the_cheap_budget(self) -> None:
+        config = resolve_rl_training_config(overrides={"search": {
+            "simulations_per_move": 400,
+            "katago_cheap_search_visits": 60,
+        }})
+        overrides = build_selfplay_overrides(config)
+        self.assertEqual(overrides["maxVisits"], 400)
+        self.assertEqual(overrides["cheapSearchVisits"], 60)
+        self.assertEqual(overrides["reducedVisitsMin"], 100)
+        self.assertEqual(build_selfplay_overrides(config, visits=24)["cheapSearchVisits"], 24)
+        self.assertEqual(build_selfplay_overrides(config, visits=8, smoke=True)["cheapSearchVisits"], 4)
+        with self.assertRaises(RLConfigError):
+            resolve_rl_training_config(config.preset, {"search": {"katago_cheap_search_visits": 0}})
+
     def test_invalid_zero_visits_is_rejected(self) -> None:
         with self.assertRaisesRegex(KataGoRLRunnerError, "至少为 1"):
             build_selfplay_overrides(self.config, visits=0)

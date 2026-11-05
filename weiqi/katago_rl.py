@@ -101,7 +101,10 @@ def build_selfplay_overrides(
     )
     if requested_visits < 1:
         raise KataGoRLRunnerError("自我对弈访问量必须至少为 1")
-    cheap_visits = max(4, min(100, requested_visits // 4))
+    reduced_visits_min = max(4, min(100, requested_visits // 4))
+    cheap_visits = reduced_visits_min
+    if not smoke and config.search.katago_cheap_search_visits is not None:
+        cheap_visits = min(requested_visits, config.search.katago_cheap_search_visits)
     board_size = config.game.board_size
     game_threads = 8 if smoke else max(32, min(256, config.self_play.workers * 16))
     batch_size = (
@@ -118,7 +121,7 @@ def build_selfplay_overrides(
         "maxVisits": requested_visits,
         "rootDesiredPerChildVisitsCoeff": config.search.katago_forced_playouts_coefficient,
         "cheapSearchVisits": cheap_visits,
-        "reducedVisitsMin": cheap_visits,
+        "reducedVisitsMin": reduced_visits_min,
         "nnMaxBatchSize": batch_size,
         "nnCacheSizePowerOfTwo": 20 if not smoke else 18,
         "numNNServerThreadsPerModel": 2 if not smoke else 1,

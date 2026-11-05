@@ -18,11 +18,12 @@ class TrainingOpponentTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.config, _ = _write_profiles(self.root)
-        for name in ("champion", "history", "unselected"):
+        for name in ("latest", "champion", "history", "unselected"):
             _make_model(self.root / "9x9", name)
         state = self.root / "curriculum/state.json"
         state.parent.mkdir()
         state.write_text(json.dumps({"stages": {"9x9": {
+            "latest_model": "latest",
             "champion_model": "champion", "champion_established": False,
             "fixed_baseline_models": ["history", "../../outside", "missing"],
         }}}), encoding="utf-8")
@@ -32,9 +33,23 @@ class TrainingOpponentTests(unittest.TestCase):
 
     def test_lists_only_existing_selected_pool_models_on_this_board(self):
         choices = self.choices()
-        self.assertEqual({item.model_name for item in choices.values()}, {"champion", "history"})
+        self.assertEqual({item.model_name for item in choices.values()}, {"latest", "champion", "history"})
         self.assertEqual(self.choices(13), {})
         self.assertTrue(any("暂定" in label for label in choices))
+
+    def test_refresh_reads_latest_export_and_keeps_other_choices_if_unavailable(self):
+        state_path = self.root / "curriculum/state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        for name in ("unselected", "champion", "missing", "../../outside"):
+            with self.subTest(model=name):
+                state["stages"]["9x9"]["latest_model"] = name
+                state_path.write_text(json.dumps(state), encoding="utf-8")
+                choices = self.choices()
+                latest = [item for item in choices.values() if item.role == "latest"]
+                self.assertEqual([item.model_name for item in latest],
+                                 [name] if name in ("unselected", "champion") else [])
+                self.assertTrue(any(item.role == "champion" for item in choices.values()))
+                self.assertTrue(any(item.role == "fixed" for item in choices.values()))
 
     def test_settings_disable_human_model_and_do_not_overwrite_saved_settings(self):
         opponent = next(iter(self.choices().values()))

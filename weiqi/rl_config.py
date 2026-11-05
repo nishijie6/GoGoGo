@@ -88,6 +88,7 @@ class SearchTrainingConfig:
     # Official backend already enables this in selfplay1.cfg; keep it separate
     # from the native implementation's opt-in default above.
     katago_forced_playouts_coefficient: float = 2.0
+    katago_cheap_search_visits: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -237,6 +238,7 @@ _BALANCED_PRESET: Dict[str, Any] = {
         "forced_playouts_coefficient": 0.0,
         "policy_target_pruning": False,
         "katago_forced_playouts_coefficient": 2.0,
+        "katago_cheap_search_visits": None,
     },
     "self_play": {
         "workers": 2,
@@ -343,6 +345,7 @@ _HIGH_PERFORMANCE_PRESET: Dict[str, Any] = {
         "forced_playouts_coefficient": 0.0,
         "policy_target_pruning": False,
         "katago_forced_playouts_coefficient": 2.0,
+        "katago_cheap_search_visits": None,
     },
     "self_play": {
         "workers": 8,
@@ -574,6 +577,8 @@ def _validate_network(network: NetworkTrainingConfig) -> None:
 def _validate_search(search: SearchTrainingConfig) -> None:
     if not 0 <= _require_number("search.katago_forced_playouts_coefficient", search.katago_forced_playouts_coefficient) <= 100:
         raise _config_error("search.katago_forced_playouts_coefficient", "必须在 0 到 100 之间")
+    if search.katago_cheap_search_visits is not None:
+        _require_int("search.katago_cheap_search_visits", search.katago_cheap_search_visits, 1)
     if _require_number("search.forced_playouts_coefficient", search.forced_playouts_coefficient) < 0:
         raise _config_error("search.forced_playouts_coefficient", "不能小于 0")
     _require_bool("search.policy_target_pruning", search.policy_target_pruning)

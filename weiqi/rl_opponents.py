@@ -92,7 +92,8 @@ def load_training_opponents(board_size: int, *, project_root: Path = PROJECT_ROO
     if not run_root.is_absolute():
         run_root = project_root / run_root
     models_root = (run_root / "models").resolve()
-    rows = [("champion", champion)] + [("fixed", name) for name in fixed]
+    rows = [("latest", stage.get("latest_model")), ("champion", champion)]
+    rows += [("fixed", name) for name in fixed]
     choices = {}
     for role, name in rows:
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*", name):
@@ -100,7 +101,7 @@ def load_training_opponents(board_size: int, *, project_root: Path = PROJECT_ROO
         model_path = (models_root / name / "model.bin.gz").resolve()
         if not model_path.is_relative_to(models_root) or not model_path.is_file():
             continue
-        category = "滚动冠军" if role == "champion" else "历史基准"
+        category = {"latest": "最新模型", "champion": "滚动冠军", "fixed": "历史基准"}[role]
         if role == "champion" and not stage.get("champion_established", False):
             category += "（暂定）"
         sample_match = re.fullmatch(r"gogogo-s(\d+)-d\d+", name)
