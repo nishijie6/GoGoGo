@@ -20,6 +20,28 @@ from weiqi.rl_metrics import (
 
 
 class RLMetricParsingTests(unittest.TestCase):
+    def test_unified_sgf_metrics_include_short_pass_and_margin_observations(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "games.sgfs"
+            path.write_text("(;SZ[9]RE[B+31.5];B[];W[])"
+                            "(;SZ[9]RE[W+70];B[aa];W[bb];B[cc])")
+            row = parse_sgfs(path, standard="unified_v1")
+        self.assertEqual(row["short_games"], 2)
+        self.assertEqual(row["pass_moves"], 2)
+        self.assertEqual(row["total_moves"], 5)
+        self.assertEqual(row["extreme_result_games"], 1)
+
+    def test_unified_rolling_health_does_not_veto_extreme_scores(self):
+        records = [{"sgf_games": 32, "sgf_entries": 32,
+                    "black_wins": 16, "white_wins": 16,
+                    "extreme_result_games": 32, "total_moves": 1600,
+                    "short_games": 0, "pass_moves": 64}]
+        row = rolling_health_metrics(records, standard="unified_v1")
+        self.assertTrue(row["health_passed"])
+        self.assertEqual(row["health_extreme_result_rate"], 1.)
+        records[0]["black_wins"], records[0]["white_wins"] = 32, 0
+        self.assertFalse(rolling_health_metrics(records, standard="unified_v1")["health_passed"])
+
     def test_model_name_contains_samples_and_data_rows(self) -> None:
         self.assertEqual(parse_model_name("gogogo-s1083392-d171432"), (1083392, 171432))
         self.assertIsNone(parse_model_name("model.bin.gz"))
@@ -108,6 +130,16 @@ Total selfplay runtime (seconds): 31.938
 
         unhealthy = [dict(record, extreme_result_games=7) for record in records]
         self.assertFalse(rolling_health_metrics(unhealthy)["health_passed"])
+
+    def test_small_cycles_expand_window_until_required_game_evidence_exists(self):
+        records = [{"sgf_games":24,"sgf_entries":24,"black_wins":12,"white_wins":12}
+                   for _ in range(60)]
+        self.assertFalse(rolling_health_metrics(records[:10])["health_window_complete"])
+        health=rolling_health_metrics(records)
+        self.assertTrue(health["health_window_complete"])
+        self.assertEqual(health["health_window_cycles"],54)
+        self.assertEqual(health["health_window_games"],1296)
+        self.assertTrue(health["health_passed"])
 
 
 class RLMetricStoreTests(unittest.TestCase):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 
 from .training_monitor import iso_time, timestamp
+from .training_standard import get_training_standard, sample_evaluation_schedule
 
 
 def champion_lineage(stage):
@@ -100,7 +101,10 @@ def snapshot(store, path, run_id):
                           and row["name"] == stage.get("champion_model")), None)
     from .monitor_match import live_champion_match
     live_match = live_champion_match(store, path, state, stage) if stage else None
+    standard = get_training_standard(stage.get("training_standard"))
     return {"run": {"id": run_id, "name": run_id}, "server_time": iso_time(),
+            "training_standard": standard.to_dict() if standard else None,
+            "evaluation_schedule": sample_evaluation_schedule(stage.get("samples"), stage.get("next_evaluation_sample")),
             "source": "legacy", "status": {"state": "historical", "phase": "unknown", "updated_at": when,
                 "age_seconds": max(0, time.time() - epoch) if epoch else None,
                 "reason": "旧版 KataGo 记录没有训练心跳，无法确认进程是否运行"},

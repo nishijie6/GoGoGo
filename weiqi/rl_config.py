@@ -13,9 +13,11 @@ import math
 import re
 from collections.abc import Mapping
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
+
+from .training_standard import get_training_standard
 
 
 RL_CONFIG_VERSION = 1
@@ -158,6 +160,7 @@ class EvaluationTrainingConfig:
     sprt_beta: float = 0.10
     sprt_pair_win_rate: float = 0.65
     sprt_batch_pairs: int = 4
+    standard: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -272,6 +275,7 @@ _BALANCED_PRESET: Dict[str, Any] = {
         "score_loss_weight": 0.5,
     },
     "evaluation": {
+        "standard": None,
         "games": 80,
         "simulations_per_move": 96,
         "promotion_win_rate": 0.55,
@@ -378,6 +382,7 @@ _HIGH_PERFORMANCE_PRESET: Dict[str, Any] = {
         "score_loss_weight": 0.5,
     },
     "evaluation": {
+        "standard": None,
         "games": 40,
         "simulations_per_move": 800,
         "promotion_win_rate": 0.55,
@@ -495,6 +500,16 @@ def _build_config(preset: str, data: Mapping[str, Any]) -> RLTrainingConfig:
         evaluation=EvaluationTrainingConfig(**data["evaluation"]),
         runtime=RuntimeTrainingConfig(**data["runtime"]),
     )
+    standard = get_training_standard(config.evaluation.standard)
+    if standard is not None:
+        config = replace(config, evaluation=replace(
+            config.evaluation,
+            games=standard.confirmation_games_per_board,
+            simulations_per_move=standard.evaluation_visits,
+            promotion_win_rate=standard.promotion_win_rate,
+            screen_games=standard.screen_games_per_board,
+            screen_simulations_per_move=standard.evaluation_visits,
+            screen_min_score_rate=standard.screen_min_score))
     _validate_config(config)
     return config
 

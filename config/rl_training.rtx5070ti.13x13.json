@@ -40,9 +40,7 @@
       "training_steps_per_iteration": 32
     },
     "evaluation": {
-      "games": 200,
-      "simulations_per_move": 300,
-      "promotion_win_rate": 0.6
+      "standard": "unified_v1"
     },
     "runtime": {
       "pause_while_game_is_active": false,

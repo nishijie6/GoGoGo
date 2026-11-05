@@ -187,6 +187,168 @@ class CurriculumConfigurationTests(unittest.TestCase):
                 load_curriculum_config(path)
 
 
+class UnifiedCurriculumStandardTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        value = curriculum_dict()
+        value.update(training_standard="unified_v1", champion_evaluation_every_cycle=True,
+                     evaluation_midstage_interval_samples=2_000_000)
+        path = self.root / "standard.json"
+        path.write_text(json.dumps(value), encoding="utf-8")
+        self.config = load_curriculum_config(path)
+        self.store = CurriculumStateStore(self.root / "state")
+        self.controller = CurriculumController(self.config, self.store)
+
+    @staticmethod
+    def match():
+        return replace(passing_match(), requested_games=40, games=40,
+                       candidate_wins=22, baseline_wins=18,
+                       candidate_black_games=20, candidate_white_games=20,
+                       black_wins=20, white_wins=20, win_rate=0.55,
+                       wilson_lower=0.39, wilson_upper=0.70)
+
+    def state(self):
+        state = self.controller.adopt_existing_9x9(
+            trained_samples=1_000, latest_model="candidate", entry_model="anchor")
+        state.active.champion_model = "champion"
+        state.active.fixed_baseline_models = ["anchor"]
+        self.store.save(state)
+        return state
+
+    def test_shared_sample_schedule_replaces_legacy_per_cycle_and_midstage_schedules(self):
+        state = self.state()
+        self.assertEqual(state.active.next_evaluation_sample, 51_200)
+        self.assertEqual(self.controller.next_evaluation_sample(1, 51_200), 102_400)
+        self.assertFalse(self.config.champion_evaluation_every_cycle)
+        self.assertIsNone(self.config.evaluation_midstage_interval_samples)
+        self.assertEqual(self.config.evaluation_games, 40)
+
+    def test_champion_can_advance_at_55_percent_before_course_minimum_without_confidence_veto(self):
+        state = self.state()
+        gate = self.controller.record_evaluation(
+            state, candidate_model="candidate", match=self.match(), health=passing_health(),
+            opponent_results={"champion": self.match(), "anchor": self.match()})
+        self.assertFalse(gate.passed)
+        self.assertEqual(state.active.consecutive_passes, 0)
+        self.assertEqual(state.active.champion_model, "candidate")
+        record = self.store.load().active.evaluations[-1]
+        self.assertEqual(record["training_standard"]["name"], "unified_v1")
+        self.assertEqual(record["stage_samples"], 1_000)
+
+    def test_both_champion_paths_require_shared_black_collapse_protection(self):
+        for per_cycle in (False, True):
+            with self.subTest(per_cycle=per_cycle):
+                state = self.state()
+                health = replace(passing_health(), black_wins=0, white_wins=1280,
+                                 black_win_rate=0.0, passed=False,
+                                 reasons=("black_score_rate",))
+                if per_cycle:
+                    self.controller.record_champion_evaluation(state, match=self.match(), health=health)
+                else:
+                    self.controller.record_evaluation(
+                        state, candidate_model="candidate", match=self.match(), health=health,
+                        opponent_results={"champion": self.match(), "anchor": self.match()})
+                self.assertEqual(state.active.champion_model, "champion")
+                self.assertFalse(state.active.evaluations[-1]["champion_promoted"])
+
+    def test_unified_champion_evaluation_requires_health_even_for_manual_callers(self):
+        state = self.state()
+        self.controller.record_champion_evaluation(state, match=self.match())
+        self.assertEqual(state.active.champion_model, "champion")
+        self.assertIn("health_missing", state.active.evaluations[-1]["champion_reasons"])
+
+    def test_health_uses_common_evidence_and_keeps_extreme_scores_as_observations(self):
+        health = compute_health_window(
+            [{"games": 32, "black_wins": 8, "white_wins": 24, "extreme_games": 32}],
+            training_standard="unified_v1")
+        self.assertTrue(health.complete)
+        self.assertTrue(health.passed)
+        self.assertEqual(health.extreme_result_rate, 1.0)
+        self.assertIsNone(health.short_game_rate)
+        self.assertIsNone(health.pass_move_rate)
+        collapsed = compute_health_window(
+            [{"games": 32, "black_wins": 0, "white_wins": 32}],
+            training_standard="unified_v1")
+        self.assertFalse(collapsed.passed)
+        self.assertIn("black_score_rate", collapsed.reasons)
+
+    def test_adoption_changes_future_schedule_without_rewriting_legacy_history(self):
+        legacy = CurriculumController(load_test_config(self.root), self.store)
+        state = legacy.adopt_existing_9x9(trained_samples=60_000, latest_model="candidate")
+        state.active.consecutive_passes = 1
+        state.active.evaluations = [{"stage_samples": 50_000, "passed": True}]
+        self.store.save(state)
+        adopted = self.controller.adopt_existing_9x9(trained_samples=60_000, latest_model="candidate")
+        self.assertEqual(adopted.active.next_evaluation_sample, 102_400)
+        self.assertEqual(adopted.active.consecutive_passes, 0)
+        self.assertEqual(adopted.active.samples, 60_000)
+        self.assertEqual(adopted.active.evaluations, [{"stage_samples": 50_000, "passed": True}])
+        self.assertEqual(self.store.load().active.training_standard, "unified_v1")
+
+    def test_failed_evaluation_keeps_policy_and_sample_context(self):
+        state = self.state()
+        self.controller.record_evaluation_error(state, "engine failed")
+        record = self.store.load().active.evaluations[-1]
+        self.assertEqual(record["training_standard"]["name"], "unified_v1")
+        self.assertEqual(record["stage_samples"], 1_000)
+
+    def test_adoption_explicitly_defers_old_partial_suites_without_rejudging_evidence(self):
+        for pending in (False, True):
+            with self.subTest(pending_champion=pending):
+                store = CurriculumStateStore(self.root / f"partial-{pending}")
+                legacy = CurriculumController(load_test_config(self.root), store)
+                state = legacy.adopt_existing_9x9(
+                    trained_samples=60_000, latest_model="candidate", entry_model="anchor")
+                state.active.champion_model = "champion"
+                state.phase = "evaluating"
+                state.active.pending_champion_evaluation = pending
+                state.active.evaluations = [{"stage_samples": 50_000, "passed": False}]
+                old_next = state.active.next_evaluation_sample
+                partial = store.state_root / "evaluations/9x9/s60000-candidate-legacy"
+                partial.mkdir(parents=True)
+                manifest = partial / "evaluation_manifest.json"
+                manifest.write_text('{"games":200,"visits":400}', encoding="utf-8")
+                evidence = partial / "completed-pair.sgfs"
+                evidence.write_text("(;PB[candidate]PW[baseline]RE[B+1.5])", encoding="utf-8")
+                before = {p.name: p.read_bytes() for p in partial.iterdir()}
+                store.save(state)
+
+                controller = CurriculumController(self.config, store)
+                adopted = controller.adopt_existing_9x9(
+                    trained_samples=60_000, latest_model="candidate")
+                self.assertEqual(adopted.phase, "training")
+                self.assertFalse(adopted.active.pending_champion_evaluation)
+                self.assertEqual(adopted.active.champion_model, "champion")
+                self.assertEqual(adopted.active.evaluations, [{"stage_samples": 50_000, "passed": False}])
+                audit = adopted.warnings[-1]
+                self.assertEqual(audit["kind"], "evaluation_deferred")
+                self.assertEqual(audit["reason"], "training_standard_changed")
+                self.assertEqual(audit["previous_phase"], "evaluating")
+                self.assertEqual(audit["previous_pending_champion_evaluation"], pending)
+                self.assertEqual(audit["previous_next_evaluation_sample"], old_next)
+                self.assertIn(str(partial), audit["evaluation_paths"])
+                self.assertEqual({p.name: p.read_bytes() for p in partial.iterdir()}, before)
+
+    def test_adoption_invalidates_transition_readiness_suspended_by_disk_pause(self):
+        legacy = CurriculumController(load_test_config(self.root), self.store)
+        state = legacy.adopt_existing_9x9(trained_samples=10_000_000, latest_model="candidate")
+        state.active.consecutive_passes = 2
+        state.phase = "paused_disk"
+        state.resume_phase = "transition_ready"
+        self.store.save(state)
+
+        adopted = self.controller.adopt_existing_9x9(
+            trained_samples=10_000_000, latest_model="candidate")
+        self.assertEqual(adopted.phase, "paused_disk")
+        self.assertEqual(adopted.resume_phase, "training")
+        self.controller.update_disk(adopted, 100)
+        self.assertEqual(adopted.active.consecutive_passes, 0)
+        with self.assertRaises(CurriculumStateError):
+            self.controller.begin_migration(adopted)
+
+
 class StatisticsAndSgfTests(unittest.TestCase):
     def test_wilson_interval_distinguishes_uncertain_and_clear_win(self) -> None:
         low_small, _ = wilson_interval(6, 10)

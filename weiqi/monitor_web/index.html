@@ -19,7 +19,7 @@
     <div class="sidebar-label">工作空间</div>
     <nav>
       <a class="nav-link selected" href="#main"><span aria-hidden="true">◫</span>训练总览</a>
-      <a class="nav-link" href="#trend"><span aria-hidden="true">⌁</span>评估趋势</a>
+      <a class="nav-link" href="#trend"><span aria-hidden="true">⌁</span>评测与晋级</a>
       <a class="nav-link" href="#opponents"><span aria-hidden="true">◉</span>对手记录</a>
       <a class="nav-link" href="#diagnostics"><span aria-hidden="true">↗</span>训练诊断</a>
       <a class="nav-link" href="#events"><span aria-hidden="true">☷</span>训练动态</a>
@@ -52,7 +52,7 @@
         <details><summary>异常与恢复记录</summary><ol id="recovery-events"></ol></details>
       </section>
 
-      <section class="panel gpu-panel" aria-labelledby="gpu-title">
+      <section class="panel gpu-panel" id="gpu-panel" aria-labelledby="gpu-title">
         <div class="gpu-heading"><h2 id="gpu-title">GPU 实时状态</h2><span id="gpu-updated">正在读取</span></div>
         <div id="gpu-devices" class="gpu-devices"><p class="gpu-unavailable">等待 GPU 数据</p></div>
         <p class="gpu-note">整机 GPU 负载，包含其他程序 · 每 2 秒采样 · 历史保留最近 30 分钟，监控服务重启后重新积累</p>
@@ -88,7 +88,7 @@
             <p class="metric-caption" id="iteration-caption">已完成 — 轮</p>
             <div class="metric-footer" id="best-iteration">当前最佳来自第 — 轮</div>
           </article>
-          <article class="metric-card">
+          <article class="metric-card" id="phase-card">
             <div class="metric-label">当前阶段进度<span class="metric-symbol" aria-hidden="true">◴</span></div>
             <div class="metric-value progress-value" id="progress-value">—</div>
             <div class="progress-track" role="progressbar" id="phase-progress" aria-label="当前阶段进度" aria-valuemin="0" aria-valuemax="100"><span id="progress-fill"></span></div>
@@ -118,26 +118,32 @@
             <dl class="result-grid"><div><dt><i class="result-dot wins-dot"></i>获胜</dt><dd id="wins">—</dd></div><div><dt><i class="result-dot losses-dot"></i>负局</dt><dd id="losses">—</dd></div><div><dt><i class="result-dot draws-dot"></i>和棋</dt><dd id="draws">—</dd></div><div><dt><i class="result-dot truncated-dot"></i>截断</dt><dd id="truncated">—</dd></div></dl>
             <p class="unknown-results" id="unknown-results" hidden></p>
             <p class="confidence-note" id="confidence-note" hidden></p>
+            <div id="board-match" class="table-scroll" tabindex="0" role="region" aria-label="分棋盘评测" hidden>
+              <table><thead><tr><th>棋盘</th><th>完成</th><th>胜 / 负 / 和</th><th>候选胜率</th></tr></thead><tbody id="board-match-body"></tbody></table>
+            </div>
             <div class="detail-divider"></div>
             <dl class="training-facts"><div><dt>训练设备</dt><dd id="device">—</dd></div><div><dt>回放样本</dt><dd id="replay-samples">—</dd></div><div><dt>最近训练损失</dt><dd id="training-loss">—</dd></div></dl>
           </section>
         </div>
+
+        <section class="panel integrated-panel" id="baselines" aria-labelledby="baselines-title">
+          <div class="panel-header"><div><span class="section-kicker">REFERENCE MATCHES</span><h2 id="baselines-title">固定基准与独立对战</h2></div></div>
+          <div class="baseline-controls"><label for="baseline-select">选择对手与评测条件</label><select id="baseline-select"></select></div>
+          <div id="baseline-chart" class="baseline-chart"></div>
+          <p class="integration-note">固定基准按对手身份、搜索预算与局数分别查看。滚动冠军或评测条件缺失时只画独立数据点；区间沿用原记录的方法，不作为新的晋级判定。</p>
+          <div class="table-scroll" tabindex="0" role="region" aria-label="基准成绩表"><table><thead><tr><th>轮次 / 样本</th><th>对手</th><th>用途</th><th>胜率 / 局数</th><th>统计区间</th><th>相对 Elo</th><th>晋级结果</th></tr></thead><tbody id="baseline-body"></tbody></table></div>
+          <p class="integration-note">展示所选对手最近 32 项成绩。Elo 仅显示旧记录的相对值，不能跨对手比较；全胜或全负时无法给出有限估计。</p>
+        </section>
 
         <section class="panel integrated-panel" id="diagnostics" aria-labelledby="diagnostics-title">
           <div class="panel-header"><div><span class="section-kicker">TRAINING HEALTH</span><h2 id="diagnostics-title">训练进展与健康</h2></div><span class="soft-tag" id="source-label">训练记录</span></div>
           <p class="integration-note" id="curriculum-detail" hidden></p>
           <div class="diagnostic-grid" id="diagnostic-charts"></div>
           <dl class="health-grid" id="health-metrics"></dl>
+          <div id="board-health" class="table-scroll" tabindex="0" role="region" aria-label="分棋盘自对弈健康" hidden>
+            <table><thead><tr><th>棋盘</th><th>棋局</th><th>自对弈黑方得分率</th><th>短局</th><th>开局双停</th><th>停着</th><th>大分差（观察）</th><th>状态</th></tr></thead><tbody id="board-health-body"></tbody></table>
+          </div>
           <p class="integration-note" id="diagnostic-note">损失下降不等同于棋力提升；样本与吞吐量以记录中的统计口径为准。</p>
-        </section>
-
-        <section class="panel integrated-panel" id="baselines" aria-labelledby="baselines-title">
-          <div class="panel-header"><div><span class="section-kicker">REFERENCE MATCHES</span><h2 id="baselines-title">固定基准与冠军挑战</h2></div></div>
-          <div class="baseline-controls"><label for="baseline-select">选择对手与评测条件</label><select id="baseline-select"></select></div>
-          <div id="baseline-chart" class="baseline-chart"></div>
-          <p class="integration-note">固定基准按对手身份、搜索预算与局数分别查看。滚动冠军或评测条件缺失时只画独立数据点；区间沿用原记录的方法，不作为新的晋级判定。</p>
-          <div class="table-scroll" tabindex="0" role="region" aria-label="基准成绩表"><table><thead><tr><th>轮次 / 样本</th><th>对手</th><th>用途</th><th>胜率 / 局数</th><th>统计区间</th><th>相对 Elo</th><th>晋级结果</th></tr></thead><tbody id="baseline-body"></tbody></table></div>
-          <p class="integration-note">展示所选对手最近 32 项成绩。Elo 仅显示旧记录的相对值，不能跨对手比较；全胜或全负时无法给出有限估计。</p>
         </section>
 
         <section class="panel opponents-panel" id="opponents" aria-labelledby="opponents-title">

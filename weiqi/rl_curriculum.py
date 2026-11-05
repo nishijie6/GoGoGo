@@ -38,6 +38,7 @@ from .rl_curriculum_state import (
     progress_key,
 )
 from .rl_match import MatchSummary
+from .training_standard import get_training_standard
 
 
 DEFAULT_HEALTH_GAMES_PER_CYCLE = 128
@@ -72,6 +73,8 @@ class HealthSummary:
     complete: bool
     passed: bool
     reasons: tuple[str, ...]
+    short_game_rate: Optional[float] = None
+    pass_move_rate: Optional[float] = None
 
     def to_dict(self) -> dict[str, object]:
         result = asdict(self)
@@ -94,11 +97,22 @@ def compute_health_window(
     games_per_cycle: int = DEFAULT_HEALTH_GAMES_PER_CYCLE,
     thresholds: HealthThresholds = HealthThresholds(),
     minimum_games: Optional[int] = None,
+    training_standard: Optional[str] = None,
 ) -> HealthSummary:
     """Aggregate the most recent self-play cycles and apply all health gates."""
 
+    standard = get_training_standard(training_standard)
     selected = list(records[-window_cycles:])
     required_games = window_cycles * games_per_cycle if minimum_games is None else minimum_games
+    if standard is not None:
+        required_games = standard.health_minimum_games if minimum_games is None else minimum_games
+        selected = []
+        total = 0
+        for record in reversed(records):
+            selected.insert(0, record)
+            total += _record_int(record, "games", "sgf_games", "selfplay_games")
+            if total >= required_games:
+                break
     if required_games < 1:
         raise ValueError("健康窗口的最低局数必须为正数")
     if minimum_games is not None:
@@ -136,20 +150,37 @@ def compute_health_window(
         + _record_int(record, "damaged_games", "damaged_sgfs")
         for record in selected
     )
-    complete = len(selected) >= window_cycles and games >= required_games
+    complete = games >= required_games and (standard is not None or len(selected) >= window_cycles)
     decided = black + white + draws
     black_rate = (black + 0.5 * draws) / decided if decided else 0.0
     double_rate = double_pass / games if games else 1.0
     extreme_rate = extreme / games if games else 1.0
     invalid_rate = min(games, invalid) / games if games else 1.0
+    short_rate = (
+        sum(_record_int(record, "short_games") for record in selected) / games
+        if games and all("short_games" in record for record in selected) else None
+    )
+    total_moves = sum(_record_int(record, "total_moves") for record in selected)
+    pass_rate = (
+        sum(_record_int(record, "pass_moves") for record in selected) / total_moves
+        if total_moves and all("pass_moves" in record and "total_moves" in record for record in selected)
+        else None
+    )
     reasons: list[str] = []
-    if not complete:
+    if standard is not None:
+        reasons.extend(standard.health_reasons(
+            games=games, black_score_rate=black_rate,
+            early_double_pass_rate=double_rate, invalid_rate=invalid_rate,
+            short_game_rate=short_rate, pass_move_rate=pass_rate,
+            minimum_games=required_games,
+        ))
+    elif not complete:
         reasons.append("健康窗口不足")
-    if double_rate > thresholds.immediate_double_pass_rate:
+    if standard is None and double_rate > thresholds.immediate_double_pass_rate:
         reasons.append("开局双方立即停一手比例超标")
-    if not thresholds.black_win_rate_min <= black_rate <= thresholds.black_win_rate_max:
+    if standard is None and not thresholds.black_win_rate_min <= black_rate <= thresholds.black_win_rate_max:
         reasons.append("黑方胜率超出 45%–55%")
-    if invalid_rate > thresholds.invalid_rate:
+    if standard is None and invalid_rate > thresholds.invalid_rate:
         reasons.append("无结果或损坏棋谱比例超标")
     return HealthSummary(
         cycles=len(selected),
@@ -167,6 +198,8 @@ def compute_health_window(
         complete=complete,
         passed=not reasons,
         reasons=tuple(reasons),
+        short_game_rate=short_rate,
+        pass_move_rate=pass_rate,
     )
 
 
@@ -188,6 +221,20 @@ def evaluate_quality_gate(
     reasons: list[str] = []
     if minimum_samples is not None and stage_samples < minimum_samples:
         reasons.append("尚未达到阶段最低样本数")
+    standard = get_training_standard(config.training_standard)
+    if standard is not None:
+        reasons.extend(standard.promotion_reasons(
+            score=match.win_rate, by_board={"active": match.win_rate},
+            complete=(match.games == config.evaluation_games
+                      and match.requested_games == config.evaluation_games
+                      and match.candidate_black_games == config.evaluation_games // 2
+                      and match.candidate_white_games == config.evaluation_games // 2
+                      and not match.damaged_games and not match.no_result_games),
+            confidence_lower=match.wilson_lower, health_reasons=health.reasons,
+        ))
+        if not health.passed and not health.reasons:
+            reasons.append("health_failed")
+        return QualityGate(passed=not reasons, reasons=tuple(dict.fromkeys(reasons)))
     if match.games != config.evaluation_games:
         reasons.append("固定评测局数不完整")
     if match.win_rate < config.promotion_win_rate:
@@ -205,6 +252,57 @@ class CurriculumController:
     def __init__(self, config: CurriculumConfig, store: CurriculumStateStore):
         self.config = config
         self.store = store
+
+    def apply_training_standard(self, state: CurriculumState) -> None:
+        """Adopt future sample gates without reinterpreting recorded decisions."""
+        name = self.config.training_standard
+        if state.active.training_standard == name:
+            return
+        candidate = copy.deepcopy(state)
+        active = candidate.active
+        evaluation_root = self.store.state_root / "evaluations" / progress_key(active.board_size)
+        prefix = f"s{active.samples}-{active.latest_model or 'unknown'}-"
+        previous_paths = (
+            sorted(str(path) for path in evaluation_root.iterdir()
+                   if path.is_dir() and path.name.startswith(prefix)
+                   and not (path / "summary.json").exists())
+            if evaluation_root.is_dir() else []
+        )
+        if (candidate.phase == "evaluating" or candidate.resume_phase == "evaluating"
+                or active.pending_champion_evaluation or previous_paths):
+            # Old manifests bind engine evidence but omit the complete gate
+            # policy. Keep their bytes and decisions; never infer old rules or
+            # reuse their outcomes as evidence under a newly selected standard.
+            standard = get_training_standard(name)
+            candidate.warnings.append({
+                "timestamp": local_timestamp(), "kind": "evaluation_deferred",
+                "reason": "training_standard_changed",
+                "message": "训练标准已改变；旧评测缺少完整门槛快照，保留原证据并延期，按新样本边界启动独立评测",
+                "candidate_model": active.latest_model,
+                "stage_samples": active.samples,
+                "previous_training_standard": active.training_standard,
+                "training_standard": standard.to_dict() if standard is not None else None,
+                "previous_phase": candidate.phase,
+                "previous_resume_phase": candidate.resume_phase,
+                "previous_pending_champion_evaluation": active.pending_champion_evaluation,
+                "previous_next_evaluation_sample": active.next_evaluation_sample,
+                "evaluation_paths": previous_paths,
+            })
+            active.pending_champion_evaluation = False
+            if candidate.phase == "paused_disk":
+                candidate.resume_phase = "training"
+            else:
+                candidate.phase = "training"
+        candidate.active.training_standard = name
+        candidate.active.next_evaluation_sample = self.next_evaluation_sample(
+            candidate.active_stage_index, candidate.active.samples)
+        candidate.active.consecutive_passes = 0
+        if candidate.phase == "transition_ready":
+            candidate.phase = "training"
+        if candidate.resume_phase == "transition_ready":
+            candidate.resume_phase = "training"
+        self.store.save(candidate)
+        state.__dict__.update(candidate.__dict__)
 
     def next_evaluation_sample(self, stage_index: int, samples: int) -> int:
         """Use a wider interval mid-stage and dense checks near a finite gate."""
@@ -229,6 +327,7 @@ class CurriculumController:
     ) -> CurriculumState:
         existing = self.store.load()
         if existing is not None:
+            self.apply_training_standard(existing)
             return existing
         if trained_samples < 0 or not latest_model:
             raise CurriculumStateError("无法接管无效的 9x9 训练状态")
@@ -240,6 +339,7 @@ class CurriculumController:
             baseline_model=baseline,
             latest_model=latest_model,
             next_evaluation_sample=self.next_evaluation_sample(0, trained_samples),
+            training_standard=self.config.training_standard,
         )
         state = CurriculumState(
             schema_version=STATE_SCHEMA_VERSION,
@@ -260,6 +360,7 @@ class CurriculumController:
     ) -> bool:
         if trained_samples < state.active.samples:
             raise CurriculumStateError("阶段训练样本数不能倒退")
+        self.apply_training_standard(state)
         state.active.samples = trained_samples
         state.active.latest_model = latest_model
         due = trained_samples >= state.active.next_evaluation_sample
@@ -283,7 +384,8 @@ class CurriculumController:
                 opponents.setdefault(name, []).append("fixed")
         return opponents
 
-    def record_champion_evaluation(self, state: CurriculumState, *, match: MatchSummary, training_cycle=None) -> None:
+    def record_champion_evaluation(self, state: CurriculumState, *, match: MatchSummary, training_cycle=None,
+                                   health: Optional[HealthSummary] = None) -> None:
         """Commit a full champion challenge without advancing the fixed-pool gate."""
         if (match.games != self.config.evaluation_games
                 or match.requested_games != self.config.evaluation_games
@@ -298,6 +400,18 @@ class CurriculumController:
             raise CurriculumStateError("冠军评测需要不同于候选的冠军模型")
         promoted = (match.win_rate >= self.config.promotion_win_rate
                     and match.wilson_lower > self.config.wilson_lower_bound)
+        standard = get_training_standard(self.config.training_standard)
+        champion_reasons = ()
+        if standard is not None:
+            health_reasons = ("health_missing",) if health is None else health.reasons
+            if health is not None and not health.passed and not health_reasons:
+                health_reasons = ("health_failed",)
+            champion_reasons = standard.promotion_reasons(
+                score=match.win_rate, by_board={active.board_size: match.win_rate},
+                complete=True, confidence_lower=match.wilson_lower,
+                health_reasons=health_reasons,
+            )
+            promoted = not champion_reasons
         if promoted:
             active.champion_model = active.latest_model
             active.champion_established = True
@@ -309,6 +423,10 @@ class CurriculumController:
             "champion_promoted": promoted,
             "opponents": [{"model": before, "roles": ["champion"], "match": match.to_dict()}],
         })
+        if standard is not None:
+            active.evaluations[-1].update(training_standard=standard.to_dict(),
+                                          champion_reasons=list(champion_reasons),
+                                          health=health.to_dict() if health is not None else None)
         active.pending_champion_evaluation = False
         candidate.phase = "training"
         self.store.save(candidate)
@@ -350,6 +468,9 @@ class CurriculumController:
         }
         champion = state.active.champion_model
         record["champion_before"] = champion
+        standard = get_training_standard(self.config.training_standard)
+        if standard is not None:
+            record.update(training_standard=standard.to_dict(), champion_promoted=False)
         if opponent_results is not None:
             expected = self.evaluation_opponents(state)
             if set(opponent_results) != set(expected):
@@ -391,7 +512,7 @@ class CurriculumController:
             gate = QualityGate(passed=not reasons, reasons=tuple(dict.fromkeys(reasons)))
             record.update(passed=gate.passed, reasons=list(gate.reasons), fixed_gates=fixed_gates)
             champion_match = opponent_results.get(champion) if champion else None
-            if champion_match is not None and (
+            champion_passed = champion_match is not None and (
                 champion_match.games == self.config.evaluation_games
                 and champion_match.candidate_black_games == self.config.evaluation_games // 2
                 and champion_match.candidate_white_games == self.config.evaluation_games // 2
@@ -399,7 +520,14 @@ class CurriculumController:
                 and not champion_match.no_result_games
                 and champion_match.win_rate >= self.config.promotion_win_rate
                 and champion_match.wilson_lower > self.config.wilson_lower_bound
-            ):
+            )
+            if standard is not None and champion_match is not None:
+                champion_gate = evaluate_quality_gate(
+                    champion_match, health, self.config, stage_samples=state.active.samples,
+                    minimum_samples=None, rolling_champion=True)
+                champion_passed = champion_gate.passed
+                record["champion_reasons"] = list(champion_gate.reasons)
+            if champion_passed:
                 candidate.active.champion_model = candidate_model
                 candidate.active.champion_established = True
                 record["champion_promoted"] = True
@@ -454,6 +582,9 @@ class CurriculumController:
                 "error": message,
             }
         )
+        standard = get_training_standard(self.config.training_standard)
+        if standard is not None:
+            candidate.active.evaluations[-1]["training_standard"] = standard.to_dict()
         candidate.active.consecutive_passes = 0
         candidate.active.next_evaluation_sample = self.next_evaluation_sample(
             candidate.active_stage_index, candidate.active.samples
@@ -507,6 +638,7 @@ class CurriculumController:
             fixed_baseline_models=[seed_model],
             next_evaluation_sample=self.next_evaluation_sample(candidate.active_stage_index, 0),
             autotune_batch=autotune_batch,
+            training_standard=self.config.training_standard,
         )
         candidate.stages[progress_key(board)] = progress
         candidate.protected_models.append(seed_model)

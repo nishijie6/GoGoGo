@@ -18,6 +18,12 @@ from .katago_rl import (
 )
 from .rl_config import RLConfigError
 from .katago_hardware import detect_hardware
+from .katago_mixed import DEFAULT_MIXED_PROFILE, MixedBoardRunner
+from .katago_mixed_health import build_mixed_health
+from .katago_mixed_eval import evaluate_mixed
+from .katago_mixed_experiments import prepare_mixed_experiment
+from .katago_mixed_trials import run_prepared_experiment
+from .katago_mixed_budget_profiles import prepare_budget_candidates
 from .rl_curriculum import (
     CurriculumConfigError,
     CurriculumLockError,
@@ -67,14 +73,33 @@ def build_parser() -> argparse.ArgumentParser:
             "curriculum-status",
             "curriculum-dashboard",
             "curriculum-evaluate",
+            "mixed", "mixed-status", "mixed-doctor", "mixed-health", "mixed-evaluate",
+            "mixed-experiment-prepare", "mixed-experiment-run",
+            "mixed-budget-prepare",
             *sorted(HANDOFF_COMMANDS),
         ),
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_RTX_PROFILE)
     parser.add_argument(
-        "--hardware", choices=("auto", "cpu", "low", "high", "configured"), default="auto",
+        "--hardware", choices=("auto", "cpu", "mps", "low", "high", "configured"), default="auto",
         help="启动时检测硬件，或手动选择 CPU/低端 CUDA/高端 CUDA；configured 沿用原配置",
     )
+    parser.add_argument("--mixed-config", type=Path, default=DEFAULT_MIXED_PROFILE,
+                        help="KataGo 混合棋盘配置；mixed 系列命令使用")
+    parser.add_argument("--run-root", type=Path,
+                        help="mixed 系列命令的独立输出目录；省略时使用混训配置")
+    parser.add_argument("--baseline-model", type=Path, help="mixed-evaluate 的冻结对手模型")
+    parser.add_argument("--candidate-model", type=Path, help="评测候选模型；省略时首次选定最新模型")
+    parser.add_argument("--evaluation-output", type=Path, help="独立、可恢复的评测输出目录")
+    parser.add_argument("--evaluation-games", type=int, default=12, help="每种棋盘预先固定的偶数评测局数")
+    parser.add_argument("--evaluation-visits", type=int, default=32)
+    parser.add_argument("--evaluation-parallel-pairs", type=int, default=1,
+                        help="mixed-evaluate 同时运行的换色开局组数；改变时使用新评测目录")
+    parser.add_argument("--evaluation-max-moves-factor", type=float, default=2.5,
+                        help="mixed-evaluate 每局新增手数上限为棋盘面积的此倍数；改变时使用新评测目录")
+    parser.add_argument("--evaluation-boards", type=int, nargs="+", help="要评测的棋盘尺寸；省略时使用全部混训棋盘")
+    parser.add_argument("--experiment-output", type=Path, help="独立的混训试验目录")
+    parser.add_argument("--budget-seconds", type=int, default=180, help="准备试验时固定每个分支的训练墙钟秒数")
     parser.add_argument(
         "--curriculum-config",
         type=Path,
@@ -102,7 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--destination",
         type=Path,
-        help="接力恢复目录；handoff-import 必须指定尚不存在的新目录",
+        help="接力恢复或 mixed-budget-prepare 候选目录；必须是新目录",
     )
     parser.add_argument(
         "--single-run",
@@ -206,12 +231,66 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             return
         if args.iterations < 0:
             raise KataGoRLRunnerError("--iterations 不能小于 0")
+        if args.run_root is not None and not args.command.startswith("mixed"):
+            parser.error("--run-root 仅用于 mixed 系列命令")
+        if args.command == "mixed-evaluate" and (args.baseline_model is None or args.evaluation_output is None):
+            parser.error("mixed-evaluate 必须指定 --baseline-model 和 --evaluation-output")
+        if args.command in {"mixed-experiment-prepare", "mixed-experiment-run", "mixed-budget-prepare"} and args.experiment_output is None:
+            parser.error("混训试验必须指定 --experiment-output")
+        if args.command == "mixed-budget-prepare" and args.destination is None:
+            parser.error("mixed-budget-prepare 必须指定 --destination")
+        if args.command == "mixed-experiment-run" and args.hardware == "configured":
+            parser.error("试验执行必须显式检测硬件，请使用 --hardware mps、cpu 或 auto")
         profile = None
-        read_only = {"status", "dashboard", "curriculum-status", "curriculum-dashboard"}
+        read_only = {"status", "dashboard", "curriculum-status", "curriculum-dashboard", "mixed-status", "mixed-health", "mixed-experiment-prepare", "mixed-budget-prepare"}
         if args.command == "hardware" or (args.hardware != "configured" and args.command not in read_only):
             profile = detect_hardware("auto" if args.hardware == "configured" else args.hardware)
             print(json.dumps({"hardware": profile.to_dict()}, ensure_ascii=False, indent=2), flush=True)
         if args.command == "hardware":
+            return
+        if args.command == "mixed-budget-prepare":
+            result = prepare_budget_candidates(args.experiment_output, args.destination)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return
+        if args.command == "mixed-experiment-run":
+            result = run_prepared_experiment(args.experiment_output, hardware_profile=profile,
+                                            games_per_board=args.evaluation_games, visits=args.evaluation_visits)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return
+        if args.command.startswith("mixed"):
+            runner = MixedBoardRunner(args.mixed_config, run_root_override=args.run_root,
+                                      hardware_profile=profile)
+            if args.command == "mixed-status":
+                runner.status()
+                return
+            if args.command == "mixed-experiment-prepare":
+                with runner.lock():
+                    result = prepare_mixed_experiment(runner.run_root, args.mixed_config,
+                                                      args.experiment_output, wall_seconds=args.budget_seconds)
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+                return
+            if args.command == "mixed-health":
+                print(json.dumps(build_mixed_health(runner.run_root, runner.mixed.board_sizes), ensure_ascii=False, indent=2))
+                return
+            if args.command == "mixed-evaluate":
+                result = evaluate_mixed(runner, args.evaluation_output, candidate=args.candidate_model,
+                                        baseline=args.baseline_model, boards=args.evaluation_boards,
+                                        games_per_board=args.evaluation_games, visits=args.evaluation_visits,
+                                        max_moves_factor=args.evaluation_max_moves_factor,
+                                        parallel_pairs=args.evaluation_parallel_pairs)
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+                return
+            if args.command == "mixed-doctor":
+                runner.doctor()
+                return
+            with runner.lock():
+                completed = 0
+                limit = args.iterations or (1 if args.smoke else 0)
+                while limit <= 0 or completed < limit:
+                    print(f"\n===== 混合棋盘循环 {completed + 1} =====", flush=True)
+                    runner.cycle(smoke=args.smoke, games=args.games, visits=args.visits,
+                                 min_rows=args.min_rows)
+                    completed += 1
             return
         if args.command in {"curriculum", "curriculum-status", "curriculum-dashboard", "curriculum-evaluate"}:
             curriculum = CurriculumRuntime(args.curriculum_config, hardware_profile=profile)

@@ -29,8 +29,7 @@
       "training_steps_per_iteration": 128
     },
     "evaluation": {
-      "games": 20,
-      "simulations_per_move": 400
+      "standard": "unified_v1"
     },
     "runtime": {
       "pause_while_game_is_active": false,

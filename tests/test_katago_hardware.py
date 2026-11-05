@@ -93,6 +93,29 @@ def _profile(tier="cpu", *, memory=0.0, cpu_threads=12):
     )
 
 
+def _fake_mps_torch(*, available=True, error=None, memory=12):
+    torch = _fake_torch(available=False)
+    torch.backends = SimpleNamespace(mps=SimpleNamespace(is_available=lambda: available))
+    torch.mps = SimpleNamespace(recommended_max_memory=lambda: memory * 1024**3)
+
+    def ones(shape, *, dtype, device):
+        if device != "mps" or dtype != "float32":
+            raise AssertionError("MPS must be probed with a float32 tensor on mps")
+        tensor = _ProbeTensor(error)
+        torch.tensors.append((device, tensor))
+        return tensor
+
+    torch.ones = ones
+    return torch
+
+
+def _mps_profile():
+    return HardwareProfile(
+        tier="mps", device="mps", precision="float32", gpu_name="Apple MPS",
+        memory_gib=12, cpu_threads=4, use_fp16=False,
+    )
+
+
 class DetectHardwareTests(unittest.TestCase):
     def _detect(self, torch, tier="auto"):
         with patch.object(katago_hardware.importlib, "import_module", return_value=torch), \
@@ -214,8 +237,85 @@ class DetectHardwareTests(unittest.TestCase):
         self.assertEqual(self._detect(_fake_torch((16, (8, 6), True, None)), "low").tier, "low")
         self.assertEqual(self._detect(_fake_torch((8, (8, 6), True, None)), "high").tier, "high")
 
+    def test_explicit_mps_requires_a_working_float32_kernel(self):
+        torch = _fake_mps_torch()
+        profile = self._detect(torch, "mps")
+        self.assertEqual(profile.tier, "mps")
+        self.assertEqual(profile.device, "mps")
+        self.assertEqual(profile.precision, "float32")
+        self.assertFalse(profile.use_fp16)
+        self.assertEqual(profile.cpu_threads, 4)
+        self.assertEqual(profile.memory_gib, 12)
+        self.assertIn("共享", profile.reason)
+        self.assertEqual(len(torch.tensors), 1)
+        self.assertTrue(torch.tensors[0][1].multiplied)
+
+    def test_explicit_mps_never_falls_back_on_unavailable_or_broken_kernel(self):
+        for torch, expected in (
+            (_fake_mps_torch(available=False), "MPS"),
+            (_fake_torch(available=False), "MPS"),
+            (_fake_mps_torch(error="Metal kernel failure"), "Metal kernel failure"),
+        ):
+            with self.subTest(expected=expected), self.assertRaisesRegex(ValueError, expected):
+                self._detect(torch, "mps")
+        with patch.object(katago_hardware.importlib, "import_module",
+                          side_effect=ImportError("missing torch")), \
+                self.assertRaisesRegex(ValueError, "MPS.*missing torch"):
+            detect_hardware("mps")
+
+    def test_auto_uses_mps_when_cuda_is_unavailable_or_broken(self):
+        torch = _fake_mps_torch()
+        self.assertEqual(self._detect(torch).device, "mps")
+        torch.cuda.is_available = lambda: (_ for _ in ()).throw(RuntimeError("CUDA error"))
+        self.assertEqual(self._detect(torch).device, "mps")
+
+    def test_auto_mps_kernel_failure_records_reason_and_falls_back(self):
+        profile = self._detect(_fake_mps_torch(error="Metal kernel failure"))
+        self.assertEqual(profile.device, "cpu")
+        self.assertIn("Metal kernel failure", profile.reason)
+
+    def test_mps_memory_advisory_is_optional(self):
+        torch = _fake_mps_torch()
+        torch.mps = SimpleNamespace()
+        self.assertEqual(self._detect(torch, "mps").memory_gib, 0)
+
 
 class HardwareProfileTests(unittest.TestCase):
+    def test_mps_caps_shared_memory_use_and_preserves_training_objective(self):
+        original = resolve_rl_training_config("high_performance")
+        profile = _mps_profile()
+        adapted = profile.apply(original)
+        self.assertEqual(adapted.hardware.device, "mps")
+        self.assertEqual(adapted.hardware.precision, "float32")
+        self.assertFalse(adapted.hardware.allow_tf32)
+        self.assertFalse(adapted.hardware.compile_model)
+        self.assertFalse(adapted.hardware.pin_memory)
+        self.assertEqual(adapted.hardware.data_loader_workers, 0)
+        self.assertEqual(adapted.self_play.workers, 2)
+        self.assertEqual(adapted.self_play.games_per_iteration, 24)
+        self.assertEqual(adapted.self_play.inference_batch_size, 4)
+        self.assertEqual(adapted.optimizer.batch_size, 8)
+        self.assertEqual(tuple(profile.training_batch_limit(size) for size in (9, 13, 19)),
+                         (16, 16, 8))
+        for field in ("game", "network", "search", "evaluation", "runtime"):
+            self.assertIs(getattr(adapted, field), getattr(original, field))
+        small = replace(original, self_play=replace(original.self_play, workers=1,
+                        games_per_iteration=2, inference_batch_size=1),
+                        optimizer=replace(original.optimizer, batch_size=2))
+        kept = profile.apply(small)
+        self.assertEqual(kept.self_play, small.self_play)
+        self.assertEqual(kept.optimizer.batch_size, 2)
+
+    def test_mps_uses_metal_inference_without_cuda_or_eigen_options(self):
+        profile = _mps_profile()
+        self.assertEqual(profile.backend, "metal")
+        self.assertEqual(profile.game_threads, 2)
+        self.assertIsNone(profile.gpu_index)
+        expected = {"nnCacheSizePowerOfTwo": 16, "numNNServerThreadsPerModel": 1,
+                    "metalDeviceToUseThread0": 0}
+        self.assertEqual(profile.inference_overrides(), expected)
+        self.assertEqual(profile.inference_overrides(has_model=False, smoke=True), expected)
+
     def test_board_size_batch_limits_cover_cpu_small_gpu_and_large_gpu(self):
         for profile, expected in (
             (_profile("cpu"), (16, 8, 4)),

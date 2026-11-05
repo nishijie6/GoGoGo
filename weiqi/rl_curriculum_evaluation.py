@@ -14,6 +14,7 @@ from .rl_curriculum import CurriculumState, CurriculumStateError
 from .rl_curriculum_openings import ensure_evaluation_opening_suite
 from .rl_match import build_match_config
 from .rl_match_jobs import run_opening_pairs
+from .training_standard import get_training_standard
 
 
 class EvaluationSteps:
@@ -45,7 +46,8 @@ class EvaluationSteps:
             opening_count=opening_count,
         )
         suite_manifest = openings[0].parent / "manifest.json"
-        return openings, {
+        standard = get_training_standard(self.config.training_standard)
+        manifest = {
             "protocol_version": 2,
             "roles": roles,
             "candidate_model": candidate_name,
@@ -55,7 +57,8 @@ class EvaluationSteps:
             "baseline_path": str(baseline),
             "baseline_sha256": sha256_file(baseline),
             "board_size": state.active.board_size,
-            "visits": runner.config.evaluation.simulations_per_move,
+            "visits": (standard.evaluation_visits if standard is not None
+                       else runner.config.evaluation.simulations_per_move),
             "komi": 6.5,
             "games": self.config.evaluation_games,
             "opening_pairs": opening_count,
@@ -65,6 +68,9 @@ class EvaluationSteps:
             "temperature": 0.0,
             "resignation": False,
         }
+        if standard is not None:
+            manifest["training_standard"] = standard.to_dict()
+        return openings, manifest
 
     def _parallel_pairs(self) -> int:
         requested = self.config.evaluation_parallel_pairs
@@ -130,7 +136,7 @@ class EvaluationSteps:
                 candidate_model=Path(manifest["candidate_path"]),
                 baseline_model=Path(manifest["baseline_path"]),
                 board_size=state.active.board_size,
-                visits=runner.config.evaluation.simulations_per_move,
+                visits=manifest["visits"],
                 games=2,
                 game_threads=2,
                 inference_batch_size=runner.config.self_play.inference_batch_size,
@@ -164,11 +170,17 @@ class EvaluationSteps:
             config_builder=config_builder, execute=execute,
         )
 
+    def _same_training_standard(self, record):
+        stamp = record.get("training_standard")
+        name = stamp.get("name") if isinstance(stamp, dict) else None
+        return name == getattr(self.config, "training_standard", None)
+
     def _needs_champion_evaluation(self, state):
         active = state.active
         if not active.latest_model or not active.champion_model or active.latest_model == active.champion_model:
             return False
         return not any(record.get("candidate_model") == active.latest_model
+                       and self._same_training_standard(record)
                        and any("champion" in item.get("roles", [])
                                and item.get("match", {}).get("games") == self.config.evaluation_games
                                for item in (record.get("opponents") or []))
@@ -214,6 +226,7 @@ class EvaluationSteps:
                                      output_dir / f"opponent-00-{champion}")
         records = self._read_metric_records(runner)
         self.controller.record_champion_evaluation(state, match=match,
+                                                   health=self._health(runner),
                                                    training_cycle=records[-1].get("cycle") if records else None)
         try:
             atomic_write_json(output_dir / "summary.json", state.active.evaluations[-1])

@@ -1,0 +1,6 @@
+# Native macOS PyTorch/MPS; install alongside the matching official KataGo source.
+# No CUDA wheel index is used on Apple Silicon.
+torch>=2.4,<3
+numpy>=1.26,<3
+packaging>=23
+psutil>=5.9

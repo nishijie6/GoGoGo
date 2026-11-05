@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional
 
+from .training_standard import get_training_standard
+
 
 CURRICULUM_SCHEMA_VERSION = 1
 EXPECTED_BOARDS = (9, 13, 19)
@@ -114,6 +116,7 @@ class CurriculumConfig:
     evaluation_near_gate_samples: int = 1_000_000
     champion_evaluation_every_cycle: bool = False
     evaluation_inference_batch_size: int = 128
+    training_standard: Optional[str] = None
 
     def state_root(self, project_root: Path) -> Path:
         path = Path(self.state_directory)
@@ -167,7 +170,7 @@ def load_curriculum_config(path: Path) -> CurriculumConfig:
         raw, path="课程配置", required=_ROOT_FIELDS,
         optional={"evaluation_parallel_pairs", "evaluation_midstage_interval_samples",
                   "evaluation_near_gate_samples", "champion_evaluation_every_cycle",
-                  "evaluation_inference_batch_size"},
+                  "evaluation_inference_batch_size", "training_standard"},
     )
     if (
         isinstance(raw["schema_version"], bool)
@@ -296,6 +299,18 @@ def load_curriculum_config(path: Path) -> CurriculumConfig:
     if len({stage.training_config.casefold() for stage in stages}) != 3:
         raise CurriculumConfigError("三个阶段必须使用不同的 training_config 文件")
 
+    standard_name = raw.get("training_standard")
+    try:
+        standard = get_training_standard(standard_name)
+    except ValueError as error:
+        raise CurriculumConfigError(str(error)) from error
+    if standard is not None:
+        interval = standard.evaluation_interval_samples
+        games = standard.confirmation_games_per_board
+        promotion = standard.promotion_win_rate
+        midstage_interval = None
+        every_cycle = False
+
     return CurriculumConfig(
         schema_version=CURRICULUM_SCHEMA_VERSION,
         state_directory=state_directory,
@@ -317,6 +332,7 @@ def load_curriculum_config(path: Path) -> CurriculumConfig:
         evaluation_near_gate_samples=near_gate_samples,
         champion_evaluation_every_cycle=every_cycle,
         evaluation_inference_batch_size=inference_batch,
+        training_standard=standard_name,
     )
 
 

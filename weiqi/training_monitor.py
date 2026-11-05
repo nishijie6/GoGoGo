@@ -230,6 +230,9 @@ class MonitorStore:
             row = next((item for item in rounds if item.get("champion_round") == round_number), None)
             if row is None:
                 raise FileNotFoundError("评测轮次不存在")
+            if snapshot.get("source") == "mixed":
+                from .monitor_mixed import historical_curve
+                return historical_curve(self, path, championship, row)
             key = (run_id, championship.get("stage"), row.get("candidate"), row.get("name"), row.get("samples"))
             cached = self.curve_cache.get(key)
             if cached:
@@ -313,6 +316,15 @@ class MonitorStore:
         path = self.safe_path(self.root / run_id)
         if not path.is_dir() or run_id.startswith("."):
             raise FileNotFoundError("找不到训练记录")
+        return self.data_path(path)
+
+    def data_path(self, path):
+        nested = path / "run"
+        if self.safe_path(nested / "mixed_manifest.json").is_file() and not any(
+            self.safe_path(path / name).is_file() for name in
+            ("mixed_manifest.json", "state.json", "events.jsonl", "summary.json", "metrics/history.jsonl")
+        ):
+            return self.safe_path(nested)
         return path
 
     def run_status(self, path, tail=None):
@@ -367,13 +379,18 @@ class MonitorStore:
                     if path.name.startswith(".") or not path.is_dir():
                         continue
                     try:
-                        self.safe_path(path)
-                        if not any(self.safe_path(path / name).is_file() for name in ("events.jsonl", "summary.json", "monitor.json", "config.resolved.json", "metrics/history.jsonl", "state.json")):
+                        data = self.data_path(self.safe_path(path))
+                        if not any(self.safe_path(data / name).is_file() for name in ("events.jsonl", "summary.json", "monitor.json", "config.resolved.json", "metrics/history.jsonl", "state.json", "mixed_manifest.json")):
                             continue
-                        status = self.run_status(path)
-                        summary = self.read_json(path / "summary.json")
+                        if self.safe_path(data / "mixed_manifest.json").is_file():
+                            from .monitor_mixed import runtime_status
+                            summary = self.read_json(data / "metrics/latest.json")
+                            status = runtime_status(self, data, summary, self.read_json(data / "promotion/state.json"))
+                        else:
+                            summary = self.read_json(data / "summary.json")
+                            status = self.run_status(data)
                         rows.append({"id": path.name, "name": path.name, "status": status["state"],
-                                     "updated_at": status["updated_at"], "iteration": summary.get("iteration")})
+                                     "updated_at": status["updated_at"], "iteration": summary.get("iteration", summary.get("cycle"))})
                     except (ValueError, OSError):
                         continue
             rows.sort(key=lambda row: (row["status"] in {"running", "paused"}, row["updated_at"] or ""), reverse=True)
@@ -427,6 +444,9 @@ class MonitorStore:
     def snapshot(self, run_id):
         with self.lock:
             path = self.run_path(run_id)
+            if self.safe_path(path / "mixed_manifest.json").is_file():
+                from .monitor_mixed import snapshot
+                return snapshot(self, path, run_id)
             if not any(self.safe_path(path / name).is_file() for name in ("events.jsonl", "summary.json", "monitor.json")) and (
                     self.safe_path(path / "metrics/history.jsonl").is_file() or self.read_json(path / "state.json").get("stages")):
                 from .monitor_legacy import snapshot
@@ -516,6 +536,8 @@ class MonitorStore:
                                     "sha256": row["opponent_sha256"], "role": "training",
                                     "live": True} for row in matches] + historical_rows
             return {"run": {"id": run_id, "name": run_id}, "server_time": iso_time(), "status": status,
+                    "training_standard": latest.get("training_standard") or tail.ready.get("training_standard"),
+                    "evaluation_schedule": latest.get("evaluation_schedule") or tail.ready.get("evaluation_schedule"),
                     "current": current, "latest": latest, "history": history,
                     "diagnostics": diagnostics, "evaluations": evaluations, "source": "native",
                     "opponents": historical_rows,

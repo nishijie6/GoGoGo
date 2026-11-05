@@ -44,6 +44,7 @@ class StageProgress:
     autotune_batch: Optional[int] = None
     started_at: str = field(default_factory=local_timestamp)
     completed_at: Optional[str] = None
+    training_standard: Optional[str] = None
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> "StageProgress":
@@ -68,6 +69,7 @@ class StageProgress:
                 ),
                 started_at=str(value.get("started_at", local_timestamp())),
                 completed_at=_optional_string(value.get("completed_at")),
+                training_standard=_optional_string(value.get("training_standard")),
             )
         except (KeyError, TypeError, ValueError) as error:
             raise CurriculumStateError("阶段状态字段无效") from error

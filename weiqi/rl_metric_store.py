@@ -30,8 +30,12 @@ def _timestamp(path: Path) -> str:
 class RLMetricStore:
     """Synchronize accepted checkpoints into durable metrics and charts."""
 
-    def __init__(self, run_root: Path) -> None:
+    def __init__(self, run_root: Path, *, allow_mixed_boards: bool = False,
+                 standard: str | None = None) -> None:
         self.run_root = run_root.resolve()
+        self.allow_mixed_boards = allow_mixed_boards
+        from .training_standard import get_training_standard
+        self.standard = get_training_standard(standard)
         self.models_dir = self.run_root / "models"
         self.exports_dir = self.run_root / "torchmodels_toexport"
         self.selfplay_dir = self.run_root / "selfplay"
@@ -133,13 +137,16 @@ class RLMetricStore:
             if model_name == live_model and live_metrics:
                 record.update(live_metrics)
                 record["source"] = "completed-cycle"
+            if self.standard and (model_name == live_model or model_name not in existing):
+                record["training_standard"] = self.standard.to_dict()
             sgf_paths = sorted(
                 (self.selfplay_dir / model_name / "sgfs").glob("*.sgfs")
             )
             if sgf_paths:
                 sgf_bytes = sum(path.stat().st_size for path in sgf_paths)
                 if record.get("sgf_file_bytes") != sgf_bytes:
-                    record.update(parse_sgfs(sgf_paths))
+                    record.update(parse_sgfs(sgf_paths, allow_mixed_boards=self.allow_mixed_boards,
+                        standard=(record.get("training_standard") or {}).get("name")))
             records.append(record)
 
         previous_samples = 0
@@ -185,7 +192,10 @@ class RLMetricStore:
         for record in records:
             if "sgf_entries" in record:
                 health_records.append(record)
-            record.update(rolling_health_metrics(health_records))
+            name = (record.get("training_standard") or {}).get("name")
+            compatible = [row for row in health_records
+                          if (row.get("training_standard") or {}).get("name") == name]
+            record.update(rolling_health_metrics(compatible, standard=name))
 
         generated_at = datetime.now().astimezone().isoformat(timespec="seconds")
         jsonl = "".join(

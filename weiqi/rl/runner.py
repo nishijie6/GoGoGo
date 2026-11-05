@@ -15,7 +15,8 @@ from torch.nn import functional as F
 from ..engine import BLACK, WHITE
 from ..fileio import sha256_file
 from ..rl_config import RLTrainingConfig
-from .control import Progress, RunLock, TrainingControl
+from ..training_standard import get_training_standard
+from .control import Progress, RunLock, TrainingControl, TrainingStopped
 from .eval_pool import evaluate_pool, save_anchor, select_anchors
 from .eval_quality import evaluate_positions
 from .eval_stats import confirmed_improvement, paired_confidence, paired_sign_test, paired_sprt
@@ -68,6 +69,12 @@ class Trainer:
         self.replay = ReplayBuffer(config.optimizer.replay_buffer_capacity, config.game.board_size,
                                    config.optimizer.use_board_symmetry_augmentation)
         self.iteration = self.training_steps = self.best_iteration = 0
+        self.training_samples = 0
+        self.standard = get_training_standard(config.evaluation.standard)
+        self.last_evaluation_sample = 0
+        self.next_evaluation_sample = (self.standard.evaluation_interval_samples
+                                       if self.standard else None)
+        self.recent_selfplay_health = []
         self.untrained_samples = 0
         if resume is not None:
             if resume.get("kind") != "training":
@@ -81,6 +88,20 @@ class Trainer:
                 self.scaler.load_state_dict(resume["scaler"])
             self.replay.restore(resume["replay"])
             self.iteration, self.training_steps = resume["iteration"], resume["training_steps"]
+            # Use the saved batch, so moving a checkpoint to different hardware
+            # never reinterprets its historical training progress.
+            saved_batch = resume["config"]["optimizer"]["batch_size"]
+            self.training_samples = resume.get("training_samples", self.training_steps * saved_batch)
+            if self.standard:
+                interval = self.standard.evaluation_interval_samples
+                saved_next = resume.get("next_evaluation_sample")
+                if saved_next is None:
+                    self.last_evaluation_sample = self.training_samples // interval * interval
+                    self.next_evaluation_sample = self.last_evaluation_sample + interval
+                else:
+                    self.last_evaluation_sample = resume.get("last_evaluation_sample", 0)
+                    self.next_evaluation_sample = saved_next
+            self.recent_selfplay_health = resume.get("recent_selfplay_health", [])
             self.best_iteration = resume["best_iteration"]
             self.untrained_samples = resume.get("untrained_samples", 0)
             self.rng.bit_generator.state = resume["numpy_rng"]
@@ -99,6 +120,10 @@ class Trainer:
         self.progress({
             "event": "ready", "resumed": resume is not None, "iteration": self.iteration,
             "training_steps": self.training_steps, "best_iteration": self.best_iteration,
+            "training_samples": self.training_samples,
+            "next_evaluation_sample": self.next_evaluation_sample,
+            "training_standard": self.standard.to_dict() if self.standard else None,
+            "evaluation_schedule": self._evaluation_schedule(),
             "replay_samples": len(self.replay),
             "device": str(self.runtime.device), "precision": self.runtime.precision,
             "torch": torch.__version__, "parameters": sum(p.numel() for p in self.model.parameters()),
@@ -129,7 +154,22 @@ class Trainer:
     def _base_payload(self):
         return {"checkpoint_version": CHECKPOINT_VERSION, "feature_version": FEATURE_VERSION,
                 "config": self.config.to_dict(), "iteration": self.iteration,
-                "training_steps": self.training_steps, "best_iteration": self.best_iteration}
+                "training_steps": self.training_steps, "best_iteration": self.best_iteration,
+                "training_samples": self.training_samples,
+                "last_evaluation_sample": self.last_evaluation_sample,
+                "next_evaluation_sample": self.next_evaluation_sample,
+                "training_standard": self.standard.to_dict() if self.standard else None}
+
+    def _evaluation_schedule(self) -> dict:
+        return {"trained_samples": self.training_samples,
+                "next_samples": self.next_evaluation_sample,
+                "remaining_samples": (max(0, self.next_evaluation_sample - self.training_samples)
+                                      if self.next_evaluation_sample is not None else None)}
+
+    def _advance_evaluation_sample(self) -> None:
+        self.last_evaluation_sample = self.next_evaluation_sample
+        interval = self.standard.evaluation_interval_samples
+        self.next_evaluation_sample = (self.training_samples // interval + 1) * interval
 
     def save(self, archive: bool = True):
         payload = {
@@ -137,6 +177,7 @@ class Trainer:
             "best_model": cpu_state(self.best), "optimizer": self.optimizer.state_dict(),
             "scaler": self.scaler.state_dict(), "replay": self.replay.state(),
             "untrained_samples": self.untrained_samples,
+            "recent_selfplay_health": self.recent_selfplay_health,
             "numpy_rng": deepcopy(self.rng.bit_generator.state), "torch_rng": torch.get_rng_state(),
             "cuda_rng": torch.cuda.get_rng_state_all() if self.runtime.device.type == "cuda" else [],
         }
@@ -218,6 +259,7 @@ class Trainer:
                 continue
             updates += 1
             self.training_steps += 1
+            self.training_samples += len(features)
             step_losses = torch.stack([loss, policy_loss, value_loss,
                                        ownership_loss, score_loss]).detach()
             totals += step_losses
@@ -225,6 +267,7 @@ class Trainer:
                 losses = step_losses.tolist()
                 event = {"event": "training_step", "step": step, "total": count,
                          "training_steps": self.training_steps,
+                         "training_samples": self.training_samples,
                          "loss": losses[0], "policy_loss": losses[1], "value_loss": losses[2]}
                 if auxiliary:
                     event.update(ownership_loss=losses[3], score_loss=losses[4])
@@ -234,6 +277,7 @@ class Trainer:
         new_samples, self.untrained_samples = self.untrained_samples, 0
         totals = totals.tolist()
         result = {"steps": updates, "attempts": count,
+                  "training_samples": self.training_samples,
                   "loss": totals[0] / updates, "policy_loss": totals[1] / updates,
                   "value_loss": totals[2] / updates, "seconds": time.monotonic() - started,
                   "untrained_samples": new_samples,
@@ -319,7 +363,7 @@ class Trainer:
         """
         jobs = self.evaluation_jobs()
         evaluators = {0: self.runtime.evaluator(self.best), 1: self.runtime.evaluator(self.model)}
-        if config.evaluation.promotion_test != "paired_sprt":
+        if self.standard or config.evaluation.promotion_test != "paired_sprt":
             return run_games(config, jobs, evaluators, training=False, check=self.control,
                              progress=self.progress, metadata=metadata)
         results = []
@@ -344,9 +388,14 @@ class Trainer:
             summary["training"] = self.train_updates()
             summary["position_quality"] = self._position_quality(directory)
             summary["opponent_pool"] = self._opponent_pool(number, directory)
-            match_metadata, summary["screening"] = self._screening(directory)
-            summary["evaluation"], summary["promoted"] = self._promotion(
-                number, directory, match_metadata, summary["screening"])
+            if self.standard and self.training_samples < self.next_evaluation_sample:
+                summary["screening"] = summary["evaluation"] = {
+                    "status": "scheduled", "next_evaluation_sample": self.next_evaluation_sample}
+                summary["promoted"] = False
+            else:
+                match_metadata, summary["screening"] = self._screening(directory)
+                summary["evaluation"], summary["promoted"] = self._promotion(
+                    number, directory, match_metadata, summary["screening"])
         else:
             summary["training"] = {"steps": 0, "reason": "replay_warmup",
                                    "required_samples": config.optimizer.minimum_replay_size}
@@ -356,6 +405,68 @@ class Trainer:
     @staticmethod
     def _next_due(number: int, every: int) -> int:
         return number + (every - number % every)
+
+    def _record_selfplay_health(self, games) -> None:
+        """Keep compact observations, without duplicating replay tensors in saves."""
+        if not self.standard:
+            return
+        policy = self.standard
+        area = self.config.game.board_size ** 2
+        cutoff = max(policy.short_game_min_moves,
+                     math.ceil(area * policy.short_game_area_fraction))
+        for game in games:
+            valid = (game.reason in ("two_passes", "resign")
+                     and game.winner in (BLACK, WHITE, None)
+                     and math.isfinite(game.black_score) and math.isfinite(game.white_score))
+            self.recent_selfplay_health.append({
+                "self": game.opponent_name in ("", "candidate_self"),
+                "black_score": (.5 if game.winner is None else float(game.winner == BLACK))
+                               if valid else None,
+                "early_double_pass": (len(game.moves) >= 2 and game.moves[0][1] == area
+                                      and game.moves[1][1] == area
+                                      and game.moves[0][0] != game.moves[1][0]),
+                "short": len(game.moves) < cutoff,
+                "invalid": not valid,
+                "truncated": game.reason == "length_limit",
+                "moves": len(game.moves),
+                "passes": sum(action == area for _, action in game.moves),
+                "extreme_margin": (math.isfinite(game.black_score)
+                                   and math.isfinite(game.white_score)
+                                   and abs(game.black_score - game.white_score)
+                                   >= area * policy.extreme_margin_area_fraction),
+            })
+        # Retain enough true self-play evidence even when the majority of games
+        # spar against frozen opponents. Other health rates still use the newest
+        # 32 games; the color check uses the newest 32 comparable self games.
+        self.recent_selfplay_health = self.recent_selfplay_health[-max(256, policy.health_minimum_games):]
+
+    def _selfplay_health(self, *, minimum_games=None, require_color_evidence=True) -> dict:
+        policy = self.standard
+        rows = self.recent_selfplay_health[-policy.health_minimum_games:]
+        count = len(rows)
+        comparable = [row["black_score"] for row in self.recent_selfplay_health
+                      if row["self"] and row["black_score"] is not None][-policy.health_minimum_games:]
+        moves = sum(row["moves"] for row in rows)
+        report = {
+            "games": count, "candidate_self_games": len(comparable),
+            "black_score_rate": sum(comparable) / len(comparable) if comparable else None,
+            "early_double_pass_rate": sum(row["early_double_pass"] for row in rows) / count if count else 0.,
+            "short_game_rate": sum(row["short"] for row in rows) / count if count else 0.,
+            "invalid_rate": sum(row["invalid"] for row in rows) / count if count else 0.,
+            "truncated_rate": sum(row["truncated"] for row in rows) / count if count else 0.,
+            "pass_move_rate": sum(row["passes"] for row in rows) / moves if moves else None,
+            "extreme_margin_rate": sum(row["extreme_margin"] for row in rows) / count if count else 0.,
+        }
+        color_minimum = policy.health_minimum_games if minimum_games is None else minimum_games
+        enough_color = len(comparable) >= color_minimum
+        reasons = list(policy.health_reasons(
+            **{key: report[key] for key in ("games", "early_double_pass_rate", "short_game_rate",
+                                           "invalid_rate", "pass_move_rate")},
+            black_score_rate=report["black_score_rate"] if enough_color else .5,
+            minimum_games=minimum_games))
+        if not enough_color and require_color_evidence:
+            reasons.append("insufficient_candidate_self_games")
+        return {**report, "passed": not reasons, "rejection_reasons": reasons}
 
     def _selfplay_phase(self, number: int, directory: Path, started: float) -> dict:
         config = self.config
@@ -377,6 +488,16 @@ class Trainer:
                           metadata={"candidate_sha256": fingerprint(cpu_state(self.model)),
                                     "best_iteration": self.best_iteration})
         write_games(games, config, directory / "selfplay")
+        self._record_selfplay_health(games)
+        health = self._selfplay_health() if self.standard else None
+        if self.standard and health["games"] >= self.standard.live_minimum_games:
+            live = self._selfplay_health(minimum_games=self.standard.live_minimum_games,
+                                         require_color_evidence=False)
+            if not live["passed"]:
+                atomic_json(live, directory / "selfplay_health.json")
+                self.progress({"event": "selfplay_health_rejected", "selfplay_health": live,
+                               "training_standard": self.standard.to_dict()})
+                raise TrainingStopped("Self-play health rejected: " + ", ".join(live["rejection_reasons"]))
         for game in games:
             self.replay.extend(game.examples)
             self.untrained_samples += len(game.examples)
@@ -399,6 +520,7 @@ class Trainer:
             "selfplay_opponents": list(opponent_rows.values()),
             "selfplay_joseki_games": sum(game.opening_id is not None for game in games),
             "selfplay_joseki_fraction": config.self_play.joseki_fraction,
+            "selfplay_health": health,
         }
 
     def _position_quality(self, directory: Path) -> dict:
@@ -455,7 +577,9 @@ class Trainer:
         match_metadata = {"candidate_sha256": fingerprint(cpu_state(self.model)),
                           "opponent_name": f"accepted_{self.best_iteration:06d}",
                           "opponent_sha256": fingerprint(cpu_state(self.best)),
-                          "best_iteration": self.best_iteration}
+                          "best_iteration": self.best_iteration,
+                          "training_samples": self.training_samples,
+                          "training_standard": self.standard.to_dict() if self.standard else None}
         screen_config = replace(config, evaluation=replace(
             config.evaluation, games=config.evaluation.screen_games,
             simulations_per_move=config.evaluation.screen_simulations_per_move))
@@ -477,12 +601,17 @@ class Trainer:
         """Run the due confirmation match after a passing screen; promote on success."""
         config = self.config
         every = config.evaluation.full_every_iterations
-        due = number % every == 0
+        due = (self.training_samples >= self.next_evaluation_sample if self.standard
+               else number % every == 0)
         eligible = (screening["truncated"] == 0 and
                     screening["score_rate"] >= config.evaluation.screen_min_score_rate)
         if not (due and eligible):
+            if due and self.standard:
+                self._advance_evaluation_sample()
             return {"status": "screen_rejected" if due else "scheduled",
-                    "next_due_iteration": self._next_due(number, every)}, False
+                    "next_due_iteration": self._next_due(number, every) if not self.standard else None,
+                    "next_evaluation_sample": self.next_evaluation_sample,
+                    "training_standard": self.standard.to_dict() if self.standard else None}, False
         self.progress.phase = "evaluation"
         confirmation_config = replace(
             config, self_play=replace(
@@ -492,6 +621,7 @@ class Trainer:
         write_games(results, confirmation_config, directory / "evaluation")
         evaluation = {
             **match_metadata,
+            "training_standard": self.standard.to_dict() if self.standard else None,
             **evaluation_summary(results),
             "paired": paired_confidence(results, confidence=config.evaluation.confidence_level),
             "paired_sign": paired_sign_test(results, confidence=config.evaluation.confidence_level),
@@ -501,9 +631,26 @@ class Trainer:
             "max_game_length_factor": config.evaluation.confirmation_max_game_length_factor,
             "simulations_per_move": config.evaluation.simulations_per_move,
         }
-        promoted = confirmed_improvement(evaluation,
-                                         threshold=config.evaluation.promotion_win_rate,
-                                         method=config.evaluation.promotion_test)
+        if self.standard:
+            health = self._selfplay_health()
+            reasons = self.standard.promotion_reasons(
+                score=evaluation["score_rate"],
+                by_board={config.game.board_size: evaluation["score_rate"]},
+                complete=(len(results) == self.standard.confirmation_games_per_board
+                          and evaluation["truncated"] == 0
+                          and evaluation["paired"]["complete_pairs"]
+                          == self.standard.confirmation_games_per_board // 2),
+                confidence_lower=evaluation["paired"]["lower"],
+                health_reasons=health["rejection_reasons"])
+            evaluation.update(selfplay_health=health, rejection_reasons=list(reasons),
+                              promotion_test="unified_fixed_paired")
+            promoted = not reasons
+            self._advance_evaluation_sample()
+            evaluation["next_evaluation_sample"] = self.next_evaluation_sample
+        else:
+            promoted = confirmed_improvement(evaluation,
+                                             threshold=config.evaluation.promotion_win_rate,
+                                             method=config.evaluation.promotion_test)
         if promoted:
             self.best.load_state_dict(self.model.state_dict())
             self.best_iteration = number
@@ -514,6 +661,11 @@ class Trainer:
         config = self.config
         self.iteration = number
         summary.update({"training_steps": self.training_steps, "best_iteration": self.best_iteration,
+                        "training_samples": self.training_samples,
+                        "last_evaluation_sample": self.last_evaluation_sample,
+                        "next_evaluation_sample": self.next_evaluation_sample,
+                        "evaluation_schedule": self._evaluation_schedule(),
+                        "training_standard": self.standard.to_dict() if self.standard else None,
                         "model_sha256": fingerprint(cpu_state(self.model)),
                         "seconds": time.monotonic() - started})
         self.progress.phase = "checkpoint"

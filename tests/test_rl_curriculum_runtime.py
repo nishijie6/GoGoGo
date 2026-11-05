@@ -214,6 +214,186 @@ class CurriculumRuntimeStateTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def _standard_runtime(self):
+        value = json.loads(self.config_path.read_text(encoding="utf-8"))
+        value["training_standard"] = "unified_v1"
+        self.config_path.write_text(json.dumps(value), encoding="utf-8")
+        return CurriculumRuntime(self.config_path, project_root=PROJECT_ROOT,
+                                 runner_factory=_FakeRunner)
+
+    def test_standard_runtime_uses_recent_game_evidence_and_optional_shape_health(self):
+        runtime = self._standard_runtime()
+        runner = runtime._make_runner(runtime.config.stages[0])
+        metrics = runner.metric_store.jsonl_path
+        metrics.parent.mkdir(parents=True)
+        records = [
+            {"sgf_entries": 1280, "black_wins": 1280, "white_wins": 0},
+            {"sgf_entries": 32, "black_wins": 8, "white_wins": 24,
+             "extreme_result_games": 32, "short_games": 0,
+             "pass_moves": 4, "total_moves": 100},
+        ]
+        metrics.write_text("".join(json.dumps(row) + "\n" for row in records), encoding="utf-8")
+        health = runtime._health(runner)
+        self.assertEqual(health.games, 32)
+        self.assertTrue(health.passed)
+        self.assertEqual(health.extreme_result_rate, 1.0)
+        self.assertEqual(health.pass_move_rate, .04)
+        records[-1].update(short_games=16, pass_moves=30)
+        metrics.write_text("".join(json.dumps(row) + "\n" for row in records), encoding="utf-8")
+        health = runtime._health(runner)
+        self.assertFalse(health.passed)
+        self.assertIn("short_game_rate", health.reasons)
+        self.assertIn("pass_move_rate", health.reasons)
+
+    def test_standard_manifest_freezes_shared_visits_games_and_policy(self):
+        runtime = self._standard_runtime()
+        for name in ("gogogo-s1-d1", "gogogo-s1000-d20"):
+            _make_model(self.root / "9x9", name)
+        state = runtime._adopt_existing_9x9()
+        runner = runtime._stage_runner(state)
+        _, manifest = runtime._match_manifest(state, runner, "gogogo-s1000-d20",
+                                              "gogogo-s1-d1", ["champion"])
+        self.assertEqual(manifest["visits"], 32)
+        self.assertEqual(manifest["games"], 40)
+        self.assertEqual(manifest["training_standard"]["name"], "unified_v1")
+
+    def test_standard_runtime_resumes_progress_without_discarding_history(self):
+        _make_model(self.root / "9x9", "gogogo-s60000-d20")
+        state = self.runtime._adopt_existing_9x9()
+        state.active.evaluations = [{"stage_samples": 50_000, "passed": True}]
+        self.runtime.store.save(state)
+        runtime = self._standard_runtime()
+        restored = runtime._adopt_existing_9x9()
+        self.assertEqual(restored.active.next_evaluation_sample, 102_400)
+        self.assertEqual(restored.active.evaluations, [{"stage_samples": 50_000, "passed": True}])
+
+    def test_standard_runtime_champion_evaluation_passes_actual_health_to_admission(self):
+        from test_rl_curriculum import UnifiedCurriculumStandardTests
+        from unittest.mock import patch
+        runtime = self._standard_runtime()
+        for name in ("gogogo-s1-d1", "gogogo-s1000-d20"):
+            _make_model(self.root / "9x9", name)
+        state = runtime._adopt_existing_9x9()
+        state.active.champion_model = "gogogo-s1-d1"
+        runner = runtime._stage_runner(state)
+        metrics = runner.metric_store.jsonl_path
+        metrics.parent.mkdir(parents=True)
+        metrics.write_text(json.dumps({"sgf_entries": 32, "black_wins": 16,
+                                       "white_wins": 16}) + "\n", encoding="utf-8")
+        with patch.object(runtime, "_pending_evaluation_directory", return_value=None), patch.object(
+                runtime, "_match_opponent", return_value=UnifiedCurriculumStandardTests.match()):
+            runtime._evaluate_champion(state)
+        self.assertEqual(state.active.champion_model, "gogogo-s1000-d20")
+        self.assertEqual(state.active.evaluations[-1]["health"]["games"], 32)
+
+    def test_standard_does_not_reuse_legacy_match_admission_for_same_candidate(self):
+        from test_rl_curriculum import UnifiedCurriculumStandardTests
+        runtime = self._standard_runtime()
+        for name in ("gogogo-s1-d1", "gogogo-s1000-d20"):
+            _make_model(self.root / "9x9", name)
+        state = runtime._adopt_existing_9x9()
+        state.active.champion_model = "gogogo-s1-d1"
+        state.active.evaluations = [{
+            "candidate_model": "gogogo-s1000-d20",
+            "opponents": [{"model": "gogogo-s1-d1", "roles": ["champion"],
+                           "match": UnifiedCurriculumStandardTests.match().to_dict()}],
+        }]
+        runtime.store.save(state)
+        self.assertTrue(runtime._needs_champion_evaluation(state))
+        runner = runtime._stage_runner(state)
+        metrics = runner.metric_store.jsonl_path
+        metrics.parent.mkdir(parents=True)
+        metrics.write_text(json.dumps({"sgf_entries": 32, "black_wins": 16,
+                                       "white_wins": 16}) + "\n", encoding="utf-8")
+
+        def successful_pair(command, **_kwargs):
+            sgf_dir = Path(command[command.index("-sgf-output-dir") + 1])
+            sgf_dir.mkdir(parents=True, exist_ok=True)
+            (sgf_dir / "pair.sgfs").write_text(
+                "(;PB[candidate]PW[baseline]RE[B+1.5])\n"
+                "(;PB[baseline]PW[candidate]RE[W+1.5])\n", encoding="utf-8")
+            return CommandExecution(0, "ok")
+
+        runtime.command_runner = successful_pair
+        runtime.evaluate_now()
+        records = runtime.store.load().active.evaluations
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[1]["training_standard"]["name"], "unified_v1")
+
+    def _assert_legacy_partial_suite_is_deferred(self, *, pending_champion):
+        for name in ("gogogo-s1-d1", "gogogo-s60000-d20"):
+            _make_model(self.root / "9x9", name)
+        state = self.runtime._adopt_existing_9x9()
+        state.active.champion_model = "gogogo-s1-d1"
+        state.phase = "evaluating"
+        state.active.pending_champion_evaluation = pending_champion
+        self.runtime.store.save(state)
+        runner = self.runtime._stage_runner(state)
+        old_dir = self.runtime._evaluation_directory(state)
+        old_calls = []
+
+        def interrupted_legacy_pair(command, **_kwargs):
+            old_calls.append(command)
+            if len(old_calls) > 1:
+                return CommandExecution(7, "interrupted legacy suite")
+            sgf_dir = Path(command[command.index("-sgf-output-dir") + 1])
+            sgf_dir.mkdir(parents=True, exist_ok=True)
+            (sgf_dir / "pair.sgfs").write_text(
+                "(;PB[candidate]PW[baseline]RE[B+1.5])\n"
+                "(;PB[baseline]PW[candidate]RE[W+1.5])\n", encoding="utf-8")
+            return CommandExecution(0, "ok")
+
+        self.runtime.command_runner = interrupted_legacy_pair
+        with self.assertRaisesRegex(RuntimeError, "退出代码 7"):
+            self.runtime._match_opponent(state, runner, "gogogo-s60000-d20", "gogogo-s1-d1",
+                                         ["champion", "fixed"], old_dir / "opponent-00-gogogo-s1-d1")
+        original = {str(p.relative_to(old_dir)): p.read_bytes()
+                    for p in old_dir.rglob("*") if p.is_file()}
+        runtime = self._standard_runtime()
+        adopted = runtime._adopt_existing_9x9()
+        self.assertEqual(adopted.phase, "training")
+        self.assertFalse(adopted.active.pending_champion_evaluation)
+        self.assertEqual(adopted.active.champion_model, "gogogo-s1-d1")
+        audit = adopted.warnings[-1]
+        self.assertEqual(audit["previous_pending_champion_evaluation"], pending_champion)
+        self.assertIn(str(old_dir), audit["evaluation_paths"])
+        self.assertIsNone(runtime._pending_evaluation_directory(
+            adopted, runtime._stage_runner(adopted), "gogogo-s60000-d20",
+            {"gogogo-s1-d1": ["champion", "fixed"]}))
+
+        metrics = runner.metric_store.jsonl_path
+        metrics.parent.mkdir(parents=True)
+        metrics.write_text(json.dumps({"sgf_entries": 32, "black_wins": 16,
+                                       "white_wins": 16}) + "\n", encoding="utf-8")
+        fresh_pairs = []
+
+        def losing_fresh_pair(command, **_kwargs):
+            fresh_pairs.append(command)
+            sgf_dir = Path(command[command.index("-sgf-output-dir") + 1])
+            sgf_dir.mkdir(parents=True, exist_ok=True)
+            (sgf_dir / "pair.sgfs").write_text(
+                "(;PB[candidate]PW[baseline]RE[W+1.5])\n"
+                "(;PB[baseline]PW[candidate]RE[B+1.5])\n", encoding="utf-8")
+            return CommandExecution(0, "ok")
+
+        runtime.command_runner = losing_fresh_pair
+        runtime.evaluate_now()
+        restored = runtime.store.load()
+        self.assertEqual(len(fresh_pairs), 20)
+        self.assertEqual(restored.active.champion_model, "gogogo-s1-d1")
+        record = restored.active.evaluations[-1]
+        self.assertEqual(record["match"]["games"], 40)
+        self.assertEqual(record["match"]["win_rate"], 0.0)
+        self.assertFalse(record["champion_promoted"])
+        self.assertEqual({str(p.relative_to(old_dir)): p.read_bytes()
+                          for p in old_dir.rglob("*") if p.is_file()}, original)
+
+    def test_standard_defers_ordinary_partial_suite_and_uses_only_fresh_results(self):
+        self._assert_legacy_partial_suite_is_deferred(pending_champion=False)
+
+    def test_standard_defers_champion_partial_suite_and_uses_only_fresh_results(self):
+        self._assert_legacy_partial_suite_is_deferred(pending_champion=True)
+
     def test_adoption_protects_oldest_baseline_before_latest(self) -> None:
         run_root = self.root / "9x9"
         _make_model(run_root, "gogogo-s2048-d100")

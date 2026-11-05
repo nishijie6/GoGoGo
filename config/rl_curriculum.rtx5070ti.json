@@ -1,14 +1,11 @@
 {
   "schema_version": 1,
   "state_directory": "training_runs/curriculum",
-  "evaluation_interval_samples": 500000,
-  "evaluation_midstage_interval_samples": 2000000,
-  "evaluation_near_gate_samples": 1000000,
+  "evaluation_interval_samples": 51200,
   "evaluation_parallel_pairs": 8,
   "evaluation_inference_batch_size": 2,
-  "evaluation_games": 200,
-  "champion_evaluation_every_cycle": false,
-  "promotion_win_rate": 0.6,
+  "evaluation_games": 40,
+  "promotion_win_rate": 0.55,
   "wilson_lower_bound": 0.5,
   "required_consecutive_passes": 2,
   "health_window_cycles": 10,
@@ -40,15 +37,27 @@
         "gogogo-s0-d0",
         "gogogo-s11507712-d3661143"
       ],
-      "autotune_batches": [512, 1024, 1536, 2048],
+      "autotune_batches": [
+        512,
+        1024,
+        1536,
+        2048
+      ],
       "indefinite": false
     },
     {
       "board_size": 19,
       "training_config": "config/rl_training.rtx5070ti.curriculum.19x19.json",
       "min_stage_samples": null,
-      "autotune_batches": [256, 512, 768, 1024, 1280],
+      "autotune_batches": [
+        256,
+        512,
+        768,
+        1024,
+        1280
+      ],
       "indefinite": true
     }
-  ]
+  ],
+  "training_standard": "unified_v1"
 }

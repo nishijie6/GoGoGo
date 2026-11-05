@@ -2,7 +2,7 @@
 
 Profiles change concurrency, batch sizes, and numerical precision.  They retain
 the model shape, search effort, and promotion rules so an existing training run
-can move between Windows computers without changing its learning objective.
+can move between computers without changing its learning objective.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from typing import Optional
 from .rl_config import RLTrainingConfig
 
 
-HARDWARE_TIERS = ("auto", "cpu", "low", "high")
+HARDWARE_TIERS = ("auto", "cpu", "mps", "low", "high")
 
 
 @dataclass(frozen=True)
@@ -33,6 +33,8 @@ class HardwareProfile:
 
     @property
     def backend(self) -> str:
+        if self.tier == "mps":
+            return "metal"
         return "eigen" if self.tier == "cpu" else "cuda"
 
     @property
@@ -45,13 +47,15 @@ class HardwareProfile:
     def game_threads(self) -> Optional[int]:
         if self.tier == "cpu":
             return min(4, max(1, self.cpu_threads))
+        if self.tier == "mps":
+            return 2
         if self.tier == "low":
             return 32
         return None
 
     @property
     def inference_cache_power(self) -> int:
-        return {"cpu": 16, "low": 18, "high": 20}[self.tier]
+        return {"cpu": 16, "mps": 16, "low": 18, "high": 20}[self.tier]
 
     @property
     def nn_server_threads(self) -> int:
@@ -62,6 +66,8 @@ class HardwareProfile:
 
         if self.tier == "cpu":
             limits = {9: 16, 13: 8, 19: 4}
+        elif self.tier == "mps":
+            limits = {9: 16, 13: 16, 19: 8}
         elif self.tier == "low" and self.memory_gib <= 4:
             limits = {9: 64, 13: 32, 19: 16}
         elif self.tier == "low":
@@ -78,7 +84,7 @@ class HardwareProfile:
 
         hardware = replace(config.hardware, device=self.device, precision=self.precision)
         self_play = config.self_play
-        if self.tier == "cpu":
+        if self.tier in ("cpu", "mps"):
             hardware = replace(
                 hardware,
                 allow_tf32=False,
@@ -86,12 +92,20 @@ class HardwareProfile:
                 data_loader_workers=0,
                 pin_memory=False,
             )
-            self_play = replace(
-                self_play,
-                workers=1,
-                games_per_iteration=min(self_play.games_per_iteration, 4),
-                inference_batch_size=1,
-            )
+            if self.tier == "mps":
+                self_play = replace(
+                    self_play,
+                    workers=min(self_play.workers, 2),
+                    games_per_iteration=min(self_play.games_per_iteration, 24),
+                    inference_batch_size=min(self_play.inference_batch_size, 4),
+                )
+            else:
+                self_play = replace(
+                    self_play,
+                    workers=1,
+                    games_per_iteration=min(self_play.games_per_iteration, 4),
+                    inference_batch_size=1,
+                )
         elif self.tier == "low":
             hardware = replace(
                 hardware,
@@ -126,6 +140,8 @@ class HardwareProfile:
         }
         if self.tier == "cpu":
             overrides["numEigenThreadsPerModel"] = max(1, self.cpu_threads)
+        elif self.tier == "mps":
+            overrides["metalDeviceToUseThread0"] = 0
         else:
             overrides["cudaDeviceToUse"] = self.gpu_index
             overrides["cudaUseFP16"] = self.use_fp16
@@ -150,14 +166,54 @@ def _cpu_profile(cpu_threads: int, reason: str) -> HardwareProfile:
     )
 
 
-def _unavailable(tier: str, cpu_threads: int, reason: str) -> HardwareProfile:
+def _detect_mps(torch, cpu_threads: int) -> HardwareProfile:
+    """Require a real Metal tensor operation; memory is an advisory shared budget."""
+
+    try:
+        backend = getattr(getattr(torch, "backends", None), "mps", None)
+        if backend is None or not backend.is_available():
+            raise RuntimeError("PyTorch 未检测到可用 MPS")
+        probe = torch.ones((2, 2), dtype=torch.float32, device="mps")
+        (probe * probe).sum().item()
+    except Exception as error:
+        raise ValueError(f"硬件档位 mps 需要可用的 Apple MPS：{error}") from error
+
+    memory_gib = 0.0
+    try:
+        memory_gib = torch.mps.recommended_max_memory() / (1024 ** 3)
+    except Exception:
+        # Older PyTorch builds may lack the advisory memory API.
+        pass
+    reason = "使用 Apple Metal (MPS)，float32；统一/共享内存与 CPU 共用"
+    if memory_gib > 0:
+        reason += f"，PyTorch 建议上限 {memory_gib:.1f} GiB（非独立显存）"
+    return HardwareProfile(
+        tier="mps",
+        device="mps",
+        precision="float32",
+        gpu_name="Apple Metal (MPS)",
+        memory_gib=memory_gib,
+        cpu_threads=min(cpu_threads, 4),
+        use_fp16=False,
+        reason=reason,
+    )
+
+
+def _unavailable(tier: str, cpu_threads: int, reason: str, torch=None) -> HardwareProfile:
+    if tier == "mps":
+        raise ValueError(f"硬件档位 mps 需要可用的 Apple MPS：{reason}")
     if tier != "auto":
         raise ValueError(f"硬件档位 {tier} 需要可用的 CUDA 显卡：{reason}")
+    if getattr(getattr(torch, "backends", None), "mps", None) is not None:
+        try:
+            return _detect_mps(torch, cpu_threads)
+        except ValueError as error:
+            reason += f"；{error}"
     return _cpu_profile(cpu_threads, reason)
 
 
 def detect_hardware(tier: str = "auto") -> HardwareProfile:
-    """Probe CUDA kernels and choose the working GPU with the most VRAM.
+    """Probe CUDA kernels, then try MPS when no CUDA device can run.
 
     CUDA discovery alone is insufficient: a wheel may list a new or old GPU
     whose architecture its kernels do not support.  A real, synchronized tensor
@@ -166,7 +222,7 @@ def detect_hardware(tier: str = "auto") -> HardwareProfile:
     """
 
     if tier not in HARDWARE_TIERS:
-        raise ValueError(f"未知硬件档位 {tier!r}；可选：auto、cpu、low、high")
+        raise ValueError(f"未知硬件档位 {tier!r}；可选：auto、cpu、mps、low、high")
     cpu_threads = max(1, os.cpu_count() or 1)
     if tier == "cpu":
         return _cpu_profile(cpu_threads, "用户指定 CPU 档位")
@@ -175,13 +231,15 @@ def detect_hardware(tier: str = "auto") -> HardwareProfile:
         torch = importlib.import_module("torch")
     except Exception as error:
         return _unavailable(tier, cpu_threads, f"无法加载 PyTorch：{error}")
+    if tier == "mps":
+        return _detect_mps(torch, cpu_threads)
     try:
         available = torch.cuda.is_available()
         count = torch.cuda.device_count() if available else 0
     except Exception as error:
-        return _unavailable(tier, cpu_threads, f"CUDA 初始化失败：{error}")
+        return _unavailable(tier, cpu_threads, f"CUDA 初始化失败：{error}", torch)
     if not available:
-        return _unavailable(tier, cpu_threads, "PyTorch 未检测到可用 CUDA")
+        return _unavailable(tier, cpu_threads, "PyTorch 未检测到可用 CUDA", torch)
 
     candidates = []
     failures = []
@@ -199,7 +257,7 @@ def detect_hardware(tier: str = "auto") -> HardwareProfile:
             failures.append(f"cuda:{index} 无法运行张量运算：{error}")
     if not candidates:
         reason = "；".join(failures) or "未找到可用 CUDA 设备"
-        return _unavailable(tier, cpu_threads, reason)
+        return _unavailable(tier, cpu_threads, reason, torch)
 
     memory_gib, index, name, capability = max(candidates, key=lambda item: item[0])
     use_fp16 = capability >= (7, 0)

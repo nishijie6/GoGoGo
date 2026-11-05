@@ -207,12 +207,13 @@ class KataGoRLRunner:
         project_root: Path = PROJECT_ROOT,
         run_root_override: Optional[Path] = None,
         hardware_profile: Optional[HardwareProfile] = None,
+        training_config: Optional[RLTrainingConfig] = None,
     ) -> None:
         self.project_root = project_root.resolve()
         self.config_path = (
             config_path if config_path.is_absolute() else self.project_root / config_path
         ).resolve()
-        self.config = load_rl_training_config(self.config_path)
+        self.config = training_config or load_rl_training_config(self.config_path)
         self.hardware_profile = hardware_profile
         if hardware_profile is not None:
             self.config = hardware_profile.apply(self.config)
@@ -231,13 +232,20 @@ class KataGoRLRunner:
         )
         if hardware_profile is not None and hardware_profile.backend == "eigen":
             self.katago_executable = self.katago_executable.parent / "cpu" / self.katago_executable.name
+        if self.config.hardware.device == "mps" and not self.katago_executable.is_file():
+            installed = shutil.which("katago")
+            if installed:
+                self.katago_executable = Path(installed)
+            elif Path("/opt/homebrew/bin/katago").is_file():
+                self.katago_executable = Path("/opt/homebrew/bin/katago")
         self.katago_source = self.project_root / "katago" / "source"
         self.python_source = self.katago_source / "python"
         self.selfplay_config = (
             self.katago_source / "cpp" / "configs" / "training" / "selfplay1.cfg"
         )
         self.model_kind = model_kind_for_config(self.config)
-        self.metric_store = RLMetricStore(self.run_root)
+        self.metric_store = RLMetricStore(self.run_root,
+            standard=getattr(self.config.evaluation, "standard", None))
 
     @property
     def models_dir(self) -> Path:
@@ -295,6 +303,8 @@ class KataGoRLRunner:
         if self.config.hardware.device == "cpu":
             # Official train.py auto-selects CUDA; hide it only in this child.
             environment["CUDA_VISIBLE_DEVICES"] = "-1"
+        if self.config.hardware.device == "mps":
+            environment["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
         if self.hardware_profile is not None:
             environment["OMP_NUM_THREADS"] = str(self.hardware_profile.cpu_threads)
             environment["MKL_NUM_THREADS"] = str(self.hardware_profile.cpu_threads)
@@ -348,16 +358,21 @@ class KataGoRLRunner:
                 "未安装 PyTorch；CPU 使用 requirements-rl-cpu.txt，CUDA 使用 requirements-rl.txt"
             ) from error
         cpu = self.config.hardware.device == "cpu"
-        if not cpu and not torch.cuda.is_available():
+        mps = self.config.hardware.device == "mps"
+        if mps and not torch.backends.mps.is_available():
+            raise KataGoRLRunnerError("PyTorch 未检测到可用的 MPS 设备")
+        if not cpu and not mps and not torch.cuda.is_available():
             raise KataGoRLRunnerError("PyTorch 未检测到可用的 CUDA 显卡")
         device = torch.device(self.config.hardware.device.replace("auto", "cuda:0"))
         index = device.index or 0
+        probe = torch.ones((2, 2), device=device)
+        (probe * probe).sum().item()
         version = self._run(
             [self.katago_executable, "version"],
             log_name="doctor.log",
         )
         if self.hardware_profile is not None:
-            expected = "eigen" if cpu else "cuda"
+            expected = self.hardware_profile.backend
             if expected not in version.casefold():
                 raise KataGoRLRunnerError(f"KataGo 引擎与选择的 {expected} 后端不符：{version.strip()}")
         result = {
@@ -368,13 +383,23 @@ class KataGoRLRunner:
             "torch_cuda": torch.version.cuda,
             "cudnn": torch.backends.cudnn.version(),
             "device": str(device),
-            "gpu": None if cpu else torch.cuda.get_device_name(index),
-            "capability": None if cpu else ".".join(str(part) for part in torch.cuda.get_device_capability(index)),
+            "gpu": None if cpu else "Apple GPU (Metal/MPS)" if mps else torch.cuda.get_device_name(index),
+            "capability": None if cpu or mps else ".".join(str(part) for part in torch.cuda.get_device_capability(index)),
         }
         if self.hardware_profile is not None:
             result["hardware"] = self.hardware_profile.to_dict()
         print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
         return result
+
+    def _targeted_positions_directory(self, has_model: bool) -> Optional[Path]:
+        if not has_model or not self.config.self_play.targeted_start_probability:
+            return None
+        directory = Path(self.config.self_play.targeted_positions_directory)
+        if not directory.is_absolute():
+            directory = self.project_root / directory
+        if not directory.is_dir() or not any(directory.glob("*.startposes.txt")):
+            raise KataGoRLRunnerError("定向采样目录不存在或缺少 .startposes.txt 局面文件")
+        return directory.resolve()
 
     def selfplay(
         self,
@@ -393,14 +418,7 @@ class KataGoRLRunner:
         if requested_games < 1:
             raise KataGoRLRunnerError("自我对弈局数必须至少为 1")
         has_model = any(self.models_dir.glob("*/model.bin.gz"))
-        targeted_directory = None
-        if has_model and self.config.self_play.targeted_start_probability:
-            directory = Path(self.config.self_play.targeted_positions_directory)
-            if not directory.is_absolute():
-                directory = self.project_root / directory
-            if not directory.is_dir() or not any(directory.glob("*.startposes.txt")):
-                raise KataGoRLRunnerError("定向采样目录不存在或缺少 .startposes.txt 局面文件")
-            targeted_directory = directory.resolve()
+        targeted_directory = self._targeted_positions_directory(has_model)
         overrides = build_selfplay_overrides(
             self.config,
             visits=(8 if smoke else None) if visits is None else visits,
@@ -465,7 +483,7 @@ class KataGoRLRunner:
             available = min(ledger.physical_rows, self.config.optimizer.replay_buffer_capacity)
             required_rows = max(required_rows, min(available, math.ceil(budget * 1.5)))
         workers = max(1, min(4, self.config.hardware.data_loader_workers))
-        rows_per_file = max(4096, batch * 16)
+        rows_per_file = self._shuffle_rows_per_file(batch)
         self._run(
             [
                 sys.executable,
@@ -501,6 +519,9 @@ class KataGoRLRunner:
         temporary_parent.replace(final_parent)
         print(f"已生成打乱数据：{final_parent}", flush=True)
         return final_parent
+
+    def _shuffle_rows_per_file(self, batch_size: Optional[int] = None) -> int:
+        return max(4096, (batch_size or self.config.optimizer.batch_size) * 16)
 
     def training_sample_budget(self, batch_size: int, *, new_data_rows: Optional[int] = None) -> int:
         budget = batch_size * self.config.optimizer.training_steps_per_iteration
@@ -571,6 +592,12 @@ class KataGoRLRunner:
             "-data-prefetch-depth",
             1,
         ]
+        if self.config.hardware.device in {"cpu", "mps"}:
+            command[1:1] = [
+                PROJECT_ROOT / "weiqi" / "katago_train.py",
+                "--device", self.config.hardware.device,
+                "--memory-fraction", self.config.hardware.gpu_memory_fraction,
+            ]
         if initial_checkpoint is not None:
             resolved_initial = initial_checkpoint.resolve()
             if not resolved_initial.is_file():

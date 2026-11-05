@@ -104,33 +104,42 @@ def read_champion_match(store, path, *, candidate, champion, board, samples):
             total = manifest.get("games")
             if isinstance(total, bool) or not isinstance(total, int) or total < 2 or total > 10000 or total % 2:
                 continue
-            counts = {"wins": 0, "losses": 0, "draws": 0}
-            events = []
-            completed_pairs = 0
-            modified = None
-            for index in range(total // 2):
-                try:
-                    pair = _pair(store, opponent / "pairs" / f"opening-{index:03d}")
-                except (OSError, ValueError, UnicodeError):
-                    continue
-                if pair is not None:
-                    for _, result in pair["games"]:
-                        counts[result] += 1
-                    events.extend(pair["events"])
-                    completed_pairs += int(pair["complete"])
-                    modified = max(modified or 0, pair["modified"])
-            games = sum(counts.values())
-            cumulative = {"wins": 0, "losses": 0, "draws": 0}
-            points = []
-            for index, (_, _, _, result) in enumerate(sorted(events), 1):
-                cumulative[result] += 1
-                points.append({"completed": index, **cumulative,
-                               "win_rate": cumulative["wins"] / index,
-                               "score_rate": (cumulative["wins"] + cumulative["draws"] / 2) / index})
-            return {"live": True, "candidate": candidate, "name": champion,
-                    "games": games, "total": total, **counts, "completed_pairs": completed_pairs,
-                    "win_rate": counts["wins"] / games if games else None,
-                    "score_rate": (counts["wins"] + counts["draws"] / 2) / games if games else None,
-                    "points": points,
-                    "updated_at": iso_time(modified) if modified else None}
+            return read_paired_match(store, opponent / "pairs", total, candidate, champion)
     return None
+
+
+def read_paired_match(store, pairs, total, candidate, champion):
+    """Read one attempt per opening, reusing cached SGF parsing."""
+    counts = {"wins": 0, "losses": 0, "draws": 0}
+    events = []
+    completed_pairs = 0
+    modified = None
+    for index in range(total // 2 if store.safe_path(pairs).is_dir() else 0):
+        try:
+            pair = _pair(store, pairs / f"opening-{index:03d}")
+        except (OSError, ValueError, UnicodeError):
+            continue
+        if pair is not None:
+            for _, result in pair["games"]:
+                counts[result] += 1
+            events.extend(pair["events"])
+            completed_pairs += int(pair["complete"])
+            modified = max(modified or 0, pair["modified"])
+    return match_totals(counts, total, candidate, champion, completed_pairs,
+                        [item[-1] for item in sorted(events)], iso_time(modified) if modified else None)
+
+
+def match_totals(counts, total, candidate, champion, completed_pairs, outcomes, updated_at=None):
+    games = sum(counts.values())
+    cumulative = {"wins": 0, "losses": 0, "draws": 0}
+    points = []
+    for index, result in enumerate(outcomes, 1):
+        cumulative[result] += 1
+        points.append({"completed": index, **cumulative,
+                       "win_rate": cumulative["wins"] / index,
+                       "score_rate": (cumulative["wins"] + cumulative["draws"] / 2) / index})
+    return {"live": True, "candidate": candidate, "name": champion,
+            "games": games, "total": total, **counts, "completed_pairs": completed_pairs,
+            "win_rate": counts["wins"] / games if games else None,
+            "score_rate": (counts["wins"] + counts["draws"] / 2) / games if games else None,
+            "points": points, "updated_at": updated_at}

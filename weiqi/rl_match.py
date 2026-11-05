@@ -187,6 +187,8 @@ def build_match_config(
     gpu_index: int = 0,
     opening_directory: Optional[Path] = None,
     hardware_profile: Optional[HardwareProfile] = None,
+    komi: float = 6.5,
+    max_moves_factor: float = 2.5,
 ) -> str:
     """Build a fixed-protocol, mirrored-color KataGo match configuration."""
 
@@ -196,8 +198,13 @@ def build_match_config(
     for path in checked_paths:
         if "\n" in str(path) or "\r" in str(path):
             raise ValueError("评测路径不能包含换行")
-    if board_size not in GoGame.SUPPORTED_SIZES or visits < 1 or games < 2 or games % 2:
+    if board_size not in (*GoGame.SUPPORTED_SIZES, 7, 8) or visits < 1 or games < 2 or games % 2:
         raise ValueError("棋盘、visits 或偶数局数无效")
+    if type(komi) not in (int, float) or not math.isfinite(komi):
+        raise ValueError("评测贴目必须是有限数值")
+    if (type(max_moves_factor) not in (int, float) or not math.isfinite(max_moves_factor)
+            or max_moves_factor <= 0 or not math.isfinite(board_size * board_size * max_moves_factor)):
+        raise ValueError("评测手数倍数必须是有限正数")
     values: list[tuple[str, object]] = [
         ("logSearchInfo", "false"),
         ("logMoves", "false"),
@@ -210,7 +217,7 @@ def build_match_config(
         ("nnModelFile1", baseline_model),
         ("numGameThreads", game_threads),
         ("numGamesTotal", games),
-        ("maxMovesPerGame", math.ceil(board_size * board_size * 2.5)),
+        ("maxMovesPerGame", math.ceil(board_size * board_size * max_moves_factor)),
         ("allowResignation", "false"),
         # KataGo's match loader requires these companion keys even when
         # resignation itself is disabled.
@@ -224,7 +231,7 @@ def build_match_config(
         ("bSizes", board_size),
         ("bSizeRelProbs", 1),
         ("komiAuto", "false"),
-        ("komiMean", 6.5),
+        ("komiMean", komi),
         ("komiStdev", 0.0),
         ("handicapProb", 0.0),
         ("maxVisits", visits),

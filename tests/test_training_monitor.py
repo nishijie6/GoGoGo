@@ -160,6 +160,41 @@ class EventTailTests(unittest.TestCase):
 
 
 class MonitorStoreTests(unittest.TestCase):
+    def test_mixed_unified_schedule_uses_samples_and_preserves_legacy_round(self):
+        run = self.run / "run"
+        write_json(run / "mixed_manifest.json", {"identity": {"board_sizes": [9, 19]}})
+        write_json(run / "metrics/latest.json", {"cycle": 50, "trained_samples": 10_000})
+        write_json(run / "promotion/state.json", {
+            "training_standard": "unified_v1", "next_samples": 12_000,
+            "next_cycle": 51, "promotions": 0})
+        snapshot = self.store.snapshot("run_a")
+        self.assertEqual(snapshot["training_standard"]["promotion_win_rate"], .55)
+        self.assertEqual(snapshot["evaluation_schedule"], {
+            "trained_samples": 10_000, "next_samples": 12_000, "remaining_samples": 2000})
+        self.assertEqual(snapshot["championship"]["next_cycle"], 51)
+
+    def test_mixed_health_exposes_common_pass_failure_even_without_legacy_warning(self):
+        run = self.run / "run"
+        write_json(run / "mixed_manifest.json", {"identity": {"board_sizes": [9]}})
+        write_json(run / "health_by_board.json", {"by_board": {"9": {
+            "estimable": True, "pass_move_rate": .33, "warnings": [],
+            "health_reasons": ["pass_move_rate"], "status": "needs_review"}}})
+        row = self.store.snapshot("run_a")["mixed"]["health_by_board"]["9"]
+        self.assertEqual(row["health_reasons"], ["pass_move_rate"])
+        self.assertEqual(row["status"], "needs_review")
+
+    def test_curriculum_unified_schedule_does_not_relabel_old_match_rules(self):
+        write_json(self.run / "state.json", {"active_board_size": 9, "stages": {
+            "9x9": {"training_standard": "unified_v1", "samples": 1000,
+                    "next_evaluation_sample": 51200, "evaluations": [{
+                        "stage_samples": 100, "match": {"games": 10, "candidate_wins": 6,
+                        "draws": 0, "baseline_wins": 4, "wilson_lower": .3},
+                        "baseline_model": "old"}]}}})
+        snapshot = self.store.snapshot("run_a")
+        self.assertEqual(snapshot["training_standard"]["name"], "unified_v1")
+        self.assertEqual(snapshot["evaluation_schedule"]["remaining_samples"], 50200)
+        self.assertNotIn("training_standard", snapshot["evaluations"][0])
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -244,6 +279,125 @@ class MonitorStoreTests(unittest.TestCase):
         self.assertEqual(rows[0]["iteration"], 50)
         path.write_text('{"cycle":1}\n', encoding="utf-8")
         self.assertEqual(len(self.store.snapshot("run_a")["diagnostics"]), 1)
+
+    def test_nested_mixed_run_exposes_pending_score_and_separate_board_health(self):
+        run = self.run / "run"
+        write_json(run / "mixed_manifest.json", {"identity": {"board_sizes": [9, 19]}})
+        write_json(run / "metrics/latest.json", {"cycle": 50, "trained_samples": 12000,
+                   "data_rows": 5000, "selfplay_stage_seconds": 22, "shuffle_seconds": 4, "train_seconds": 7})
+        write_json(run / "health_by_board.json", {"by_board": {"19": {"black_score_rate": .25, "warnings": []}}})
+        candidate, champion = "gogogo-s12000-d5000", "gogogo-s10000-d4500"
+        write_json(run / "promotion/state.json", {"champion": champion, "promotions": 1, "next_cycle": 50,
+                   "pending": {"candidate": candidate, "cycle": 50, "sha256": "a"}, "champion_sha256": "b"})
+        screen = run / "promotion" / "evaluations" / f"cycle-50-{candidate}" / "screen"
+        write_json(screen / "evaluation_manifest.json", {"protocol": {"board_sizes": [9, 19], "games_per_board": 2},
+                   "candidate": {"model_name": candidate, "sha256": "a"},
+                   "baseline": {"model_name": champion, "sha256": "b"}})
+        write_json(screen / "progress.json", {"status": "running", "current_board": 9})
+        pair = screen / "boards/9x9/pairs/opening-000"
+        (pair / "sgfs").mkdir(parents=True)
+        (pair / "match.cfg").write_text("test")
+        (pair / "sgfs/match.sgfs").write_text("(;SZ[9]PB[candidate]PW[baseline]RE[B+1.5])")
+        self.assertEqual(self.store.runs()["default_run"], "run_a")
+        snapshot = self.store.snapshot("run_a")
+        self.assertEqual(snapshot["source"], "mixed")
+        self.assertEqual(snapshot["current"]["iteration"], 50)
+        self.assertEqual(snapshot["mixed"]["health_by_board"]["19"]["black_score_rate"], .25)
+        self.assertEqual(snapshot["diagnostics"][-1]["shuffle_seconds"], 4)
+        self.assertEqual(snapshot["championship"]["current"]["label"], "T1")
+        live = snapshot["championship"]["live_match"]
+        self.assertEqual((live["games"], live["total"], live["wins"], live["win_rate"]), (1, 4, 1, 1))
+        self.assertEqual([row["games"] for row in live["by_board"]], [1, 0])
+
+        confirmation = screen.parent / "confirmation"
+        write_json(confirmation / "evaluation_manifest.json", {"protocol": {"board_sizes": [9, 19], "games_per_board": 2},
+                   "candidate": {"model_name": candidate, "sha256": "a"},
+                   "baseline": {"model_name": champion, "sha256": "b"}})
+        write_json(confirmation / "progress.json", {"status": "running", "current_board": 9})
+        confirm_live = self.store.snapshot("run_a")["championship"]["live_match"]
+        self.assertEqual(confirm_live["evaluation_stage"], "confirmation")
+        self.assertEqual(confirm_live["games"], 0)
+        self.assertIsNone(confirm_live["win_rate"])
+
+        write_json(screen / "summary.json", {"status": "complete", "results_by_board": {
+            "9": {"games": 2, "candidate_wins": 1, "baseline_wins": 1, "draws": 0},
+            "19": {"games": 2, "candidate_wins": 0, "baseline_wins": 2, "draws": 0}}})
+        write_json(screen.parent / "decision.json", {"cycle": 50, "candidate": candidate, "baseline": champion,
+                   "candidate_sha256": "a", "baseline_sha256": "b", "outcome": "evaluation_failed"})
+        write_json(run / "promotion/state.json", {"champion": champion, "promotions": 1, "next_cycle": 100,
+                   "pending": None, "champion_sha256": "b"})
+        finished = self.store.snapshot("run_a")["championship"]
+        self.assertIsNone(finished["live_match"])
+        self.assertEqual(finished["rounds"][0]["outcome"], "evaluation_failed")
+        self.assertEqual(finished["rounds"][0]["evaluation_stage"], "screen")
+        self.assertEqual(finished["rounds"][0]["win_rate"], .25)
+        self.assertEqual(self.store.champion_curve("run_a", 50)["games"], 4)
+        write_json(run / "promotion/state.json", {"champion": champion, "promotions": 1,
+                   "halted": {"reasons": ["19:black_score_rate"]}})
+        self.assertEqual(self.store.runs()["runs"][0]["status"], "failed")
+        self.assertEqual(self.store.snapshot("run_a")["status"]["state"], "failed")
+
+    def test_mixed_pending_evaluation_uses_its_own_board_subset(self):
+        candidate, champion = "gogogo-s12000-d5000", "gogogo-s10000-d4500"
+        write_json(self.run / "mixed_manifest.json", {"identity": {"board_sizes": [7, 8, 9, 13, 19]}})
+        write_json(self.run / "promotion/state.json", {
+            "champion": champion, "champion_sha256": "b", "boards": [7, 8, 9, 13, 19],
+            "pending": {"candidate": candidate, "cycle": 50, "sha256": "a",
+                        "evaluation_boards": [8, 9, 13, 19]}})
+        screen = self.run / "promotion/evaluations" / f"cycle-50-{candidate}" / "screen"
+        write_json(screen / "evaluation_manifest.json", {
+            "protocol": {"board_sizes": [8, 9, 13, 19], "games_per_board": 2},
+            "candidate": {"model_name": candidate, "sha256": "a"},
+            "baseline": {"model_name": champion, "sha256": "b"}})
+        pair = screen / "boards/8x8/pairs/opening-000"
+        (pair / "sgfs").mkdir(parents=True)
+        (pair / "match.cfg").write_text("test")
+        (pair / "sgfs/match.sgfs").write_text("(;SZ[8]PB[candidate]PW[baseline]RE[B+1.5])")
+
+        championship = self.store.snapshot("run_a")["championship"]
+        self.assertEqual(championship["boards"], [7, 8, 9, 13, 19])
+        live = championship["live_match"]
+        self.assertIsNotNone(live)
+        self.assertEqual((live["games"], live["total"], live["wins"]), (1, 8, 1))
+        self.assertEqual([row["board"] for row in live["by_board"]], [8, 9, 13, 19])
+
+    def test_mixed_history_and_curve_use_each_decision_board_list(self):
+        champion = "gogogo-s10000-d4500"
+        write_json(self.run / "mixed_manifest.json", {"identity": {"board_sizes": [7, 8, 9, 13, 19]}})
+        for cycle, boards, decision_fields in (
+            (50, [7, 8, 9, 13, 19], {}),
+            (100, [8, 9, 13, 19], {"evaluation_boards": [8, 9, 13, 19], "require_confidence": False}),
+        ):
+            candidate = f"gogogo-s{cycle * 1000}-d5000"
+            evaluation = self.run / "promotion/evaluations" / f"cycle-{cycle}-{candidate}"
+            write_json(evaluation / "decision.json", {
+                "cycle": cycle, "candidate": candidate, "baseline": champion, "outcome": "promoted",
+                "candidate_sha256": "a", "baseline_sha256": "b", **decision_fields})
+            stage = evaluation / "confirmation"
+            write_json(stage / "evaluation_manifest.json", {
+                "protocol": {"board_sizes": boards, "games_per_board": 2},
+                "candidate": {"model_name": candidate, "sha256": "a"},
+                "baseline": {"model_name": champion, "sha256": "b"}})
+            write_json(stage / "summary.json", {"status": "complete", "results_by_board": {
+                str(board): {"games": 2, "candidate_wins": 2, "baseline_wins": 0, "draws": 0}
+                for board in boards}})
+            for board in boards:
+                pair = stage / "boards" / f"{board}x{board}" / "pairs/opening-000"
+                (pair / "sgfs").mkdir(parents=True)
+                (pair / "match.cfg").write_text("test")
+                (pair / "sgfs/match.sgfs").write_text(
+                    f"(;SZ[{board}]PB[candidate]PW[baseline]RE[B+1.5])"
+                    f"(;SZ[{board}]PB[baseline]PW[candidate]RE[W+1.5])")
+
+        old, new = self.store.snapshot("run_a")["championship"]["rounds"]
+        self.assertEqual((old.get("games"), new.get("games")), (10, 8))
+        self.assertEqual((old["require_confidence"], new["require_confidence"]), (True, False))
+        self.assertEqual([row["board"] for row in new["by_board"]], [8, 9, 13, 19])
+        for cycle, expected in ((50, 10), (100, 8)):
+            with self.subTest(cycle=cycle):
+                curve = self.store.champion_curve("run_a", cycle)
+                self.assertEqual(len(curve["points"]), expected)
+                self.assertEqual(curve["points"][-1]["wins"], expected)
 
     def test_old_session_sidecar_cannot_mark_new_session_completed(self):
         write_json(self.run / "monitor.json", {"session_id": "session_a", "status": "completed",

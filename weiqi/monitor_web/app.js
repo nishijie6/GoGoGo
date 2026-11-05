@@ -7,9 +7,14 @@
     training: "模型训练", position_diagnostics: "固定局面诊断", opponent_pool: "固定对手池评估",
     screening: "早期筛选", evaluation: "晋级评估", checkpoint: "保存检查点",
     benchmark: "性能测试", completed: "训练结束", idle: "等待训练", unknown: "等待阶段信息",
+    mixed_training: "混合棋盘训练", promotion_waiting: "等待初始冠军", promotion_pending: "正在准备晋级评测",
+    promotion_screen: "晋级初筛", promotion_confirmation: "晋级确认赛", promotion_health: "候选自对弈健康验收",
   };
   const states = { running: "训练中", paused: "已暂停", completed: "已完成", stopped: "已停止", failed: "训练异常", stale: "数据未更新", historical: "历史记录", empty: "暂无数据" };
   const roles = { training: "训练采样", pool: "对手池", screening: "早期筛选", evaluation: "晋级评估" };
+  const promotionOutcomes = { promoted: "已晋级", health_rejected: "健康验收未通过",
+    confirmation_rejected: "确认赛未通过", screen_rejected: "初筛未通过", evaluation_failed: "评测失败" };
+  const promotionStage = (key) => ({ screen: "初筛", confirmation: "确认赛" }[key] || "评测");
   const eventNames = {
     started: "训练启动", ready: "模型就绪", iteration_started: "开始新一轮", selfplay_schedule: "对弈计划已生成",
     game_started: "对局开始", game_completed: "对局完成", game_finished: "对局完成", training_step: "模型参数更新",
@@ -449,17 +454,22 @@
     return svg;
   }
   function renderIntegrated(snapshot) {
-    const signature = JSON.stringify([snapshot.run?.id, snapshot.diagnostics, snapshot.evaluations, snapshot.health, snapshot.curriculum, snapshot.championship]);
+    const signature = JSON.stringify([snapshot.run?.id, snapshot.diagnostics, snapshot.evaluations, snapshot.health,
+      snapshot.curriculum, snapshot.mixed, snapshot.championship?.current]);
     if (signature === integrationSignature) return;
     integrationSignature = signature;
     const legacy = snapshot.source === "legacy";
-    text("source-label", legacy ? "旧版 KataGo 历史" : "实时训练记录");
+    const mixed = snapshot.mixed;
+    text("source-label", mixed ? "KataGo 混训" : legacy ? "KataGo 课程" : "实时训练记录");
     const rows = list(snapshot.diagnostics);
     const cards = [
-      [legacy ? "累计训练样本" : "回放样本", [["samples", "样本数", "#2d7b65"]]],
+      [legacy || mixed ? "累计训练样本" : "回放样本", [["samples", "样本数", "#2d7b65"]]],
       ["总训练损失", [["loss", "总损失", "#2d7b65"]]],
       ["策略与价值损失", [["policy_loss", "策略损失", "#c3a36b"], ["value_loss", "价值损失", "#718bb5"]]],
-      [legacy ? "参数训练吞吐（样本 / 秒）" : "自我对弈采样（样本 / 秒）", [["samples_per_second", "样本 / 秒", "#2d7b65"]]],
+      ...(mixed ? [
+        ["自对弈产出（样本 / 小时）", [["data_rows_per_hour", "样本 / 小时", "#2d7b65"]]],
+        ["各环节耗时（秒）", [["selfplay_stage_seconds", "自对弈", "#2d7b65"], ["shuffle_seconds", "洗牌", "#c3a36b"], ["train_seconds", "训练", "#718bb5"]]],
+      ] : [[legacy ? "参数训练吞吐（样本 / 秒）" : "自我对弈采样（样本 / 秒）", [["samples_per_second", "样本 / 秒", "#2d7b65"]]]]),
     ].map(([title, fields]) => {
       const card = element("article", "diagnostic-card");
       card.append(element("h3", "", title), compactChart(rows, fields));
@@ -474,14 +484,32 @@
       ["黑方得分率", percent(h.black_score_rate)], ["极端结果", percent(h.extreme_rate)], ["无效棋局", percent(h.invalid_rate)], ["开局双虚手", percent(h.double_pass_rate)]];
     $("health-metrics").hidden = !snapshot.health;
     $("health-metrics").replaceChildren(...health.map(([label, value]) => { const item = element("div"); item.append(element("dt", "", label), element("dd", "", value)); return item; }));
+    $("board-health").hidden = !mixed;
+    $("board-health-body").replaceChildren(...list(mixed?.boards).map((board) => {
+      const row = mixed.health_by_board?.[board] || {};
+      const flags = { black_score_rate: "偏色", short_game_rate: "短局偏多", early_double_pass_rate: "开局双停",
+        no_result_rate: "无结果偏多", invalid_rate: "无效棋局偏多", pass_move_rate: "停着偏多",
+        insufficient_games: "样本不足", extreme_margin_rate: "大分差偏多（观察）" };
+      const warnings = [...new Set([...list(row.warnings), ...list(row.health_reasons)])];
+      return tableRow([board + " 路", count(row.window_games), percent(row.black_score_rate), percent(row.short_game_rate),
+        percent(row.early_double_pass_rate), percent(row.pass_move_rate), percent(row.extreme_margin_rate),
+        row.estimable ? warnings.map((key) => flags[key] || key).join("、") || "正常" : "样本不足"]);
+    }));
     const c = snapshot.curriculum;
-    $("curriculum-detail").hidden = !c?.board_size;
-    text("curriculum-detail", c ? `课程棋盘 ${c.board_size} × ${c.board_size} · 已训练 ${count(c.samples)} 样本 · 下次固定基准评测 ${count(c.next_evaluation_sample)} 样本 · 连续通过 ${count(c.passes)} 次 · 冠军 ${snapshot.championship?.current?.label || c.champion || "未记录"} · 磁盘剩余 ${finite(c.disk_free_gib) ? c.disk_free_gib.toFixed(1) : "—"} GiB` : "");
-    text("diagnostic-note", `最多显示最近 300 轮。${legacy ? "损失为旧版检查点移动平均，吞吐为训练样本 / 参数训练耗时。" : "吞吐为新增样本 / 自我对弈耗时。"}损失下降不等同于棋力提升。`);
+    const standard = snapshot.training_standard;
+    const schedule = snapshot.evaluation_schedule;
+    $("curriculum-detail").hidden = !c?.board_size && !mixed && !standard;
+    const context = mixed ? `${list(mixed.boards).join("、")} 路混训 · ${mixed.device?.toUpperCase() || "设备未记录"} · 累计生成 ${count(snapshot.current.replay_samples)} 条数据 · 最新候选 ${mixed.model || "—"}` : c ? `课程棋盘 ${c.board_size} × ${c.board_size} · 已训练 ${count(c.samples)} 样本 · 下次固定基准评测 ${count(c.next_evaluation_sample)} 样本 · 连续通过 ${count(c.passes)} 次 · 磁盘剩余 ${finite(c.disk_free_gib) ? c.disk_free_gib.toFixed(1) : "—"} GiB` : "";
+    const policy = standard ? `统一标准 v1 · 晋级得分率 ≥ ${percent(standard.promotion_win_rate)} · 各棋盘 ≥ ${percent(standard.board_score_floor)}${schedule ? ` · 距下次评测 ${count(schedule.remaining_samples)} 训练样本` : ""}` : "";
+    text("curriculum-detail", [context, policy].filter(Boolean).join(" · "));
+    text("diagnostic-note", mixed ? "分棋盘表统计自对弈健康。候选对冠军胜率见评测区。" : "最多显示最近 300 轮。损失下降不等同于棋力提升。");
     legacyTrendCount = legacy ? (snapshot.championship ? renderChampionTrend(snapshot.championship) : renderLegacyTrend(snapshot.evaluations)) : 0;
+    if (mixed) renderMixedHistory(snapshot.championship?.rounds);
     const oldValue = $("baseline-select").value;
     baselineGroups = new Map();
     for (const row of list(snapshot.evaluations)) {
+      if (snapshot.championship && row.role === "champion" &&
+          (mixed || row.stage === snapshot.championship.stage)) continue;
       const identity = row.sha256 || row.name || "未记录对手";
       const key = JSON.stringify([row.stage, row.role, identity, row.simulations_per_move, row.games, row.max_game_length_factor, row.promotion_test, row.paired?.confidence, row.interval?.method]);
       if (!baselineGroups.has(key)) baselineGroups.set(key, []);
@@ -497,6 +525,7 @@
     $("baseline-select").replaceChildren(...options);
     $("baseline-select").disabled = !baselineGroups.size;
     if (baselineGroups.has(oldValue)) $("baseline-select").value = oldValue;
+    $("baselines").hidden = !baselineGroups.size;
     renderBaseline();
   }
   function renderChampionTrend(championship) {
@@ -583,6 +612,83 @@
     $("baseline-body").replaceChildren(...table);
   }
   $("baseline-select").addEventListener("change", renderBaseline);
+  function tableRow(values) {
+    const row = element("tr");
+    row.append(...values.map((value) => element("td", "", value)));
+    return row;
+  }
+
+  function renderMixedHistory(rounds) {
+    const table = element("table");
+    const head = element("thead");
+    const header = element("tr");
+    header.append(...["训练轮次", "对手", "评测阶段", "胜 / 负 / 和", "得分率", "结果"].map((label) => element("th", "", label)));
+    head.append(header);
+    const body = element("tbody");
+    body.append(...list(rounds).slice(-40).reverse().map((row) => {
+      const item = tableRow([count(row.iteration), opponentName(row.name), promotionStage(row.evaluation_stage),
+        `${count(row.wins)} / ${count(row.losses)} / ${count(row.draws)}`, percent(row.score_rate),
+        promotionOutcomes[row.outcome] || "—"]);
+      if (list(row.health_reasons).length) item.title = row.health_reasons.join("、");
+      return item;
+    }));
+    table.append(head, body);
+    const scroll = element("div", "table-scroll");
+    scroll.tabIndex = 0;
+    scroll.setAttribute("aria-label", "混训历史评测");
+    scroll.append(table);
+    $("legacy-trend").replaceChildren(scroll);
+  }
+
+  function renderMixedPromotion(snapshot) {
+    const championship = snapshot.championship;
+    const champion = championship.current;
+    const active = championship.live_match;
+    const match = active || championship.match;
+    const label = champion?.label || "待登记";
+    const stage = promotionStage(match?.evaluation_stage);
+    const winRate = rate(match?.win_rate);
+    text("rate-title", active ? `${stage} · 候选对冠军胜率` : "最近候选对冠军胜率");
+    metricValue("win-rate", winRate == null ? "—" : (winRate * 100).toFixed(1), winRate == null ? "" : "%");
+    $("win-rate-track").style.width = `${(winRate ?? 0) * 100}%`;
+    text("rate-caption", active ? `${count(active.wins)} 胜 / ${count(active.losses)} 负 / ${count(active.draws)} 和`
+      : match ? `第 ${count(match.iteration)} 轮 · ${stage} · 对手 ${opponentName(match.name)}` : "等待首轮冠军挑战");
+    text("score-rate", match ? `含和棋得分率 ${percent(match.score_rate)}` : "评测开始后显示胜率");
+    text("opponent-title", "当前冠军");
+    text("current-opponent", label);
+    $("current-opponent").title = champion?.model || "";
+    text("opponent-caption", champion?.model || "等待初始模型通过健康检查");
+    text("opponent-hash", `累计晋级 ${count(championship.promotions)} 次`);
+    text("iteration-caption", `累计训练 ${count(snapshot.mixed.samples)} 样本`);
+    text("best-iteration", snapshot.evaluation_schedule ? `下次晋级评测 · 累计 ${count(snapshot.evaluation_schedule.next_samples)} 样本` : finite(championship.next_cycle) ? `下次晋级评测 · 第 ${count(championship.next_cycle)} 轮` : "等待评测安排");
+    text("training-steps", "");
+    text("detail-title", "分棋盘评测");
+    text("batch-tag", active?.live ? "评测中" : championship.phase === "promotion_health" ? "健康验收中"
+      : match ? promotionOutcomes[match.outcome] || "已完成" : "等待评测");
+    text("batch-context", active ? `${stage} · ${active.current_board ? `当前 ${active.current_board} 路` : "汇总已保存棋谱"}`
+      : match ? `第 ${count(match.iteration)} 轮 · ${stage}` : "晋级评测开始后显示各棋盘比分");
+    $("confidence-note").hidden = !list(match?.health_reasons).length && !finite(match?.interval?.lower);
+    text("confidence-note", list(match?.health_reasons).join("、") ||
+      (finite(match?.interval?.lower) ? `确认赛配对得分下界 ${percent(match.interval.lower)}${match.require_confidence === false ? "（仅供参考）" : ""}` : ""));
+    $("board-match").hidden = !list(match?.by_board).length;
+    $("board-match-body").replaceChildren(...list(match?.by_board).map((row) =>
+      tableRow([row.board + " 路", `${count(row.games)} / ${count(row.total)} 局`,
+        `${count(row.wins)} / ${count(row.losses)} / ${count(row.draws)}`, percent(row.win_rate)])));
+    if (active?.live) {
+      const progress = active.total ? active.games / active.total * 100 : 0;
+      metricValue("progress-value", count(active.games), ` / ${count(active.total)} 局`);
+      $("progress-fill").style.width = `${progress}%`;
+      $("phase-progress").setAttribute("aria-valuenow", String(Math.round(progress)));
+      text("progress-caption", `${stage} · 完成 ${count(active.completed_pairs)} 组换色对局`);
+    } else {
+      text("progress-caption", championship.phase === "promotion_health" ? "对战已结束，正在检查候选自对弈"
+        : championship.pending ? "等待评测棋谱" : "训练轮次完成后更新指标");
+    }
+    text("trend-title", "评测与晋级");
+    text("history-count", `${count(list(championship.rounds).length)} 轮评测`);
+    text("trend-note", "初筛和确认赛分别计分。历史列表优先显示已经完成的确认赛。");
+  }
+
   function renderSnapshot(snapshot) {
     lastSnapshot = snapshot;
     text("trend-title", snapshot.championship ? "每轮冠军挑战胜率" : "评估胜率趋势");
@@ -610,14 +716,20 @@
     renderEvents(snapshot.events);
     renderIntegrated(snapshot);
     const legacy = snapshot.source === "legacy";
-    $("dashboard").classList.toggle("legacy-dashboard", legacy);
-    $("legacy-trend").hidden = !legacy || !legacyTrendCount;
-    $("chart-area").hidden = legacy && legacyTrendCount > 0;
-    $("trend-legend").hidden = legacy;
-    $("opponents").hidden = legacy;
-    $("events").hidden = legacy;
-    document.querySelector('a[href="#opponents"]').hidden = legacy;
-    document.querySelector('a[href="#events"]').hidden = legacy;
+    const mixed = snapshot.source === "mixed";
+    const katago = legacy || mixed;
+    $("dashboard").classList.toggle("legacy-dashboard", katago);
+    $("dashboard").classList.toggle("mixed-dashboard", mixed);
+    $("phase-card").hidden = mixed && !snapshot.championship?.pending;
+    $("legacy-trend").hidden = mixed ? !list(snapshot.championship?.rounds).length : !legacy || !legacyTrendCount;
+    $("chart-area").hidden = mixed || (legacy && legacyTrendCount > 0);
+    $("trend-legend").hidden = katago;
+    $("opponents").hidden = katago;
+    $("events").hidden = katago;
+    $("board-match").hidden = true;
+    $("gpu-panel").hidden = mixed && !hardwareAvailable;
+    document.querySelector('a[href="#opponents"]').hidden = katago;
+    document.querySelector('a[href="#events"]').hidden = katago;
     text("trend-note", legacy
       ? "每个点是一次独立评测；滚动冠军每次晋级后更换，对手不同，所以点不连线。竖线为统计区间，横轴为该棋盘阶段的累计训练样本。"
       : "每轮对手可能变化，胜率不能直接作为棋力增长曲线；缺失数据保留空档。");
@@ -638,7 +750,9 @@
         text("confidence-note", `${batch.interval.method} ${percent(batch.interval.lower)}–${percent(batch.interval.upper)}`);
       }
     }
-    if (snapshot.championship) renderChampionship(snapshot.championship);
+    if (mixed) {
+      renderMixedPromotion(snapshot);
+    } else if (snapshot.championship) renderChampionship(snapshot.championship);
   }
 
   function renderChampionship(championship) {
@@ -692,6 +806,7 @@
     }
   }
   let gpuHistory = [];
+  let hardwareAvailable = false;
 
   function gpuMeter(label, value, caption) {
     const block = document.createElement("div");
@@ -774,7 +889,8 @@
     if (Array.isArray(hardware?.history)) gpuHistory = hardware.history;
     const gpus = hardware?.available ? list(hardware.gpus) : [];
     text("gpu-updated", hardware?.sampled_at ? `采样于 ${timestamp(hardware.sampled_at)}` : "数据不可用");
-    if (!hardware?.available || !gpus.length) {
+    hardwareAvailable = Boolean(hardware?.available && gpus.length);
+    if (!hardwareAvailable) {
       const message = document.createElement("p");
       message.className = "gpu-unavailable";
       message.textContent = hardware?.reason || "暂时无法读取 GPU 状态";
@@ -821,8 +937,9 @@
     if (!championship) return;
     const rounds = list(championship.rounds);
     const choices = [];
-    if (championship.live_match) choices.push(["live", `本轮实时 · 对 ${championship.current?.label || "当前冠军"}`]);
-    for (const row of rounds.slice().reverse()) choices.push([String(row.champion_round), `第 ${count(row.champion_round)} 轮 · 对 ${row.champion_label || "历史冠军"} · 已结束`]);
+    const mixed = snapshot.source === "mixed";
+    if (championship.live_match) choices.push(["live", `本轮 · ${mixed ? promotionStage(championship.live_match.evaluation_stage) : "实时评测"} · 对 ${championship.current?.label || "当前冠军"}`]);
+    for (const row of rounds.slice().reverse()) choices.push([String(row.champion_round), `第 ${count(row.champion_round)} 轮 · ${mixed ? promotionOutcomes[row.outcome] || "已结束" : `对 ${row.champion_label || "历史冠军"} · 已结束`}`]);
     const selected = curvePinned && choices.some(([key]) => key === curveSelection) ? curveSelection : choices[0]?.[0] || "";
     curveSelection = selected;
     const optionsSignature = JSON.stringify(choices);
@@ -843,7 +960,7 @@
     const label = choices.find(([key]) => key === selected)[1];
     if (selected === "live") { renderEvaluationCurve(championship.live_match, label); return; }
     const row = rounds.find((item) => String(item.champion_round) === selected);
-    const cacheKey = JSON.stringify([snapshot.run.id, championship.stage, row.candidate, row.name, row.samples]);
+    const cacheKey = JSON.stringify([snapshot.run.id, championship.stage, row.candidate, row.name, row.samples, selected]);
     let curve = completedCurves.get(cacheKey);
     try {
       if (!curve) {

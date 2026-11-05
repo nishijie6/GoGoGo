@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "board_sizes": [
+    7,
+    8,
+    9,
+    13,
+    19
+  ],
+  "board_weights": [
+    2,
+    2,
+    3,
+    2,
+    1
+  ],
+  "shuffle_rows_per_file": 256,
+  "promotion": {
+    "standard": "unified_v1",
+    "evaluation_boards": [
+      8,
+      9,
+      13,
+      19
+    ],
+    "parallel_pairs": 2
+  },
+  "mps_game_threads": 8,
+  "mps_hybrid_inference": true,
+  "training": {
+    "schema_version": 1,
+    "preset": "high_performance",
+    "overrides": {
+      "game": {
+        "board_size": 19,
+        "komi": 6.5
+      },
+      "hardware": {
+        "device": "mps",
+        "precision": "float32",
+        "gpu_memory_fraction": 0.6,
+        "allow_tf32": false,
+        "compile_model": false,
+        "data_loader_workers": 0,
+        "pin_memory": false
+      },
+      "network": {
+        "channels": 128,
+        "residual_blocks": 10
+      },
+      "search": {
+        "simulations_per_move": 32,
+        "dirichlet_alpha": 0.03,
+        "full_search_probability": 0.5,
+        "fast_simulations_per_move": 8,
+        "root_temperature": 1.0,
+        "temperature_moves": 20
+      },
+      "self_play": {
+        "workers": 2,
+        "games_per_iteration": 24,
+        "inference_batch_size": 4,
+        "max_game_length_factor": 3.0,
+        "resign_threshold": null,
+        "init_games_with_policy": false,
+        "early_fork_game_probability": 0.0,
+        "fork_game_probability": 0.0
+      },
+      "optimizer": {
+        "batch_size": 8,
+        "replay_buffer_capacity": 50000,
+        "minimum_replay_size": 512,
+        "training_steps_per_iteration": 128
+      },
+      "runtime": {
+        "output_directory": "training_runs/katago_existing_model_gated_20261030/run",
+        "random_seed": 20261024,
+        "keep_checkpoints": 8,
+        "pause_while_game_is_active": false
+      },
+      "evaluation": {
+        "standard": "unified_v1"
+      }
+    }
+  }
+}

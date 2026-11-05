@@ -41,6 +41,7 @@ from .rl_curriculum import (
     load_curriculum_config,
     validate_training_profiles,
 )
+from .training_standard import get_training_standard
 from .rl_curriculum_cleanup import CleanupSteps
 from .rl_curriculum_dashboard import render_curriculum_dashboard
 from .rl_curriculum_evaluation import EvaluationSteps
@@ -111,12 +112,17 @@ class CurriculumRuntime(EvaluationSteps, TransitionSteps, CleanupSteps):
         options = {}
         if self.hardware_profile is not None:
             options["hardware_profile"] = self.hardware_profile
-        return self.runner_factory(
+        runner = self.runner_factory(
             config_path=stage.config_path(self.project_root),
             project_root=self.project_root,
             run_root_override=run_root_override,
             **options,
         )
+        standard_name = getattr(self.config, "training_standard", None)
+        standard = get_training_standard(standard_name)
+        if standard is not None:
+            runner.metric_store.standard = standard
+        return runner
 
     def _stage_runner(self, state: CurriculumState) -> KataGoRLRunner:
         return self._make_runner(self.config.stages[state.active_stage_index])
@@ -152,6 +158,7 @@ class CurriculumRuntime(EvaluationSteps, TransitionSteps, CleanupSteps):
     def _adopt_existing_9x9(self) -> CurriculumState:
         existing = self.store.load()
         if existing is not None:
+            self.controller.apply_training_standard(existing)
             return existing
         runner = self._make_runner(self.config.stages[0])
         models = self._accepted_models(runner)
@@ -222,6 +229,7 @@ class CurriculumRuntime(EvaluationSteps, TransitionSteps, CleanupSteps):
                     raise CurriculumStateError("只可在训练或评测阶段执行独立评测")
                 if any(
                     row.get("candidate_model") == state.active.latest_model and row.get("opponents")
+                    and self._same_training_standard(row)
                     for row in state.active.evaluations
                 ):
                     self._render_dashboard(state)
@@ -256,29 +264,35 @@ class CurriculumRuntime(EvaluationSteps, TransitionSteps, CleanupSteps):
             # 128 result-less "ghost games" and dilute every health rate.
             if "sgf_entries" not in record:
                 continue
-            normalized.append(
-                {
-                    "games": record.get("sgf_entries", 0),
-                    "black_wins": record.get("black_wins", 0),
-                    "white_wins": record.get("white_wins", 0),
-                    "draws": record.get("draws", 0),
-                    "immediate_double_pass_games": record.get(
-                        "opening_double_pass_games",
-                        record.get("immediate_double_pass_games", 0),
-                    ),
-                    "extreme_games": record.get(
-                        "extreme_result_games", record.get("extreme_games", 0)
-                    ),
-                    "invalid_games": record.get("no_result_games", 0),
-                    "damaged_games": record.get("damaged_games", 0),
-                }
-            )
+            row = {
+                "games": record.get("sgf_entries", 0),
+                "black_wins": record.get("black_wins", 0),
+                "white_wins": record.get("white_wins", 0),
+                "draws": record.get("draws", 0),
+                "immediate_double_pass_games": record.get(
+                    "opening_double_pass_games",
+                    record.get("immediate_double_pass_games", 0),
+                ),
+                "extreme_games": record.get(
+                    "extreme_result_games", record.get("extreme_games", 0)
+                ),
+                "invalid_games": record.get("no_result_games", 0),
+                "damaged_games": record.get("damaged_games", 0),
+            }
+            for key in ("short_games", "pass_moves", "total_moves"):
+                if key in record:
+                    row[key] = record[key]
+            normalized.append(row)
+        standard_name = getattr(self.config, "training_standard", None)
+        standard = get_training_standard(standard_name)
         return compute_health_window(
             normalized,
             window_cycles=self.config.health_window_cycles,
             games_per_cycle=128,
             thresholds=self.config.health,
-            minimum_games=self.config.health_window_cycles * 128,
+            minimum_games=(standard.health_minimum_games if standard is not None
+                           else self.config.health_window_cycles * 128),
+            training_standard=standard_name,
         )
 
     def _refresh_progress(

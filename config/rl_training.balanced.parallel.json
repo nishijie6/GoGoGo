@@ -8,6 +8,9 @@
     "self_play": {
       "workers": 12,
       "inference_batch_size": 48
+    },
+    "evaluation": {
+      "standard": "unified_v1"
     }
   }
 }

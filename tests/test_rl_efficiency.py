@@ -256,8 +256,9 @@ class LargerCycleTrainingTests(unittest.TestCase):
             profile = Path(__file__).resolve().parents[1] / "config/rl_training.rtx5070ti.curriculum.19x19.json"
             runner = KataGoRLRunner(profile, run_root_override=Path(temporary))
             self.assertEqual(runner.config.self_play.games_per_iteration, 2048)
-            self.assertEqual(runner.config.evaluation.games, 200)
-            self.assertEqual(runner.config.evaluation.promotion_win_rate, 0.6)
+            self.assertEqual(runner.config.evaluation.standard, "unified_v1")
+            self.assertEqual(runner.config.evaluation.games, 40)
+            self.assertEqual(runner.config.evaluation.promotion_win_rate, 0.55)
             data = runner.shuffled_dir / "latest/train/data.npz"
             data.parent.mkdir(parents=True)
             data.touch()

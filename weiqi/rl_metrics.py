@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Iterable, Mapping, Optional, Sequence
 
 from .sgf import MalformedSGF, classify_result, parse_sgf_game, split_sgf_collection
+from .training_standard import get_training_standard
 
 
 MODEL_NAME_PATTERN = re.compile(r"^gogogo-s(?P<samples>\d+)-d(?P<data_rows>\d+)$")
@@ -82,6 +83,9 @@ CSV_FIELDS = (
     "damaged_games",
     "average_score_margin",
     "average_moves",
+    "short_games",
+    "pass_moves",
+    "total_moves",
     "opening_double_pass_games",
     "opening_double_pass_rate",
     "extreme_result_games",
@@ -112,7 +116,8 @@ CSV_FIELDS = (
 )
 
 
-def parse_sgfs(paths: Path | Iterable[Path]) -> dict[str, object]:
+def parse_sgfs(paths: Path | Iterable[Path], *, allow_mixed_boards: bool = False,
+               standard: str | None = None) -> dict[str, object]:
     """Summarize KataGo self-play SGFs using only the Python standard library.
 
     A malformed tree is counted separately and never contributes to result,
@@ -121,16 +126,19 @@ def parse_sgfs(paths: Path | Iterable[Path]) -> dict[str, object]:
     damaged storage.
     """
 
+    policy = get_training_standard(standard)
     if isinstance(paths, Path):
         path_list: Sequence[Path] = (paths,)
     else:
         path_list = tuple(Path(path) for path in paths)
     black_wins = white_wins = draws = no_results = damaged = 0
     double_passes = extreme_results = 0
+    short_games = pass_moves = 0
     score_margins: list[float] = []
     move_counts: list[int] = []
     last_result: Optional[str] = None
     board_size: Optional[int] = None
+    board_sizes: set[int] = set()
     parsed_games = 0
     total_bytes = 0
     for path in path_list:
@@ -152,10 +160,11 @@ def parse_sgfs(paths: Path | Iterable[Path]) -> dict[str, object]:
             current_size = int(parsed["board_size"])
             if board_size is None:
                 board_size = current_size
-            elif board_size != current_size:
+            elif board_size != current_size and not allow_mixed_boards:
                 damaged += 1
                 parsed_games -= 1
                 continue
+            board_sizes.add(current_size)
             result = str(parsed["result"])
             last_result = result or "无结果"
             outcome, margin = classify_result(result)
@@ -169,10 +178,14 @@ def parse_sgfs(paths: Path | Iterable[Path]) -> dict[str, object]:
                 no_results += 1
             if margin is not None and outcome in {"black", "white"}:
                 score_margins.append(margin)
-                if margin >= current_size * current_size * EXTREME_MARGIN_BOARD_FRACTION:
+                margin_fraction = policy.extreme_margin_area_fraction if policy else EXTREME_MARGIN_BOARD_FRACTION
+                if margin >= current_size * current_size * margin_fraction:
                     extreme_results += 1
             moves = list(parsed["moves"])
             move_counts.append(len(moves))
+            cutoff = max(policy.short_game_min_moves, math.ceil(current_size ** 2 * policy.short_game_area_fraction)) if policy else max(4, math.ceil(current_size ** 2 * .1))
+            short_games += len(moves) < cutoff
+            pass_moves += sum(action == "" for _, action in moves)
             if (
                 len(moves) >= 2
                 and moves[0][1] == ""
@@ -208,9 +221,14 @@ def parse_sgfs(paths: Path | Iterable[Path]) -> dict[str, object]:
             sum(score_margins) / len(score_margins) if score_margins else None
         ),
         "average_moves": sum(move_counts) / len(move_counts) if move_counts else None,
+        "short_games": short_games,
+        "pass_moves": pass_moves,
+        "total_moves": sum(move_counts),
     }
-    if board_size is not None:
+    if board_size is not None and len(board_sizes) == 1:
         result["board_size"] = board_size
+    elif board_sizes:
+        result["board_sizes"] = sorted(board_sizes)
     return result
 
 
@@ -219,11 +237,22 @@ def rolling_health_metrics(
     *,
     max_cycles: int = HEALTH_WINDOW_CYCLES,
     required_games: int = HEALTH_WINDOW_GAMES,
+    standard: str | None = None,
 ) -> dict[str, object]:
-    """Aggregate and evaluate the most recent self-play quality window."""
+    """Use recent cycles, extending small cycles until enough games exist."""
 
+    policy = get_training_standard(standard)
+    if policy:
+        required_games = policy.health_minimum_games
+        max_cycles = 1
     eligible = [record for record in records if "sgf_entries" in record]
     window = eligible[-max_cycles:]
+    count = sum(int(record.get("sgf_entries", 0) or 0) for record in window)
+    start = len(eligible) - len(window)
+    while count < required_games and start > 0:
+        start -= 1
+        count += int(eligible[start].get("sgf_entries", 0) or 0)
+    window = eligible[start:]
     count_fields = {
         "health_black_wins": "black_wins",
         "health_white_wins": "white_wins",
@@ -261,6 +290,16 @@ def rolling_health_metrics(
         and extreme_rate <= HEALTH_EXTREME_RESULT_MAX
         and invalid_rate <= HEALTH_INVALID_MAX
     )
+    if policy:
+        short_rate = (sum(int(record["short_games"]) for record in window) / parsed_games
+                      if parsed_games and all("short_games" in record for record in window) else None)
+        total_moves = sum(int(record.get("total_moves", 0)) for record in window)
+        pass_rate = (sum(int(record["pass_moves"]) for record in window) / total_moves
+                     if total_moves and all("pass_moves" in record and "total_moves" in record
+                                            for record in window) else None)
+        passed = not policy.health_reasons(games=entries, black_score_rate=black_rate,
+            early_double_pass_rate=double_pass_rate, invalid_rate=invalid_rate,
+            short_game_rate=short_rate, pass_move_rate=pass_rate)
     return {
         "health_window_cycles": len(window),
         "health_window_games": entries,

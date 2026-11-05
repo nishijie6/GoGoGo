@@ -53,6 +53,7 @@ def checkpoint_config(payload: dict):
     overrides.setdefault("self_play", {}).setdefault("milestone_fraction", 0.0)
     overrides["self_play"].setdefault("joseki_fraction", 0.0)
     evaluation = overrides.setdefault("evaluation", {})
+    evaluation.setdefault("standard", None)
     evaluation.setdefault("promotion_test", "paired_hoeffding")
     evaluation.setdefault("confirmation_max_game_length_factor",
                           overrides["self_play"].get("max_game_length_factor", 2.5))

@@ -68,13 +68,14 @@ def _fixed_opening_sample(board_size: int, index: int) -> str:
 
 
 def ensure_evaluation_opening_suite(
-    state_root: Path, *, board_size: int, opening_count: int
+    state_root: Path, *, board_size: int, opening_count: int, opening_offset: int = 0
 ) -> tuple[Path, ...]:
     """Create or verify immutable singleton opening directories for evaluation."""
 
-    if board_size not in {9, 13, 19} or opening_count < 1:
+    if (board_size not in {7, 8, 9, 13, 19} or opening_count < 1
+            or type(opening_offset) is not int or opening_offset < 0):
         raise ValueError("固定评测开局参数无效")
-    samples = [_fixed_opening_sample(board_size, index) for index in range(opening_count)]
+    samples = [_fixed_opening_sample(board_size, opening_offset + index) for index in range(opening_count)]
     hashes = [hashlib.sha256(sample.encode("utf-8")).hexdigest() for sample in samples]
     if len(set(hashes)) != opening_count:
         raise CurriculumStateError("固定评测开局生成器产生了重复局面")
@@ -92,6 +93,8 @@ def ensure_evaluation_opening_suite(
         "format": "KataGo PositionSample JSONL; one singleton directory per color-swapped pair",
         "sha256": hashes,
     }
+    if opening_offset:
+        manifest["opening_offset"] = opening_offset
 
     def is_valid() -> bool:
         try:

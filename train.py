@@ -89,7 +89,7 @@ def with_training_policy(config, path: Path):
         "self_play": {"champion_fraction", "milestone_fraction", "games_per_iteration",
                       "joseki_fraction"},
         "optimizer": {"target_sample_reuse", "training_steps_per_iteration"},
-        "evaluation": {"games", "promotion_win_rate", "promotion_test",
+        "evaluation": {"standard", "games", "promotion_win_rate", "promotion_test",
                        "confirmation_max_game_length_factor", "confidence_level",
                        "sprt_alpha", "sprt_beta", "sprt_pair_win_rate", "sprt_batch_pairs"},
     }
